@@ -1014,6 +1014,19 @@ public class Config extends ConfigBase {
     public static int tablet_further_repair_max_times = 5;
 
     /**
+     * if tablet loaded txn failed recently, it will get higher priority to repair.
+     */
+    @ConfField(mutable = true, masterOnly = true)
+    public static long tablet_recent_load_failed_second = 30 * 60;
+
+    /**
+     * base time for higher tablet scheduler task,
+     * set this config value bigger if want the high priority effect last longer.
+     */
+    @ConfField(mutable = true, masterOnly = true)
+    public static long tablet_schedule_high_priority_second = 30 * 60;
+
+    /**
      * publish version queue's size in be, report it to fe,
      * if publish task in be exceed direct_publish_limit_number,
      * fe will direct publish task
@@ -1827,7 +1840,7 @@ public class Config extends ConfigBase {
      * Max data version of backends serialize block.
      */
     @ConfField(mutable = false)
-    public static int max_be_exec_version = 5;
+    public static int max_be_exec_version = 6;
 
     /**
      * Min data version of backends serialize block.
@@ -2266,6 +2279,12 @@ public class Config extends ConfigBase {
      */
     @ConfField
     public static long stats_cache_size = 50_0000;
+
+    /**
+     * This config used for ranger cache data mask/row policy
+     */
+    @ConfField
+    public static long ranger_cache_size = 10000;
 
     /**
      * This configuration is used to enable the statistics of query information, which will record
@@ -2714,6 +2733,23 @@ public class Config extends ConfigBase {
     @ConfField
     public static long spilled_profile_storage_limit_bytes = 1 * 1024 * 1024 * 1024; // 1GB
 
+    @ConfField(mutable = true, description = {
+            "是否通过检测协调者BE心跳来 abort 事务",
+            "SHould abort txn by checking coorinator be heartbeat"})
+    public static boolean enable_abort_txn_by_checking_coordinator_be = true;
+
+    @ConfField(mutable = true, description = {
+            "是否在 schema change 过程中, 检测冲突事物并 abort 它",
+            "SHould abort txn by checking conflick txn in schema change"})
+    public static boolean enable_abort_txn_by_checking_conflict_txn = true;
+
+    @ConfField(mutable = true, description = {
+            "内表自动收集时间间隔，当某一列上次收集时间距离当前时间大于该值，则会触发一次新的收集，0表示不会触发。",
+            "Columns that have not been collected within the specified interval will trigger automatic analyze. "
+                + "0 means not trigger."
+    })
+    public static long auto_analyze_interval_seconds = 0;
+
     //==========================================================================
     //                    begin of cloud config
     //==========================================================================
@@ -2949,6 +2985,15 @@ public class Config extends ConfigBase {
     @ConfField(description = {"存算分离模式下建表是否检查残留recycler key, 默认true",
         "create table in cloud mode, check recycler key remained, default true"})
     public static boolean check_create_table_recycle_key_remained = true;
+
+    @ConfField(mutable = true, description = {"存算分离模式下fe向ms请求锁的过期时间，默认10s"})
+    public static int delete_bitmap_lock_expiration_seconds = 10;
+
+    @ConfField(mutable = true, description = {"存算分离模式下calculate delete bitmap task 超时时间，默认15s"})
+    public static int calculate_delete_bitmap_task_timeout_seconds = 15;
+
+    @ConfField(mutable = true, description = {"存算分离模式下commit阶段等锁超时时间，默认5s"})
+    public static int try_commit_lock_timeout_seconds = 5;
     // ATTN: DONOT add any config not related to cloud mode here
     // ATTN: DONOT add any config not related to cloud mode here
     // ATTN: DONOT add any config not related to cloud mode here
