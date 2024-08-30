@@ -120,6 +120,7 @@ protected:
 
     AggregatedDataVariants* _agg_data = nullptr;
     vectorized::Arena* _agg_arena_pool = nullptr;
+    std::unique_ptr<vectorized::Arena> _agg_profile_arena;
 
     std::unique_ptr<ExecutorBase> _executor = nullptr;
 };
@@ -148,11 +149,12 @@ public:
                            ? DataDistribution(ExchangeType::PASSTHROUGH)
                            : DataSinkOperatorX<AggSinkLocalState>::required_data_distribution();
         }
-        return _is_colocate && _require_bucket_distribution
+        return _is_colocate && _require_bucket_distribution && !_followed_by_shuffled_join
                        ? DataDistribution(ExchangeType::BUCKET_HASH_SHUFFLE, _partition_exprs)
                        : DataDistribution(ExchangeType::HASH_SHUFFLE, _partition_exprs);
     }
     bool require_data_distribution() const override { return _is_colocate; }
+    bool require_shuffled_data_distribution() const override { return !_probe_expr_ctxs.empty(); }
     size_t get_revocable_mem_size(RuntimeState* state) const;
 
     AggregatedDataVariants* get_agg_data(RuntimeState* state) {
