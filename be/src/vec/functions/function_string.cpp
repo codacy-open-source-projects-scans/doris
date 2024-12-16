@@ -682,7 +682,7 @@ struct Trim1Impl {
     static DataTypes get_variadic_argument_types() { return {std::make_shared<DataTypeString>()}; }
 
     static Status execute(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                          size_t result, size_t input_rows_count) {
+                          uint32_t result, size_t input_rows_count) {
         const ColumnPtr column = block.get_by_position(arguments[0]).column;
         if (const auto* col = assert_cast<const ColumnString*>(column.get())) {
             auto col_res = ColumnString::create();
@@ -711,7 +711,7 @@ struct Trim2Impl {
     }
 
     static Status execute(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                          size_t result, size_t input_rows_count) {
+                          uint32_t result, size_t input_rows_count) {
         const ColumnPtr column = block.get_by_position(arguments[0]).column;
         const auto& rcol =
                 assert_cast<const ColumnConst*>(block.get_by_position(arguments[1]).column.get())
@@ -783,7 +783,7 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         return impl::execute(context, block, arguments, result, input_rows_count);
     }
 };
@@ -888,16 +888,17 @@ struct StringSpace {
                          ColumnString::Offsets& res_offsets) {
         res_offsets.resize(data.size());
         size_t input_size = res_offsets.size();
-        std::vector<char, Allocator_<char>> buffer;
+        // sample to get approximate best reserve size
+        if (input_size > 4) {
+            res_data.reserve(((data[0] + data[input_size >> 1] + data[input_size >> 2] +
+                               data[input_size - 1]) >>
+                              2) *
+                             input_size);
+        }
         for (size_t i = 0; i < input_size; ++i) {
-            buffer.clear();
-            if (data[i] > 0) {
-                buffer.resize(data[i]);
-                for (size_t j = 0; j < data[i]; ++j) {
-                    buffer[i] = ' ';
-                }
-                StringOP::push_value_string(std::string_view(buffer.data(), buffer.size()), i,
-                                            res_data, res_offsets);
+            if (data[i] > 0) [[likely]] {
+                res_data.resize_fill(res_data.size() + data[i], ' ');
+                res_offsets[i] = res_data.size();
             } else {
                 StringOP::push_empty_string(i, res_data, res_offsets);
             }
