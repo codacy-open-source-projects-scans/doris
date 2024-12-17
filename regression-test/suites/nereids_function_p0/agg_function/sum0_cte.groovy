@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("any_value") {
-    // enable nereids
-    sql "SET enable_nereids_planner=true"
-    sql "SET enable_fallback_to_original_planner=false"
-
-    test {
-        sql "select any(s_suppkey), any(s_name), any_value(s_address) from supplier;"
-    }
-    qt_sql_max """select max(cast(concat(number, ":00:00") as time)) from numbers("number" = "100");"""
-    qt_sql_min """select min(cast(concat(number, ":00:00") as time)) from numbers("number" = "100");"""
-    sql """select any(cast(concat(number, ":00:00") as time)) from numbers("number" = "100");"""
+suite("sum0_cte") {
+    sql 'use regression_test_nereids_function_p0'
+    sql "set ignore_shape_nodes='PhysicalDistribute,PhysicalProject'"
+    qt_sum0_cte """with tmp as (select * from fn_test)
+    select * from (select sum0(distinct kint) from tmp ) t cross join (select sum0(distinct ksint) from tmp) tt;
+    """
+    qt_shape """
+    explain shape plan
+    with tmp as (select * from fn_test)
+    select * from (select sum0(distinct kint) from tmp ) t cross join (select sum0(distinct ksint) from tmp) tt;
+    """
 }
