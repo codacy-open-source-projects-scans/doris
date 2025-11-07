@@ -16,7 +16,7 @@ package mv.external_table
 // specific language governing permissions and limitations
 // under the License.
 
-suite("part_partition_invalid", "p0,external") {
+suite("part_partition_invalid", "p0,external,external_docker") {
     String enabled = context.config.otherConfigs.get("enableHiveTest")
     if (enabled == null || !enabled.equalsIgnoreCase("true")) {
         logger.info("diable Hive test. then doesn't test mv rewrite")
@@ -38,8 +38,7 @@ suite("part_partition_invalid", "p0,external") {
     );"""
 
     sql """switch ${hive_catalog_name};"""
-    sql """drop table if exists ${hive_catalog_name}.${hive_database}.${hive_table}"""
-    sql """ drop database if exists ${hive_database}"""
+    sql """ drop database if exists ${hive_database} force"""
     sql """ create database ${hive_database}"""
     sql """use ${hive_database}"""
     sql """
@@ -124,7 +123,7 @@ suite("part_partition_invalid", "p0,external") {
     order_qt_query_sql """${query_sql}"""
 
     // create partition mtmv, related partition is hive catalog
-    def mv_name = 'mv_join'
+    def mv_name = suite_name + 'mv_join'
     sql """drop materialized view if exists ${mv_name}"""
     sql """
         CREATE MATERIALIZED VIEW ${mv_name}
@@ -141,35 +140,22 @@ suite("part_partition_invalid", "p0,external") {
 
     // test query rewrite by mv, should fail ,because materialized_view_rewrite_enable_contain_external_table
     // is false default
-    mv_rewrite_fail(query_sql, mv_name)
+    mv_not_part_in(query_sql, mv_name)
     sql "SET materialized_view_rewrite_enable_contain_external_table=true"
     mv_rewrite_success(query_sql, mv_name)
 
     // data change in external table doesn't influence query rewrite,
     // if want to use new data in external table should be refresh manually
     sql """insert into ${hive_catalog_name}.${hive_database}.${hive_table} values(3, 3, 'ok', 99.5, 'a', 'b', 1, 'yy', '2023-10-19');"""
-    mv_rewrite_success(query_sql, mv_name)
-    order_qt_after_modify_data_without_refresh_catalog """ ${query_sql}"""
-
-    mv_rewrite_success("""
-            ${query_sql} where o_orderdate = '2023-10-19';
-        """, mv_name)
-    order_qt_after_modify_and_without_refresh_catalog_19 """ ${query_sql} where o_orderdate = '2023-10-19';"""
-
-    // query valid partition data, should hit mv
-    mv_rewrite_success("""
-        ${query_sql} where o_orderdate = '2023-10-18';
-    """, mv_name
-    )
-    order_qt_after_modify_and_without_refresh_catalog_18 """ ${query_sql} where o_orderdate = '2023-10-18';"""
 
     // refresh catalog cache
     sql """ REFRESH CATALOG ${hive_catalog_name} PROPERTIES("invalid_cache" = "true"); """
     mv_rewrite_success(query_sql, mv_name)
+    // in 2.1 and 3.0 should not compensate union all, in 3.1 and master should compensate union all
     order_qt_after_modify_data_and_refresh_catalog """ ${query_sql}"""
 
-    // query invalid partition data, should hit mv, because not check now.
-    mv_rewrite_success("""
+    // query invalid partition data, should not part in mv rewrite
+    mv_not_part_in("""
             ${query_sql} where o_orderdate = '2023-10-19';
         """, mv_name)
     order_qt_after_modify_and_refresh_catalog_19 """ ${query_sql} where o_orderdate = '2023-10-19';"""
@@ -189,24 +175,11 @@ suite("part_partition_invalid", "p0,external") {
 
     // test after hive add partition
     sql """insert into ${hive_catalog_name}.${hive_database}.${hive_table} values(6, 7, 'ok', 29.5, 'x', 'y', 6, 'ss', '2023-10-20');"""
-    mv_rewrite_success(query_sql, mv_name)
-    order_qt_after_add_data_without_refresh_catalog """ ${query_sql}"""
-
-    // query invalid partition data, should hit mv, because not check now.
-    mv_rewrite_success(query_sql, mv_name)
-
-    order_qt_after_add_and_without_refresh_catalog_19 """ ${query_sql} where o_orderdate = '2023-10-19';"""
-
-    // query valid partition data, should hit mv
-    mv_rewrite_success("""
-            ${query_sql} where o_orderdate = '2023-10-20';
-        """, mv_name)
-
-    order_qt_after_add_and_without_refresh_catalog_20 """ ${query_sql} where o_orderdate = '2023-10-20';"""
 
     // refresh catalog cache
     sql """ REFRESH CATALOG ${hive_catalog_name} PROPERTIES("invalid_cache" = "true"); """
     mv_rewrite_success(query_sql, mv_name)
+    // in 2.1 and 3.0 should not compensate union all, in 3.1 and master should compensate union all
     order_qt_after_add_data_with_refresh_catalog """ ${query_sql}"""
 
     // query invalid partition data, should hit mv, because not check now.
@@ -216,8 +189,8 @@ suite("part_partition_invalid", "p0,external") {
 
     order_qt_after_add_and_refresh_catalog_19 """ ${query_sql} where o_orderdate = '2023-10-19';"""
 
-    // query valid partition data, should hit mv
-    mv_rewrite_success("""
+    // query valid partition data, mv should not part in mv rewrite
+    mv_not_part_in("""
             ${query_sql} where o_orderdate = '2023-10-20';
         """, mv_name)
     order_qt_after_add_and_refresh_catalog_20 """ ${query_sql} where o_orderdate = '2023-10-20';"""
@@ -229,9 +202,7 @@ suite("part_partition_invalid", "p0,external") {
     mv_rewrite_success(query_sql, mv_name)
     order_qt_after_add_data_and_refresh_catalog_and_mv """ ${query_sql}"""
 
-    sql """drop table if exists ${hive_catalog_name}.${hive_database}.${hive_table}"""
-    sql """drop table if exists ${internal_catalog}.${olap_db}.${olap_table}"""
-    sql """drop database if exists ${hive_catalog_name}.${hive_database}"""
+    sql """drop database if exists ${hive_catalog_name}.${hive_database} force"""
     sql """drop materialized view if exists ${internal_catalog}.${olap_db}.${mv_name};"""
     sql """drop catalog if exists ${hive_catalog_name}"""
 }

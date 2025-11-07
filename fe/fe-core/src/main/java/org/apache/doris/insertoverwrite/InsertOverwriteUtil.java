@@ -19,7 +19,6 @@ package org.apache.doris.insertoverwrite;
 
 import org.apache.doris.analysis.AddPartitionLikeClause;
 import org.apache.doris.analysis.DropPartitionClause;
-import org.apache.doris.analysis.PartitionNames;
 import org.apache.doris.analysis.ReplacePartitionClause;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
@@ -27,6 +26,7 @@ import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.util.PropertyAnalyzer;
+import org.apache.doris.info.PartitionNamesInfo;
 
 import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
@@ -69,6 +69,11 @@ public class InsertOverwriteUtil {
      */
     public static void replacePartition(TableIf olapTable, List<String> partitionNames,
             List<String> tempPartitionNames) throws DdlException {
+        replacePartition(olapTable, partitionNames, tempPartitionNames, false);
+    }
+
+    public static void replacePartition(TableIf olapTable, List<String> partitionNames,
+            List<String> tempPartitionNames, boolean isForce) throws DdlException {
         if (olapTable instanceof OlapTable) {
             try {
                 if (!olapTable.writeLockIfExist()) {
@@ -77,8 +82,8 @@ public class InsertOverwriteUtil {
                 Map<String, String> properties = Maps.newHashMap();
                 properties.put(PropertyAnalyzer.PROPERTIES_USE_TEMP_PARTITION_NAME, "false");
                 ReplacePartitionClause replacePartitionClause = new ReplacePartitionClause(
-                        new PartitionNames(false, partitionNames),
-                        new PartitionNames(true, tempPartitionNames), false, properties);
+                        new PartitionNamesInfo(false, partitionNames),
+                        new PartitionNamesInfo(true, tempPartitionNames), isForce, properties);
                 if (replacePartitionClause.getTempPartitionNames().isEmpty()) {
                     return;
                 }
@@ -98,9 +103,16 @@ public class InsertOverwriteUtil {
      * @return
      */
     public static List<String> generateTempPartitionNames(List<String> partitionNames) {
+        long threadId = Thread.currentThread().getId();
+        // Adding thread ID as a prefix is to avoid mutual interference
+        // when different threads perform insert overwrite on the same partition simultaneously.
+        // Even if the insert overwrite execution fails/cancels,
+        // the generated temporary partition will be deleted,
+        // so there will be no problem generating temporary partitions with the same name in a single thread
+        String prefix = "iot_temp_" + threadId + "_";
         List<String> tempPartitionNames = new ArrayList<String>(partitionNames.size());
         for (String partitionName : partitionNames) {
-            String tempPartitionName = "iot_temp_" + partitionName;
+            String tempPartitionName = prefix + partitionName;
             if (tempPartitionName.length() > 50) {
                 tempPartitionName = tempPartitionName.substring(0, 30) + Math.abs(Objects.hash(tempPartitionName))
                         + "_" + System.currentTimeMillis();

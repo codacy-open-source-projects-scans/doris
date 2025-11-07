@@ -50,29 +50,30 @@ inline std::string types_name(const DataTypes& types) {
     return name;
 }
 
+constexpr std::string DISTINCT_FUNCTION_PREFIX = "multi_distinct_";
+
 class AggregateFunctionSimpleFactory {
 public:
     using Creator = AggregateFunctionCreator;
 
 private:
     using AggregateFunctions = std::unordered_map<std::string, Creator>;
-    constexpr static std::string_view combiner_names[] = {"_foreach"};
+    constexpr static std::string_view combiner_names[] = {"_foreach", "_foreachv2"};
     AggregateFunctions aggregate_functions;
     AggregateFunctions nullable_aggregate_functions;
     std::unordered_map<std::string, std::string> function_alias;
 
 public:
-    void register_nullable_function_combinator(const Creator& creator) {
-        for (const auto& entity : aggregate_functions) {
-            if (nullable_aggregate_functions.find(entity.first) ==
-                nullable_aggregate_functions.end()) {
-                nullable_aggregate_functions[entity.first] = creator;
-            }
-        }
-    }
-
     static bool is_foreach(const std::string& name) {
         constexpr std::string_view suffix = "_foreach";
+        if (name.length() < suffix.length()) {
+            return false;
+        }
+        return name.substr(name.length() - suffix.length()) == suffix;
+    }
+
+    static bool is_foreachv2(const std::string& name) {
+        constexpr std::string_view suffix = "_foreachv2";
         if (name.length() < suffix.length()) {
             return false;
         }
@@ -165,6 +166,7 @@ public:
         for (const auto& s : combiner_names) {
             function_alias[alias + std::string(s)] = name + std::string(s);
         }
+        function_alias[DISTINCT_FUNCTION_PREFIX + alias] = DISTINCT_FUNCTION_PREFIX + name;
     }
 
     void register_alternative_function(const std::string& name, const Creator& creator,

@@ -17,13 +17,12 @@
 
 package org.apache.doris.catalog;
 
-import org.apache.doris.analysis.CreateMTMVStmt;
-import org.apache.doris.analysis.CreateTableStmt;
-import org.apache.doris.analysis.DdlStmt;
 import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.mtmv.MTMVPartitionInfo;
 import org.apache.doris.mtmv.MTMVRefreshInfo;
 import org.apache.doris.mtmv.MTMVRelation;
+import org.apache.doris.nereids.trees.plans.commands.info.CreateMTMVInfo;
+import org.apache.doris.nereids.trees.plans.commands.info.CreateTableInfo;
 
 import com.google.common.base.Preconditions;
 
@@ -35,6 +34,7 @@ public class OlapTableFactory {
     public static class BuildParams {
         public long tableId;
         public String tableName;
+        public boolean isTemporary;
         public List<Column> schema;
         public KeysType keysType;
         public PartitionInfo partitionInfo;
@@ -43,6 +43,10 @@ public class OlapTableFactory {
 
     public static class OlapTableParams extends BuildParams {
         public TableIndexes indexes;
+
+        public OlapTableParams(boolean isTemporary) {
+            this.isTemporary = isTemporary;
+        }
     }
 
     public static class MTMVParams extends BuildParams {
@@ -55,18 +59,23 @@ public class OlapTableFactory {
 
     private BuildParams params;
 
-    public static TableType getTableType(DdlStmt stmt) {
-        if (stmt instanceof CreateMTMVStmt) {
+
+    public static TableType getTableType(CreateTableInfo createTableInfo) {
+        if (createTableInfo instanceof CreateMTMVInfo) {
             return TableType.MATERIALIZED_VIEW;
-        } else if (stmt instanceof CreateTableStmt) {
+        } else if (createTableInfo instanceof CreateTableInfo) {
             return TableType.OLAP;
         } else {
-            throw new IllegalArgumentException("Invalid DDL statement: " + stmt.toSql());
+            throw new IllegalArgumentException("Invalid DDL statement: " + createTableInfo.toSql());
         }
     }
 
-    public OlapTableFactory init(TableType type) {
-        params = (type == TableType.OLAP) ? new OlapTableParams() : new MTMVParams();
+    public OlapTableFactory init(TableType type, boolean isTemporary) {
+        if (type == TableType.OLAP) {
+            params = new OlapTableParams(isTemporary);
+        } else {
+            params = new MTMVParams();
+        }
         return this;
     }
 
@@ -78,6 +87,7 @@ public class OlapTableFactory {
             return new OlapTable(
                     olapTableParams.tableId,
                     olapTableParams.tableName,
+                    olapTableParams.isTemporary,
                     olapTableParams.schema,
                     olapTableParams.keysType,
                     olapTableParams.partitionInfo,
@@ -168,18 +178,17 @@ public class OlapTableFactory {
         return this;
     }
 
-    public OlapTableFactory withExtraParams(DdlStmt stmt) {
-        boolean isMaterializedView = stmt instanceof CreateMTMVStmt;
+    public OlapTableFactory withExtraParams(CreateTableInfo createTableInfo) {
+        boolean isMaterializedView = createTableInfo instanceof CreateMTMVInfo;
         if (!isMaterializedView) {
-            CreateTableStmt createOlapTableStmt = (CreateTableStmt) stmt;
-            return withIndexes(new TableIndexes(createOlapTableStmt.getIndexes()));
+            return withIndexes(new TableIndexes(createTableInfo.getIndexes()));
         } else {
-            CreateMTMVStmt createMTMVStmt = (CreateMTMVStmt) stmt;
-            return withRefreshInfo(createMTMVStmt.getRefreshInfo())
-                    .withQuerySql(createMTMVStmt.getQuerySql())
-                    .withMvProperties(createMTMVStmt.getMvProperties())
-                    .withMvPartitionInfo(createMTMVStmt.getMvPartitionInfo())
-                    .withMvRelation(createMTMVStmt.getRelation());
+            CreateMTMVInfo createMTMVInfo = (CreateMTMVInfo) createTableInfo;
+            return withRefreshInfo(createMTMVInfo.getRefreshInfo())
+                .withQuerySql(createMTMVInfo.getQuerySql())
+                .withMvProperties(createMTMVInfo.getMvProperties())
+                .withMvPartitionInfo(createMTMVInfo.getMvPartitionInfo())
+                .withMvRelation(createMTMVInfo.getRelation());
         }
     }
 }

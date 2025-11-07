@@ -19,6 +19,7 @@ suite("load") {
 
     // ddl begin
     sql "drop table if exists expr_test"
+    sql "drop table if exists expr_test2"
     sql "drop table if exists expr_test_not_nullable"
 
     sql  "ADMIN SET FRONTEND CONFIG ('disable_decimalv2' = 'false')"
@@ -105,6 +106,7 @@ suite("load") {
         properties("replication_num" = "1")
     """
 
+    sql """  drop table IF EXISTS `expr_test_not_nullable2` """
     sql """
         CREATE TABLE IF NOT EXISTS `expr_test_not_nullable2` (
             `id` int null,

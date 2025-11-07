@@ -22,6 +22,7 @@ import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
@@ -30,7 +31,10 @@ import org.apache.doris.mtmv.MTMVUtil;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.analyzer.UnboundTableSink;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.algebra.InlineTable;
 import org.apache.doris.nereids.trees.plans.algebra.OneRowRelation;
+import org.apache.doris.nereids.trees.plans.commands.PrepareCommand;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalUnion;
 import org.apache.doris.planner.GroupCommitPlanner;
@@ -41,6 +45,7 @@ import org.apache.doris.system.Backend;
 import org.apache.doris.transaction.TransactionStatus;
 
 import com.google.common.base.Strings;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -60,9 +65,48 @@ public class OlapGroupCommitInsertExecutor extends OlapInsertExecutor {
 
     public OlapGroupCommitInsertExecutor(ConnectContext ctx, Table table,
             String labelName, NereidsPlanner planner, Optional<InsertCommandContext> insertCtx,
-            boolean emptyInsert, Backend backend) {
-        super(ctx, table, labelName, planner, insertCtx, emptyInsert);
+            boolean emptyInsert, Backend backend, long jobId) {
+        super(ctx, table, labelName, planner, insertCtx, emptyInsert, jobId);
         this.groupCommitBackend = backend;
+    }
+
+    /**
+     * check if the sql can run in group commit mode
+     */
+    public static void fastAnalyzeGroupCommit(ConnectContext ctx, LogicalPlan logicalPlan) {
+        try {
+            if (ctx.getSessionVariable().isEnableInsertGroupCommit() && !ctx.isTxnModel() && !ctx.getSessionVariable()
+                    .isEnableUniqueKeyPartialUpdate()) {
+                ctx.setGroupCommit(true);
+            }
+        } catch (Throwable e) {
+            LOG.warn("analyze group commit failed", e);
+        }
+    }
+
+    /**
+     * check if the sql can run in group commit mode
+     */
+    public static void analyzeGroupCommit(ConnectContext ctx, LogicalPlan logicalPlan) {
+        try {
+            if (ctx.isGroupCommit()) {
+                return;
+            }
+            if (!ctx.getSessionVariable().isEnableInsertGroupCommit()) {
+                return;
+            }
+            if (logicalPlan instanceof PrepareCommand) {
+                logicalPlan = ((PrepareCommand) logicalPlan).getLogicalPlan();
+            }
+            if (logicalPlan instanceof InsertIntoTableCommand) {
+                LogicalPlan logicalQuery = ((InsertIntoTableCommand) logicalPlan).getLogicalQuery();
+                TableIf targetTableIf = InsertUtils.getTargetTable(logicalQuery, ctx);
+                OlapGroupCommitInsertExecutor.analyzeGroupCommit(ctx, targetTableIf, logicalQuery,
+                        Optional.empty());
+            }
+        } catch (Throwable e) {
+            LOG.warn("analyze group commit failed", e);
+        }
     }
 
     protected static void analyzeGroupCommit(ConnectContext ctx, TableIf table, LogicalPlan logicalQuery,
@@ -92,9 +136,14 @@ public class OlapGroupCommitInsertExecutor extends OlapInsertExecutor {
                     () -> "not allowModifyMTMVData"));
             conditions.add(Pair.of(() -> !(insertCtx.isPresent() && insertCtx.get() instanceof OlapInsertCommandContext
                     && ((OlapInsertCommandContext) insertCtx.get()).isOverwrite()), () -> "is overwrite command"));
-            conditions.add(Pair.of(
-                    () -> tableSink.child() instanceof OneRowRelation || tableSink.child() instanceof LogicalUnion,
-                    () -> "not one row relation or union, class: " + tableSink.child().getClass().getName()));
+            Plan tableSinkChild = tableSink.child();
+            conditions.add(Pair.of(() -> tableSinkChild instanceof OneRowRelation
+                            || (tableSinkChild instanceof LogicalUnion
+                            && tableSinkChild.getExpressions().size() > 0)
+                            || tableSinkChild instanceof InlineTable,
+                    () -> "should be one row relation or union or inline table, class: "
+                            + tableSinkChild.getClass().getName() + (tableSinkChild instanceof LogicalUnion
+                            ? ", expression size is 0" : "")));
             ctx.setGroupCommit(conditions.stream().allMatch(p -> p.first.getAsBoolean()));
             if (!ctx.isGroupCommit() && LOG.isDebugEnabled()) {
                 for (Pair<BooleanSupplier, Supplier<String>> pair : conditions) {
@@ -144,6 +193,10 @@ public class OlapGroupCommitInsertExecutor extends OlapInsertExecutor {
         // if any throwable being thrown during insert operation, first we should abort this txn
         LOG.warn("insert [{}] with query id {} failed, url={}", labelName, queryId, coordinator.getTrackingUrl(), t);
         StringBuilder sb = new StringBuilder(t.getMessage());
+        if (!Strings.isNullOrEmpty(coordinator.getFirstErrorMsg())) {
+            sb.append(". first_error_msg: ").append(
+                    StringUtils.abbreviate(coordinator.getFirstErrorMsg(), Config.first_error_msg_max_length));
+        }
         if (!Strings.isNullOrEmpty(coordinator.getTrackingUrl())) {
             sb.append(". url: ").append(coordinator.getTrackingUrl());
         }

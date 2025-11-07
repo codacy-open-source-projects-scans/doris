@@ -22,7 +22,7 @@
 #include "util/byte_stream_split.h"
 
 namespace doris::vectorized {
-
+#include "common/compile_check_begin.h"
 Status ByteStreamSplitDecoder::decode_values(MutableColumnPtr& doris_column, DataTypePtr& data_type,
                                              ColumnSelectVector& select_vector,
                                              bool is_dict_filter) {
@@ -51,6 +51,8 @@ Status ByteStreamSplitDecoder::_decode_values(MutableColumnPtr& doris_column,
     size_t scale_size = (select_vector.num_values() - select_vector.num_filtered()) *
                         (_type_length / primitive_length);
     doris_column->resize(doris_column->size() + scale_size);
+    // doris_column is of type MutableColumnPtr, which uses get_raw_data
+    // to return a StringRef, hence the use of const_cast.
     char* raw_data = const_cast<char*>(doris_column->get_raw_data().data);
     ColumnSelectVector::DataReadType read_type;
     DCHECK(_data->get_size() % _type_length == 0);
@@ -92,4 +94,6 @@ Status ByteStreamSplitDecoder::skip_values(size_t num_values) {
     }
     return Status::OK();
 }
+#include "common/compile_check_end.h"
+
 }; // namespace doris::vectorized

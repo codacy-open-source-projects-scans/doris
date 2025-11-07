@@ -25,16 +25,15 @@
 
 #include <algorithm>
 #include <new>
-#include <ostream>
 #include <string>
 
 #include "common/logging.h"
 #include "date_func.h"
-#include "gutil/strings/numbers.h"
 #include "olap/olap_common.h"
 #include "runtime/decimalv2_value.h"
 #include "runtime/large_int_value.h"
 #include "util/mysql_global.h"
+#include "vec/functions/cast/cast_to_string.h"
 #include "vec/runtime/ipv4_value.h"
 #include "vec/runtime/ipv6_value.h"
 #include "vec/runtime/vdatetime_value.h" // IWYU pragma: keep
@@ -110,11 +109,12 @@ void MysqlRowBuffer<is_binary_format>::open_dynamic_mode() {
         // if _pos now exactly at the end of _buf memory,
         // we should reserve 1 byte for _dynamic_mode flag byte to avoid *pos = 254
         // cause _dynamic_mode flag byte be overwritten
-        reserve(1);
+        reserve(1 + 8);
         *_pos++ = NEXT_EIGHT_BYTE; // *_pos = 254 ; _pos++
         // write length when dynamic mode close
         _len_pos = (_pos - _buf);
         _pos = _pos + 8;
+        _field_pos++;
     }
     _dynamic_mode++;
 }
@@ -169,7 +169,7 @@ char* add_int(T data, char* pos, bool dynamic_mode) {
 }
 
 static char* add_largeint(int128_t data, char* pos, bool dynamic_mode) {
-    int length = LargeIntValue::to_buffer(data, pos + !dynamic_mode);
+    auto length = LargeIntValue::to_buffer(data, pos + !dynamic_mode);
     if (!dynamic_mode) {
         int1store(pos++, length);
     }
@@ -178,20 +178,8 @@ static char* add_largeint(int128_t data, char* pos, bool dynamic_mode) {
 
 template <typename T>
 char* add_float(T data, char* pos, bool dynamic_mode) {
-    int length = 0;
-    if constexpr (std::is_same_v<T, float>) {
-        length = FastFloatToBuffer(data, pos + !dynamic_mode);
-    } else if constexpr (std::is_same_v<T, double>) {
-        length = FastDoubleToBuffer(data, pos + !dynamic_mode);
-    }
-    if (!dynamic_mode) {
-        int1store(pos++, length);
-    }
-    return pos + length;
-}
-
-static char* add_time(double data, char* pos, bool dynamic_mode) {
-    int length = time_to_buffer_from_double(data, pos + !dynamic_mode);
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>);
+    int length = vectorized::CastToString::from_number(data, pos + !dynamic_mode);
     if (!dynamic_mode) {
         int1store(pos++, length);
     }
@@ -199,12 +187,13 @@ static char* add_time(double data, char* pos, bool dynamic_mode) {
 }
 
 static char* add_timev2(double data, char* pos, bool dynamic_mode, int scale) {
-    int length = timev2_to_buffer_from_double(data, pos + !dynamic_mode, scale);
+    uint8_t length = timev2_to_buffer_from_double(data, pos + !dynamic_mode, scale);
     if (!dynamic_mode) {
         int1store(pos++, length);
     }
     return pos + length;
 }
+
 template <typename DateType>
 static char* add_datetime(const DateType& data, char* pos, bool dynamic_mode) {
     int length = data.to_buffer(pos + !dynamic_mode);
@@ -360,32 +349,79 @@ int MysqlRowBuffer<is_binary_format>::push_double(double data) {
     return 0;
 }
 
-template <bool is_binary_format>
-int MysqlRowBuffer<is_binary_format>::push_time(double data) {
-    if (is_binary_format && !_dynamic_mode) {
-        char buff[8];
-        _field_pos++;
-        float8store(buff, data);
-        return append(buff, 8);
+// Refer to https://dev.mysql.com/doc/refman/5.7/en/time.html
+// Encode time into MySQL binary protocol format with support for scale (microsecond precision)
+// Time value is limited between '-838:59:59' and '838:59:59'
+static int encode_binary_timev2(char* buff, double time, int scale) {
+    // Check if scale is valid (0 to 6)
+    if (scale < 0 || scale > 6) {
+        return -1; // Return error for invalid scale
     }
-    // 1 for string trail, 1 for length, other for time str
-    reserve(2 + MAX_TIME_WIDTH);
 
-    _pos = add_time(data, _pos, _dynamic_mode);
-    return 0;
+    int pos = 0;                      // Current position in the buffer
+    bool is_negative = time < 0;      // Determine if the time is negative
+    double abs_time = std::abs(time); // Convert time to absolute value
+
+    // Maximum time in microseconds: 838 hours, 59 minutes, 59 seconds
+    const int64_t MAX_TIME_MICROSECONDS = (838 * 3600 + 59 * 60 + 59) * 1000000LL;
+
+    // Convert time into microseconds and enforce range limit
+    auto total_microseconds = static_cast<int64_t>(abs_time); // Total microseconds
+    total_microseconds = std::min(total_microseconds, MAX_TIME_MICROSECONDS);
+
+    // Adjust microseconds precision based on scale
+    total_microseconds /= static_cast<int64_t>(std::pow(10, 6 - scale)); // Scale adjustment
+    total_microseconds *= static_cast<int64_t>(std::pow(10, 6 - scale)); // Truncate extra precision
+
+    // Extract days, hours, minutes, seconds, and microseconds
+    int64_t days = total_microseconds / (3600LL * 24 * 1000000); // Calculate days
+    total_microseconds %= (3600LL * 24 * 1000000);
+
+    int64_t hours = total_microseconds / (3600LL * 1000000); // Remaining hours
+    total_microseconds %= (3600LL * 1000000);
+
+    int64_t minutes = total_microseconds / (60LL * 1000000); // Remaining minutes
+    total_microseconds %= (60LL * 1000000);
+
+    int64_t seconds = total_microseconds / 1000000;      // Remaining seconds
+    int64_t microseconds = total_microseconds % 1000000; // Remaining microseconds
+
+    // MySQL binary protocol rules for time encoding
+    if (days == 0 && hours == 0 && minutes == 0 && seconds == 0 && microseconds == 0) {
+        buff[pos++] = 0; // All zero: length is 0
+    } else if (microseconds == 0) {
+        buff[pos++] = 8;                                    // No microseconds: length is 8
+        buff[pos++] = is_negative ? 1 : 0;                  // Sign byte
+        int4store(buff + pos, static_cast<uint32_t>(days)); // Store days (4 bytes)
+        pos += 4;
+        buff[pos++] = static_cast<char>(hours);   // Store hours (1 byte)
+        buff[pos++] = static_cast<char>(minutes); // Store minutes (1 byte)
+        buff[pos++] = static_cast<char>(seconds); // Store seconds (1 byte)
+    } else {
+        buff[pos++] = 12;                                   // Include microseconds: length is 12
+        buff[pos++] = is_negative ? 1 : 0;                  // Sign byte
+        int4store(buff + pos, static_cast<uint32_t>(days)); // Store days (4 bytes)
+        pos += 4;
+        buff[pos++] = static_cast<char>(hours);                     // Store hours (1 byte)
+        buff[pos++] = static_cast<char>(minutes);                   // Store minutes (1 byte)
+        buff[pos++] = static_cast<char>(seconds);                   // Store seconds (1 byte)
+        int4store(buff + pos, static_cast<uint32_t>(microseconds)); // Store microseconds (4 bytes)
+        pos += 4;
+    }
+
+    return pos; // Return total bytes written to buffer
 }
 
 template <bool is_binary_format>
 int MysqlRowBuffer<is_binary_format>::push_timev2(double data, int scale) {
     if (is_binary_format && !_dynamic_mode) {
-        char buff[8];
+        char buff[13];
         _field_pos++;
-        float8store(buff, data);
-        return append(buff, 8);
+        int length = encode_binary_timev2(buff, data, scale);
+        return append(buff, length);
     }
-    // 1 for string trail, 1 for length, other for time str
-    reserve(2 + MAX_TIME_WIDTH);
 
+    reserve(2 + MAX_TIME_WIDTH);
     _pos = add_timev2(data, _pos, _dynamic_mode, scale);
     return 0;
 }
@@ -497,7 +533,7 @@ int MysqlRowBuffer<is_binary_format>::push_null() {
         uint offset = (_field_pos + 2) / 8 + 1;
         uint bit = (1 << ((_field_pos + 2) & 7));
         /* Room for this as it's allocated start_binary_row*/
-        char* to = (char*)_buf + offset;
+        char* to = _buf + offset;
         *to = (char)((uchar)*to | (uchar)bit);
         _field_pos++;
         return 0;
@@ -507,15 +543,6 @@ int MysqlRowBuffer<is_binary_format>::push_null() {
     int1store(_pos, 251);
     _pos += 1;
     return 0;
-}
-
-template <bool is_binary_format>
-char* MysqlRowBuffer<is_binary_format>::reserved(int64_t size) {
-    reserve(size);
-    char* old_buf = _pos;
-    _pos += size;
-
-    return old_buf;
 }
 
 template class MysqlRowBuffer<true>;

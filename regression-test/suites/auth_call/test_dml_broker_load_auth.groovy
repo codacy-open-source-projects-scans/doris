@@ -37,17 +37,18 @@ suite("test_dml_broker_load_auth","p0,auth_call") {
     String region = getS3Region()
     String bucket = getS3BucketName()
 
+    try_sql("DROP USER ${user}")
+    try_sql """drop database if exists ${dbName}"""
+    sql """CREATE USER '${user}' IDENTIFIED BY '${pwd}'"""
+
     //cloud-mode
     if (isCloudMode()) {
         def clusters = sql " SHOW CLUSTERS; "
         assertTrue(!clusters.isEmpty())
         def validCluster = clusters[0][0]
-        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
     }
 
-    try_sql("DROP USER ${user}")
-    try_sql """drop database if exists ${dbName}"""
-    sql """CREATE USER '${user}' IDENTIFIED BY '${pwd}'"""
     sql """grant select_priv on regression_test to ${user}"""
     sql """create database ${dbName}"""
 
@@ -118,7 +119,8 @@ suite("test_dml_broker_load_auth","p0,auth_call") {
             "AWS_SECRET_KEY" = "$sk",
             "AWS_ENDPOINT" = "$endpoint",
             "AWS_REGION" = "$region",
-            "compress_type" = "GZ"
+            "compress_type" = "GZ",
+            "provider" = "${getS3Provider()}"
         )
         properties(
             "timeout" = "28800",

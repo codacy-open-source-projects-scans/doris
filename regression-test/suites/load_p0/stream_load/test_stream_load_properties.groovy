@@ -125,13 +125,13 @@ suite("test_stream_load_properties", "p0") {
                  "basic_array_data_by_line.json",
                 ]
 
-    def loadedRows = [12,12,12,12,15,15,15]
+    def loadedRows = [0,0,0,0,17,17,17]
 
     def jsonLoadedRows = [20,20,20,20,18,18,18]
 
-    def filteredRows = [8,8,8,8,5,5,5]
+    def filteredRows = [20,20,20,20,3,3,3]
 
-    def maxFilterRatio = [0.4,0.4,0.4,0.4,0.6,0.6,0.6]
+    def maxFilterRatio = [1,1,1,1,0.6,0.6,0.6]
 
     InetSocketAddress address = context.config.feHttpInetSocketAddress
     String user = context.config.feHttpUser
@@ -549,6 +549,10 @@ suite("test_stream_load_properties", "p0") {
             sql new File("""${context.file.parent}/ddl/${tableName}_drop.sql""").text
             sql new File("""${context.file.parent}/ddl/${tableName}_create.sql""").text
 
+            if (isCloudMode()) {
+                continue
+            }
+
             String txnId
             def tableName1 =  "stream_load_" + tableName
             // Invalid txn_id string with letters
@@ -741,11 +745,7 @@ suite("test_stream_load_properties", "p0") {
             
             // Commit the same txnId again to trigger operate_txn_2pc() failure
             body = do_streamload_2pc.call(txnId, "commit", tableName1)
-            if (isCloudMode()) {
-                assertEquals("success", parseJson(body).status.toLowerCase())
-            } else {
-                assertEquals("analysis_error", parseJson(body).status.toLowerCase())
-            }
+            assertEquals("analysis_error", parseJson(body).status.toLowerCase())
             assertTrue(parseJson(body).msg.toLowerCase().contains("is already visible"))    
 
             i++

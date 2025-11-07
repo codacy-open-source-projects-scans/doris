@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.processor.post;
 
 import org.apache.doris.nereids.CascadesContext;
+import org.apache.doris.nereids.properties.ChildOutputPropertyDeriver;
 import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
@@ -33,6 +34,7 @@ import org.apache.doris.nereids.trees.plans.algebra.Aggregate;
 import org.apache.doris.nereids.trees.plans.physical.AbstractPhysicalPlan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalDistribute;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalHashAggregate;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalPlan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalProject;
 import org.apache.doris.nereids.util.ExpressionUtils;
 
@@ -46,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * create project under aggregate to enable CSE
@@ -65,16 +68,24 @@ public class ProjectAggregateExpressionsForCse extends PlanPostProcessor {
         // cseCandidates: A+B -> alias(A+B)
         Map<Expression, Alias> cseCandidates = new HashMap<>();
         Set<Slot> inputSlots = new HashSet<>();
+        List<Expression> allAggFunctionChildren = new ArrayList<>();
 
         for (Expression expr : aggregate.getExpressions()) {
-            getCseCandidatesFromAggregateFunction(expr, cseCandidates);
+            getCseCandidatesFromAggregateFunction(expr, cseCandidates, allAggFunctionChildren);
             inputSlots.addAll(expr.getInputSlots());
         }
         if (cseCandidates.isEmpty()) {
             // no opportunity to generate cse
             return aggregate;
         }
-
+        CommonSubExpressionCollector collector = new CommonSubExpressionCollector();
+        for (Expression expr : allAggFunctionChildren) {
+            collector.collect(expr);
+        }
+        if (collector.commonExprByDepth.isEmpty()) {
+            // no opportunity to generate cse
+            return aggregate;
+        }
         if (aggregate.child() instanceof PhysicalProject) {
             List<NamedExpression> projections = ((PhysicalProject) aggregate.child()).getProjects();
             Map<Slot, Expression> replaceMap = new HashMap<>();
@@ -102,10 +113,44 @@ public class ProjectAggregateExpressionsForCse extends PlanPostProcessor {
         }
 
         if (aggregate.child() instanceof PhysicalProject) {
+            List<NamedExpression> newProjections = Lists.newArrayList();
+            // do column prune
+            // case 1:
+            // original plan
+            //   agg(groupKey[C+1, abs(C+1)]
+            //     -->project(A+B as C)
+            //
+            //  "A+B as C" should be reserved
+            //  new plan
+            //  agg(groupKey=[D, abs(D)])
+            //    -->project(A+B as C, C+1 as D)
+            //  case 2:
+            // original plan
+            //  agg(groupKey[A+1, abs(A+1)], output[sum(B)])
+            //    --> project(A, B)
+            // "A+1" is extracted, we have
+            //  plan1:
+            //    agg(groupKey[X, abs(X)], output[sum(B)])
+            //         --> project(A, B, A+1 as X)
+            // then column prune(A should be pruned, because it is not used directly by AGG)
+            // we have plan2:
+            //     agg(groupKey[X, abs(X)], output[sum(B)])
+            //          -->project(B, A+1 as X)
             PhysicalProject<? extends Plan> project = (PhysicalProject<? extends Plan>) aggregate.child();
-            List<NamedExpression> newProjections = Lists.newArrayList(project.getProjects());
+            Set<Slot> newInputSlots = aggOutputReplaced.stream()
+                    .flatMap(expr -> expr.getInputSlots().stream())
+                    .collect(Collectors.toSet());
+            for (NamedExpression expr : project.getProjects()) {
+                if (!(expr instanceof SlotReference) || newInputSlots.contains(expr)) {
+                    newProjections.add(expr);
+                }
+            }
             newProjections.addAll(cseCandidates.values());
-            project = project.withProjectionsAndChild(newProjections, (Plan) project.child());
+
+            project = project.withProjectionsAndChild(newProjections, project.child());
+            PhysicalProperties projectPhysicalProperties = ChildOutputPropertyDeriver.computeProjectOutputProperties(
+                    project.getProjects(), ((PhysicalPlan) project.child()).getPhysicalProperties());
+            project = project.withPhysicalPropertiesAndStats(projectPhysicalProperties, project.getStats());
             aggregate = (PhysicalHashAggregate<? extends Plan>) aggregate
                     .withAggOutput(aggOutputReplaced)
                     .withChildren(project);
@@ -122,9 +167,8 @@ public class ProjectAggregateExpressionsForCse extends PlanPostProcessor {
                     () -> DataTrait.EMPTY_TRAIT
             );
             AbstractPhysicalPlan child = ((AbstractPhysicalPlan) aggregate.child());
-            PhysicalProperties projectPhysicalProperties = new PhysicalProperties(
-                    child.getPhysicalProperties().getDistributionSpec(),
-                    child.getPhysicalProperties().getOrderSpec());
+            PhysicalProperties projectPhysicalProperties = ChildOutputPropertyDeriver.computeProjectOutputProperties(
+                    projections, child.getPhysicalProperties());
             PhysicalProject<? extends Plan> project = new PhysicalProject<>(projections, Optional.empty(),
                     projectLogicalProperties,
                     projectPhysicalProperties,
@@ -137,10 +181,12 @@ public class ProjectAggregateExpressionsForCse extends PlanPostProcessor {
         return aggregate;
     }
 
-    private void getCseCandidatesFromAggregateFunction(Expression expr, Map<Expression, Alias> result) {
+    private void getCseCandidatesFromAggregateFunction(Expression expr, Map<Expression, Alias> result,
+            List<Expression> allAggFuncChild) {
         if (expr instanceof AggregateFunction) {
             for (Expression child : expr.children()) {
                 if (!(child instanceof SlotReference) && !child.isConstant() && !(child instanceof OrderExpression)) {
+                    allAggFuncChild.add(child);
                     if (child instanceof Alias) {
                         result.put(child, (Alias) child);
                     } else {
@@ -151,7 +197,7 @@ public class ProjectAggregateExpressionsForCse extends PlanPostProcessor {
         } else {
             for (Expression child : expr.children()) {
                 if (!(child instanceof SlotReference) && !child.isConstant()) {
-                    getCseCandidatesFromAggregateFunction(child, result);
+                    getCseCandidatesFromAggregateFunction(child, result, allAggFuncChild);
                 }
             }
         }

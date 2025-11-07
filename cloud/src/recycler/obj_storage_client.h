@@ -30,9 +30,15 @@ struct ObjectStoragePathRef {
 };
 
 struct ObjectStorageResponse {
-    ObjectStorageResponse(int r = 0, std::string msg = "") : ret(r), error_msg(std::move(msg)) {}
+    enum Code : int {
+        UNDEFINED = -1,
+        OK = 0,
+        NOT_FOUND = 1,
+    };
+
+    ObjectStorageResponse(int r = OK, std::string msg = "") : ret(r), error_msg(std::move(msg)) {}
     // clang-format off
-    int ret {0}; // To unify the error handle logic with BE, we'd better use the same error code as BE
+    int ret {OK}; // To unify the error handle logic with BE, we'd better use the same error code as BE
     // clang-format on
     std::string error_msg;
 };
@@ -96,6 +102,9 @@ public:
     // Check if the objects' versioning is on or off
     // returns 0 when versioning is on, otherwise versioning is off or check failed
     virtual ObjectStorageResponse check_versioning(const std::string& bucket) = 0;
+
+    virtual ObjectStorageResponse abort_multipart_upload(ObjectStoragePathRef path,
+                                                         const std::string& upload_id) = 0;
 
 protected:
     ObjectStorageResponse delete_objects_recursively_(ObjectStoragePathRef path,

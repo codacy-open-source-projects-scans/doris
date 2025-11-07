@@ -37,6 +37,7 @@ import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.StringLiteral;
 import org.apache.doris.nereids.trees.plans.logical.LogicalEmptyRelation;
 import org.apache.doris.nereids.util.ExpressionUtils;
+import org.apache.doris.planner.GroupCommitBlockSink;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.GlobalVariable;
 import org.apache.doris.qe.SessionVariable;
@@ -94,6 +95,12 @@ public class SetSessionVarOp extends SetVarOp {
         if (name.equalsIgnoreCase(SessionVariable.TIME_ZONE)) {
             this.value = new StringLiteral(TimeUtils.checkTimeZoneValidAndStandardize(value.getStringValue()));
         }
+        if (name.equalsIgnoreCase(SessionVariable.GROUP_COMMIT)) {
+            if (GroupCommitBlockSink.parseGroupCommit(value.getStringValue()) == null) {
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_VALUE_FOR_VAR,
+                        SessionVariable.GROUP_COMMIT, value);
+            }
+        }
 
         if (name.equalsIgnoreCase(SessionVariable.EXEC_MEM_LIMIT)
                 || name.equalsIgnoreCase(SessionVariable.SCAN_QUEUE_MEM_LIMIT)) {
@@ -109,6 +116,16 @@ public class SetSessionVarOp extends SetVarOp {
                 // But ParseUtil.analyzeDataVolume() does not accept 0 as a valid value.
                 // So for compatibility, we set origin value to file_split_size
                 // when the value is 0 or other invalid value.
+                this.value = new StringLiteral(value.getStringValue());
+            }
+        }
+
+        if (name.equalsIgnoreCase(SessionVariable.MERGE_IO_READ_SLICE_SIZE_BYTES)) {
+            try {
+                this.value = new StringLiteral(
+                        Long.toString(ParseUtil.analyzeDataVolume(value.getStringValue())));
+            } catch (Throwable t) {
+                // see comments of FILE_SPLIT_SIZE
                 this.value = new StringLiteral(value.getStringValue());
             }
         }

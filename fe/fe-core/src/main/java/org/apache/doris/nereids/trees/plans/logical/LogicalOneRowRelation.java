@@ -24,26 +24,36 @@ import org.apache.doris.nereids.trees.expressions.Alias;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.expressions.WindowExpression;
+import org.apache.doris.nereids.trees.expressions.functions.generator.TableGeneratingFunction;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.GroupingScalarFunction;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.algebra.OneRowRelation;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
+import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * A relation that contains only one row consist of some constant expressions.
  * e.g. select 100, 'value'
  */
-public class LogicalOneRowRelation extends LogicalRelation implements OneRowRelation, OutputPrunable {
+public class LogicalOneRowRelation extends LogicalRelation implements OneRowRelation, OutputPrunable, ProjectMergeable {
+
+    public static final Set<Class<? extends Expression>> FORBIDDEN_EXPRESSIONS = ImmutableSet.of(
+            GroupingScalarFunction.class, TableGeneratingFunction.class, WindowExpression.class
+    );
 
     private final List<NamedExpression> projects;
 
@@ -54,12 +64,24 @@ public class LogicalOneRowRelation extends LogicalRelation implements OneRowRela
     private LogicalOneRowRelation(RelationId relationId, List<NamedExpression> projects,
             Optional<GroupExpression> groupExpression, Optional<LogicalProperties> logicalProperties) {
         super(relationId, PlanType.LOGICAL_ONE_ROW_RELATION, groupExpression, logicalProperties);
-        this.projects = ImmutableList.copyOf(Objects.requireNonNull(projects, "projects can not be null"));
+        this.projects = Utils.fastToImmutableList(Objects.requireNonNull(projects, "projects can not be null"));
     }
 
     @Override
     public <R, C> R accept(PlanVisitor<R, C> visitor, C context) {
         return visitor.visitLogicalOneRowRelation(this, context);
+    }
+
+    public boolean isValid() {
+        return !ExpressionUtils.containsTypes(projects, FORBIDDEN_EXPRESSIONS);
+    }
+
+    @Override
+    public boolean canProcessProject(List<NamedExpression> parentProjects) {
+        if (ExpressionUtils.containsTypes(parentProjects, FORBIDDEN_EXPRESSIONS)) {
+            return false;
+        }
+        return ProjectMergeable.super.canProcessProject(parentProjects);
     }
 
     @Override
@@ -86,6 +108,10 @@ public class LogicalOneRowRelation extends LogicalRelation implements OneRowRela
     @Override
     public LogicalOneRowRelation withRelationId(RelationId relationId) {
         throw new RuntimeException("should not call LogicalOneRowRelation's withRelationId method");
+    }
+
+    public LogicalOneRowRelation withRelationIdAndProjects(RelationId relationId, List<NamedExpression> projects) {
+        return new LogicalOneRowRelation(relationId, projects);
     }
 
     @Override

@@ -19,7 +19,9 @@
 
 #include <type_traits>
 
+#include "runtime/primitive_type.h"
 #include "vec/columns/column_array.h"
+#include "vec/columns/column_decimal.h"
 #include "vec/columns/column_string.h"
 #include "vec/data_types/data_type_array.h"
 #include "vec/functions/array/function_array_utils.h"
@@ -142,9 +144,9 @@ public:
                           bool right_const) {
         ColumnArrayMutableData dst;
         if (left_data.nested_nullmap_data || right_data.nested_nullmap_data) {
-            dst = create_mutable_data(left_data.nested_col, true);
+            dst = create_mutable_data(left_data.nested_col.get(), true);
         } else {
-            dst = create_mutable_data(left_data.nested_col, false);
+            dst = create_mutable_data(left_data.nested_col.get(), false);
         }
         ColumnPtr res_column;
         if (left_const) {
@@ -174,7 +176,7 @@ private:
                                   const ColumnArrayExecutionData& left_data,
                                   const ColumnArrayExecutionData& right_data) {
         using Impl = OpenSetImpl<operation, ColumnType>;
-        if (!check_column<ColumnType>(*left_data.nested_col)) {
+        if (!is_column<ColumnType>(*left_data.nested_col)) {
             return false;
         }
         constexpr auto execute_left_column_first = Impl::Action::execute_left_column_first;

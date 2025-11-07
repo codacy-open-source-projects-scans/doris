@@ -31,13 +31,14 @@ import org.apache.doris.proto.InternalService.PGetWalQueueSizeResponse;
 import org.apache.doris.proto.InternalService.PGroupCommitInsertRequest;
 import org.apache.doris.proto.InternalService.PGroupCommitInsertResponse;
 import org.apache.doris.proto.Types;
-import org.apache.doris.thrift.TExecPlanFragmentParamsList;
 import org.apache.doris.thrift.TFoldConstantParams;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TPipelineFragmentParamsList;
 import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.collect.Maps;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.protobuf.ByteString;
 import org.apache.logging.log4j.LogManager;
@@ -157,38 +158,6 @@ public class BackendServiceProxy {
     }
 
     public Future<InternalService.PExecPlanFragmentResult> execPlanFragmentsAsync(TNetworkAddress address,
-            TExecPlanFragmentParamsList paramsList, boolean twoPhaseExecution) throws TException, RpcException {
-        InternalService.PExecPlanFragmentRequest.Builder builder =
-                InternalService.PExecPlanFragmentRequest.newBuilder();
-        if (Config.use_compact_thrift_rpc) {
-            builder.setRequest(
-                    ByteString.copyFrom(new TSerializer(new TCompactProtocol.Factory()).serialize(paramsList)));
-            builder.setCompact(true);
-        } else {
-            builder.setRequest(ByteString.copyFrom(new TSerializer().serialize(paramsList))).build();
-            builder.setCompact(false);
-        }
-        // VERSION 2 means we send TExecPlanFragmentParamsList, not single TExecPlanFragmentParams
-        builder.setVersion(InternalService.PFragmentRequestVersion.VERSION_2);
-
-        final InternalService.PExecPlanFragmentRequest pRequest = builder.build();
-        MetricRepo.BE_COUNTER_QUERY_RPC_ALL.getOrAdd(address.hostname).increase(1L);
-        MetricRepo.BE_COUNTER_QUERY_RPC_SIZE.getOrAdd(address.hostname).increase((long) pRequest.getSerializedSize());
-        try {
-            final BackendServiceClient client = getProxy(address);
-            if (twoPhaseExecution) {
-                return client.execPlanFragmentPrepareAsync(pRequest);
-            } else {
-                return client.execPlanFragmentAsync(pRequest);
-            }
-        } catch (Throwable e) {
-            LOG.warn("Execute plan fragment catch a exception, address={}:{}", address.getHostname(), address.getPort(),
-                    e);
-            throw new RpcException(address.hostname, e.getMessage());
-        }
-    }
-
-    public Future<InternalService.PExecPlanFragmentResult> execPlanFragmentsAsync(TNetworkAddress address,
             TPipelineFragmentParamsList params, boolean twoPhaseExecution) throws TException, RpcException {
         InternalService.PExecPlanFragmentRequest.Builder builder =
                 InternalService.PExecPlanFragmentRequest.newBuilder();
@@ -288,6 +257,23 @@ public class BackendServiceProxy {
         try {
             final BackendServiceClient client = getProxy(address);
             return client.fetchDataAsync(request);
+        } catch (Throwable e) {
+            LOG.warn("fetch data catch a exception, address={}:{}",
+                    address.getHostname(), address.getPort(), e);
+            throw new RpcException(address.hostname, e.getMessage());
+        }
+    }
+
+    public Future<InternalService.PFetchDataResult> fetchDataAsyncWithCallback(
+            TNetworkAddress address, InternalService.PFetchDataRequest request,
+            FutureCallback<InternalService.PFetchDataResult> callback) throws RpcException {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            ListenableFuture<InternalService.PFetchDataResult> future = client.fetchDataAsync(request);
+            Futures.addCallback(
+                    future, callback,
+                    grpcThreadPool);
+            return future;
         } catch (Throwable e) {
             LOG.warn("fetch data catch a exception, address={}:{}",
                     address.getHostname(), address.getPort(), e);
@@ -569,4 +555,36 @@ public class BackendServiceProxy {
         return null;
     }
 
+    public Future<InternalService.PDeleteDictionaryResponse> deleteDictionaryAsync(TNetworkAddress address,
+            int timeoutSec, InternalService.PDeleteDictionaryRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.deleteDictionary(request, timeoutSec);
+        } catch (Throwable e) {
+            LOG.warn("delete dictionary failed, address={}:{}", address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
+
+    public Future<InternalService.PCommitRefreshDictionaryResponse> commitDictionaryAsync(TNetworkAddress address,
+            int timeoutSec, InternalService.PCommitRefreshDictionaryRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.commitRefreshDictionary(request, timeoutSec);
+        } catch (Throwable e) {
+            LOG.warn("commit refresh dictionary failed, address={}:{}", address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
+
+    public Future<InternalService.PAbortRefreshDictionaryResponse> abortDictionaryAsync(TNetworkAddress address,
+            int timeoutSec, InternalService.PAbortRefreshDictionaryRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.abortRefreshDictionary(request, timeoutSec);
+        } catch (Throwable e) {
+            LOG.warn("abort refrersh dictionary failed, address={}:{}", address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
 }

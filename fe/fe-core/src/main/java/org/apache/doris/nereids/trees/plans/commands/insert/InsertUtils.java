@@ -29,31 +29,43 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.FormatOptions;
 import org.apache.doris.datasource.hive.HMSExternalTable;
 import org.apache.doris.datasource.jdbc.JdbcExternalTable;
+import org.apache.doris.nereids.CascadesContext;
+import org.apache.doris.nereids.analyzer.Scope;
 import org.apache.doris.nereids.analyzer.UnboundAlias;
+import org.apache.doris.nereids.analyzer.UnboundBlackholeSink;
+import org.apache.doris.nereids.analyzer.UnboundDictionarySink;
+import org.apache.doris.nereids.analyzer.UnboundFunction;
 import org.apache.doris.nereids.analyzer.UnboundHiveTableSink;
 import org.apache.doris.nereids.analyzer.UnboundIcebergTableSink;
+import org.apache.doris.nereids.analyzer.UnboundInlineTable;
 import org.apache.doris.nereids.analyzer.UnboundJdbcTableSink;
-import org.apache.doris.nereids.analyzer.UnboundOneRowRelation;
+import org.apache.doris.nereids.analyzer.UnboundSlot;
+import org.apache.doris.nereids.analyzer.UnboundStar;
 import org.apache.doris.nereids.analyzer.UnboundTableSink;
+import org.apache.doris.nereids.analyzer.UnboundVariable;
 import org.apache.doris.nereids.exceptions.AnalysisException;
-import org.apache.doris.nereids.parser.LogicalPlanBuilder;
 import org.apache.doris.nereids.parser.NereidsParser;
+import org.apache.doris.nereids.properties.PhysicalProperties;
+import org.apache.doris.nereids.rules.analysis.ExpressionAnalyzer;
+import org.apache.doris.nereids.rules.expression.ExpressionRewriteContext;
+import org.apache.doris.nereids.rules.expression.rules.ConvertAggStateCast;
+import org.apache.doris.nereids.rules.expression.rules.FoldConstantRuleOnFE;
 import org.apache.doris.nereids.trees.expressions.Alias;
 import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.DefaultValueSlot;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
-import org.apache.doris.nereids.trees.expressions.StatementScopeIdGenerator;
-import org.apache.doris.nereids.trees.expressions.literal.ArrayLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
 import org.apache.doris.nereids.trees.plans.Plan;
-import org.apache.doris.nereids.trees.plans.algebra.SetOperation.Qualifier;
+import org.apache.doris.nereids.trees.plans.algebra.InlineTable;
 import org.apache.doris.nereids.trees.plans.commands.info.DMLCommandType;
 import org.apache.doris.nereids.trees.plans.logical.LogicalInlineTable;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.UnboundLogicalSink;
+import org.apache.doris.nereids.types.AggStateType;
 import org.apache.doris.nereids.types.DataType;
+import org.apache.doris.nereids.types.VarcharType;
 import org.apache.doris.nereids.util.RelationUtil;
 import org.apache.doris.nereids.util.TypeCoercionUtils;
 import org.apache.doris.proto.InternalService;
@@ -79,7 +91,9 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -164,15 +178,7 @@ public class InsertUtils {
                 throw new AnalysisException(
                         "do not support non-literal expr in transactional insert operation: " + expr.toSql());
             }
-            if (expr instanceof NullLiteral) {
-                row.addColBuilder().setValue(StmtExecutor.NULL_VALUE_FOR_LOAD);
-            } else if (expr instanceof ArrayLiteral) {
-                row.addColBuilder().setValue(String.format("\"%s\"",
-                        ((ArrayLiteral) expr).toLegacyLiteral().getStringValueForArray(options)));
-            } else {
-                row.addColBuilder().setValue(String.format("\"%s\"",
-                        ((Literal) expr).toLegacyLiteral().getStringValue()));
-            }
+            row.addColBuilder().setValue(((Literal) expr).toLegacyLiteral().getStringValueForStreamLoad(options));
         }
         return row.build();
     }
@@ -187,7 +193,7 @@ public class InsertUtils {
         }
         TTxnParams txnConf = txnEntry.getTxnConf();
         SessionVariable sessionVariable = ctx.getSessionVariable();
-        long timeoutSecond = ctx.getExecTimeout();
+        long timeoutSecond = ctx.getExecTimeoutS();
         TransactionState.LoadJobSourceType sourceType = TransactionState.LoadJobSourceType.INSERT_STREAMING;
         Database dbObj = Env.getCurrentInternalCatalog()
                 .getDbOrException(dbName, s -> new AnalysisException("database is invalid for dbName: " + s));
@@ -241,7 +247,6 @@ public class InsertUtils {
                 .setTimeout((int) timeoutSecond)
                 .setTimezone(timeZone)
                 .setSendBatchParallelism(sendBatchParallelism)
-                .setTrimDoubleQuotes(true)
                 .setSequenceCol(columns.stream()
                         .filter(c -> Column.SEQUENCE_COL.equalsIgnoreCase(c.getName()))
                         .map(Column::getName)
@@ -260,7 +265,20 @@ public class InsertUtils {
     /**
      * normalize plan to let it could be process correctly by nereids
      */
-    public static Plan normalizePlan(Plan plan, TableIf table, Optional<InsertCommandContext> insertCtx) {
+    public static Plan normalizePlan(LogicalPlan plan, TableIf table,
+            Optional<CascadesContext> analyzeContext,
+            Optional<InsertCommandContext> insertCtx) {
+        table.readLock();
+        try {
+            return normalizePlanWithoutLock(plan, table, analyzeContext, insertCtx);
+        } finally {
+            table.readUnlock();
+        }
+    }
+
+    private static Plan normalizePlanWithoutLock(LogicalPlan plan, TableIf table,
+                                     Optional<CascadesContext> analyzeContext,
+                                     Optional<InsertCommandContext> insertCtx) {
         UnboundLogicalSink<? extends Plan> unboundLogicalSink = (UnboundLogicalSink<? extends Plan>) plan;
         if (table instanceof HMSExternalTable) {
             HMSExternalTable hiveTable = (HMSExternalTable) table;
@@ -305,7 +323,7 @@ public class InsertUtils {
                                     throw new AnalysisException("Partial update should include all key columns,"
                                             + " missing: " + col.getName());
                                 }
-                                if (!col.getGeneratedColumnsThatReferToThis().isEmpty()
+                                if (CollectionUtils.isNotEmpty(col.getGeneratedColumnsThatReferToThis())
                                         && col.getGeneratedColumnInfo() == null && !insertCol.isPresent()) {
                                     throw new AnalysisException("Partial update should include"
                                             + " all ordinary columns referenced"
@@ -334,21 +352,40 @@ public class InsertUtils {
         }
         Plan query = unboundLogicalSink.child();
         checkGeneratedColumnForInsertIntoSelect(table, unboundLogicalSink, insertCtx);
-        if (!(query instanceof LogicalInlineTable)) {
+        if (!(query instanceof UnboundInlineTable)) {
             return plan;
         }
-        LogicalInlineTable logicalInlineTable = (LogicalInlineTable) query;
-        ImmutableList.Builder<LogicalPlan> oneRowRelationBuilder = ImmutableList.builder();
+
+        UnboundInlineTable unboundInlineTable = (UnboundInlineTable) query;
+        ImmutableList.Builder<List<NamedExpression>> optimizedRowConstructors
+                = ImmutableList.builderWithExpectedSize(unboundInlineTable.getConstantExprsList().size());
         List<Column> columns = table.getBaseSchema(false);
 
-        for (List<NamedExpression> values : logicalInlineTable.getConstantExprsList()) {
-            ImmutableList.Builder<NamedExpression> constantExprs = ImmutableList.builder();
+        ConnectContext context = ConnectContext.get();
+        ExpressionRewriteContext rewriteContext = null;
+        if (context != null && context.getStatementContext() != null) {
+            rewriteContext = new ExpressionRewriteContext(
+                    CascadesContext.initContext(
+                            context.getStatementContext(), unboundInlineTable, PhysicalProperties.ANY
+                    )
+            );
+        }
+
+        Optional<ExpressionAnalyzer> analyzer = analyzeContext.map(
+                cascadesContext -> buildExprAnalyzer(plan, cascadesContext)
+        );
+        boolean strictCast = SessionVariable.enableStrictCast();
+        for (List<NamedExpression> values : unboundInlineTable.getConstantExprsList()) {
+            ImmutableList.Builder<NamedExpression> optimizedRowConstructor = ImmutableList.builder();
             if (values.isEmpty()) {
                 if (CollectionUtils.isNotEmpty(unboundLogicalSink.getColNames())) {
                     throw new AnalysisException("value list should not be empty if columns are specified");
                 }
-                for (Column column : columns) {
-                    constantExprs.add(generateDefaultExpression(column));
+                for (int i = 0; i < columns.size(); i++) {
+                    Column column = columns.get(i);
+                    NamedExpression defaultExpression = generateDefaultExpression(column);
+                    addColumnValue(analyzer, optimizedRowConstructor, defaultExpression,
+                            null, rewriteContext, strictCast);
                 }
             } else {
                 if (CollectionUtils.isNotEmpty(unboundLogicalSink.getColNames())) {
@@ -374,10 +411,13 @@ public class InsertUtils {
                                     + "' in table '" + table.getName() + "' is not allowed.");
                         }
                         if (values.get(i) instanceof DefaultValueSlot) {
-                            constantExprs.add(generateDefaultExpression(sameNameColumn));
+                            NamedExpression defaultExpression = generateDefaultExpression(sameNameColumn);
+                            addColumnValue(analyzer, optimizedRowConstructor, defaultExpression,
+                                    null, rewriteContext, strictCast);
                         } else {
                             DataType targetType = DataType.fromCatalogType(sameNameColumn.getType());
-                            constantExprs.add((NamedExpression) castValue(values.get(i), targetType));
+                            addColumnValue(analyzer, optimizedRowConstructor, values.get(i),
+                                    targetType, rewriteContext, strictCast);
                         }
                     }
                 } else {
@@ -392,32 +432,125 @@ public class InsertUtils {
                                     + "' in table '" + table.getName() + "' is not allowed.");
                         }
                         if (values.get(i) instanceof DefaultValueSlot) {
-                            constantExprs.add(generateDefaultExpression(columns.get(i)));
+                            NamedExpression defaultExpression = generateDefaultExpression(columns.get(i));
+                            addColumnValue(analyzer, optimizedRowConstructor, defaultExpression,
+                                    null, rewriteContext, strictCast);
                         } else {
                             DataType targetType = DataType.fromCatalogType(columns.get(i).getType());
-                            constantExprs.add((NamedExpression) castValue(values.get(i), targetType));
+                            addColumnValue(analyzer, optimizedRowConstructor, values.get(i), targetType,
+                                    rewriteContext, strictCast);
                         }
                     }
                 }
             }
-            oneRowRelationBuilder.add(new UnboundOneRowRelation(
-                    StatementScopeIdGenerator.newRelationId(), constantExprs.build()));
+            optimizedRowConstructors.add(optimizedRowConstructor.build());
         }
-        List<LogicalPlan> oneRowRelations = oneRowRelationBuilder.build();
-        if (oneRowRelations.size() == 1) {
-            return plan.withChildren(oneRowRelations.get(0));
-        } else {
-            return plan.withChildren(
-                    LogicalPlanBuilder.reduceToLogicalPlanTree(0, oneRowRelations.size() - 1,
-                            oneRowRelations, Qualifier.ALL));
-        }
+        return plan.withChildren(new LogicalInlineTable(optimizedRowConstructors.build()));
     }
 
-    private static Expression castValue(Expression value, DataType targetType) {
-        if (value instanceof UnboundAlias) {
-            return value.withChildren(TypeCoercionUtils.castUnbound(((UnboundAlias) value).child(), targetType));
+    /** buildAnalyzer */
+    public static ExpressionAnalyzer buildExprAnalyzer(Plan plan, CascadesContext analyzeContext) {
+        return new ExpressionAnalyzer(plan, new Scope(ImmutableList.of()),
+            analyzeContext, false, false) {
+            @Override
+            public Expression visitCast(Cast cast, ExpressionRewriteContext context) {
+                Expression expr = super.visitCast(cast, context);
+                if (expr instanceof Cast) {
+                    if (expr.child(0).getDataType() instanceof AggStateType) {
+                        expr = ConvertAggStateCast.convert((Cast) expr);
+                    } else {
+                        expr = FoldConstantRuleOnFE.evaluate(expr, context);
+                    }
+                }
+                return expr;
+            }
+
+            @Override
+            public Expression visitUnboundFunction(UnboundFunction unboundFunction, ExpressionRewriteContext context) {
+                Expression expr = super.visitUnboundFunction(unboundFunction, context);
+                if (expr instanceof UnboundFunction) {
+                    throw new IllegalStateException("Can not analyze function " + unboundFunction.getName());
+                }
+                return expr;
+            }
+
+            @Override
+            public Expression visitUnboundSlot(UnboundSlot unboundSlot, ExpressionRewriteContext context) {
+                Expression expr = super.visitUnboundSlot(unboundSlot, context);
+                if (expr instanceof UnboundFunction) {
+                    throw new AnalysisException("Can not analyze slot " + unboundSlot.getName());
+                }
+                return expr;
+            }
+
+            @Override
+            public Expression visitUnboundVariable(UnboundVariable unboundVariable, ExpressionRewriteContext context) {
+                Expression expr = super.visitUnboundVariable(unboundVariable, context);
+                if (expr instanceof UnboundVariable) {
+                    throw new AnalysisException("Can not analyze variable " + unboundVariable.getName());
+                }
+                return expr;
+            }
+
+            @Override
+            public Expression visitUnboundAlias(UnboundAlias unboundAlias, ExpressionRewriteContext context) {
+                Expression expr = super.visitUnboundAlias(unboundAlias, context);
+                if (expr instanceof UnboundVariable) {
+                    throw new AnalysisException("Can not analyze alias");
+                }
+                return expr;
+            }
+
+            @Override
+            public Expression visitUnboundStar(UnboundStar unboundStar, ExpressionRewriteContext context) {
+                Expression expr = super.visitUnboundStar(unboundStar, context);
+                if (expr instanceof UnboundStar) {
+                    List<String> qualifier = unboundStar.getQualifier();
+                    List<String> qualified = new ArrayList<>(qualifier);
+                    qualified.add("*");
+                    throw new AnalysisException("Can not analyze " + StringUtils.join(qualified, "."));
+                }
+                return expr;
+            }
+        };
+    }
+
+    private static void addColumnValue(
+            Optional<ExpressionAnalyzer> analyzer,
+            ImmutableList.Builder<NamedExpression> optimizedRowConstructor,
+            NamedExpression value, DataType targetType, ExpressionRewriteContext rewriteContext,
+            boolean strictCast) {
+        if (targetType != null) {
+            // In strict cast/insert mode, we don't cast to target varchar type here,
+            // we cast to varchar max here and do substring accordingly in BindSink.
+            if (strictCast && (targetType.isVarcharType() || targetType.isCharType())) {
+                value = castValue(value, VarcharType.MAX_VARCHAR_TYPE);
+            } else {
+                value = castValue(value, targetType);
+            }
+        }
+        if (analyzer.isPresent() && !(value instanceof Alias && value.child(0) instanceof Literal)) {
+            ExpressionAnalyzer expressionAnalyzer = analyzer.get();
+            value = (NamedExpression) expressionAnalyzer.analyze(
+                    value, new ExpressionRewriteContext(expressionAnalyzer.getCascadesContext())
+            );
+            value = rewriteContext == null
+                    ? value
+                    : (NamedExpression) FoldConstantRuleOnFE.evaluate(value, rewriteContext);
+        }
+        optimizedRowConstructor.add(value);
+    }
+
+    private static NamedExpression castValue(Expression value, DataType targetType) {
+        if (value instanceof Alias) {
+            Expression oldChild = value.child(0);
+            Expression newChild = TypeCoercionUtils.castUnbound(oldChild, targetType);
+            return (Alias) (oldChild == newChild ? value : value.withChildren(newChild));
+        } else if (value instanceof UnboundAlias) {
+            UnboundAlias unboundAlias = (UnboundAlias) value;
+            return new UnboundAlias(TypeCoercionUtils.castUnbound(unboundAlias.child(), targetType));
         } else {
-            return TypeCoercionUtils.castUnbound(value, targetType);
+            return new UnboundAlias(TypeCoercionUtils.castUnbound(value, targetType));
         }
     }
 
@@ -425,6 +558,14 @@ public class InsertUtils {
      * get target table from names.
      */
     public static TableIf getTargetTable(Plan plan, ConnectContext ctx) {
+        List<String> tableQualifier = getTargetTableQualified(plan, ctx);
+        return RelationUtil.getTable(tableQualifier, ctx.getEnv(), Optional.empty());
+    }
+
+    /**
+     * get target table from names.
+     */
+    public static List<String> getTargetTableQualified(Plan plan, ConnectContext ctx) {
         UnboundLogicalSink<? extends Plan> unboundTableSink;
         if (plan instanceof UnboundTableSink) {
             unboundTableSink = (UnboundTableSink<? extends Plan>) plan;
@@ -434,58 +575,66 @@ public class InsertUtils {
             unboundTableSink = (UnboundIcebergTableSink<? extends Plan>) plan;
         } else if (plan instanceof UnboundJdbcTableSink) {
             unboundTableSink = (UnboundJdbcTableSink<? extends Plan>) plan;
+        } else if (plan instanceof UnboundDictionarySink) {
+            unboundTableSink = (UnboundDictionarySink<? extends Plan>) plan;
+        } else if (plan instanceof UnboundBlackholeSink) {
+            unboundTableSink = (UnboundBlackholeSink<? extends Plan>) plan;
         } else {
-            throw new AnalysisException("the root of plan should be"
-                    + " [UnboundTableSink, UnboundHiveTableSink, UnboundIcebergTableSink],"
-                    + " but it is " + plan.getType());
+            throw new AnalysisException(
+                    "the root of plan only accept Olap, Dictionary, Hive, Iceberg or Jdbc table sink, but it is "
+                            + plan.getType());
         }
-        List<String> tableQualifier = RelationUtil.getQualifierName(ctx, unboundTableSink.getNameParts());
-        return RelationUtil.getDbAndTable(tableQualifier, ctx.getEnv()).second;
+        return RelationUtil.getQualifierName(ctx, unboundTableSink.getNameParts());
     }
 
     private static NamedExpression generateDefaultExpression(Column column) {
-        try {
-            GeneratedColumnInfo generatedColumnInfo = column.getGeneratedColumnInfo();
-            // Using NullLiteral as a placeholder.
-            // If return the expr in generatedColumnInfo, will lead to slot not found error in analyze.
-            // Instead, getting the generated column expr and analyze the expr in BindSink can avoid the error.
-            if (generatedColumnInfo != null) {
-                return new Alias(new NullLiteral(DataType.fromCatalogType(column.getType())), column.getName());
+        GeneratedColumnInfo generatedColumnInfo = column.getGeneratedColumnInfo();
+        // Using NullLiteral as a placeholder.
+        // If return the expr in generatedColumnInfo, will lead to slot not found error in analyze.
+        // Instead, getting the generated column expr and analyze the expr in BindSink can avoid the error.
+        if (generatedColumnInfo != null) {
+            return new Alias(new NullLiteral(DataType.fromCatalogType(column.getType())), column.getName());
+        }
+        if (column.getDefaultValue() == null) {
+            if (!column.isAllowNull() && !column.isAutoInc()) {
+                throw new AnalysisException("Column has no default value, column=" + column.getName());
             }
-            if (column.getDefaultValue() == null) {
-                if (!column.isAllowNull() && !column.isAutoInc()) {
-                    throw new AnalysisException("Column has no default value, column=" + column.getName());
-                }
+            return new Alias(Literal.of(column.getDefaultValue())
+                    .checkedCastWithStrictChecking(DataType.fromCatalogType(column.getType())),
+                    column.getName());
+        } else {
+            Expression defualtValueExpression = new NereidsParser().parseExpression(
+                    column.getDefaultValueSql());
+            if (!(defualtValueExpression instanceof UnboundAlias)) {
+                defualtValueExpression = new UnboundAlias(defualtValueExpression);
             }
-            if (column.getDefaultValueExpr() != null) {
-                Expression defualtValueExpression = new NereidsParser().parseExpression(
-                        column.getDefaultValueExpr().toSqlWithoutTbl());
-                if (!(defualtValueExpression instanceof UnboundAlias)) {
-                    defualtValueExpression = new UnboundAlias(defualtValueExpression);
-                }
-                return (NamedExpression) defualtValueExpression;
-            } else {
-                return new Alias(Literal.of(column.getDefaultValue())
-                        .checkedCastTo(DataType.fromCatalogType(column.getType())),
-                        column.getName());
-            }
-        } catch (org.apache.doris.common.AnalysisException e) {
-            throw new AnalysisException(e.getMessage(), e);
+            return (NamedExpression) defualtValueExpression;
         }
     }
 
     /**
      * get plan for explain.
      */
-    public static Plan getPlanForExplain(ConnectContext ctx, LogicalPlan logicalQuery) {
-        return InsertUtils.normalizePlan(logicalQuery, InsertUtils.getTargetTable(logicalQuery, ctx), Optional.empty());
+    public static Plan getPlanForExplain(
+            ConnectContext ctx, Optional<CascadesContext> analyzeContext, LogicalPlan logicalQuery) {
+        return InsertUtils.normalizePlan(
+            logicalQuery, InsertUtils.getTargetTable(logicalQuery, ctx), analyzeContext, Optional.empty());
+    }
+
+    /** supportFastInsertIntoValues */
+    public static boolean supportFastInsertIntoValues(
+            LogicalPlan logicalPlan, TableIf targetTableIf, ConnectContext ctx) {
+        return logicalPlan instanceof UnboundTableSink && logicalPlan.child(0) instanceof InlineTable
+                && targetTableIf instanceof OlapTable
+                && ctx != null && ctx.getSessionVariable().isEnableFastAnalyzeInsertIntoValues();
     }
 
     // check for insert into t1(a,b,gen_col) select 1,2,3;
     private static void checkGeneratedColumnForInsertIntoSelect(TableIf table,
             UnboundLogicalSink<? extends Plan> unboundLogicalSink, Optional<InsertCommandContext> insertCtx) {
         // should not check delete stmt, because deletestmt can transform to insert delete sign
-        if (unboundLogicalSink.getDMLCommandType() == DMLCommandType.DELETE) {
+        if (unboundLogicalSink.getDMLCommandType() == DMLCommandType.DELETE
+                || unboundLogicalSink.getDMLCommandType() == DMLCommandType.GROUP_COMMIT) {
             return;
         }
         // This is for the insert overwrite values(),()
@@ -501,7 +650,7 @@ public class InsertUtils {
             return;
         }
         Plan query = unboundLogicalSink.child();
-        if (table instanceof OlapTable && !(query instanceof LogicalInlineTable)) {
+        if (table instanceof OlapTable && !(query instanceof InlineTable)) {
             OlapTable olapTable = (OlapTable) table;
             Set<String> insertNames = Sets.newHashSet();
             if (unboundLogicalSink.getColNames() != null) {

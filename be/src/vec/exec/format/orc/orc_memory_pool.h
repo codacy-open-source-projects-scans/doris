@@ -19,14 +19,16 @@
 
 #include "orc/MemoryPool.hh"
 #include "vec/common/allocator.h"
+#include "vec/common/allocator_fwd.h"
+
+namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
 using ORC_MEMORY_ALLOCATOR = RecordSizeMemoryAllocator;
 #else
 using ORC_MEMORY_ALLOCATOR = ORCMemoryAllocator;
 #endif
-
-namespace doris::vectorized {
 
 class ORCMemoryPool : public orc::MemoryPool {
 public:
@@ -50,4 +52,5 @@ private:
     Allocator<false, false, false, ORC_MEMORY_ALLOCATOR> _allocator;
 };
 
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

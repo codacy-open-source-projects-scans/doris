@@ -314,8 +314,17 @@
     INSERT INTO `other_db_mc_parts` PARTITION (dt='e') VALUES
     (1005, 'Sample data 5');
 
-
-
+  CREATE TABLE `mc_parts2` (
+    `id` STRING COMMENT 'Id'
+  )
+  PARTITIONED BY (
+    `ds` STRING ,
+    `audit_flag` STRING 
+  );
+  INSERT INTO TABLE `mc_parts2`  PARTITION (`ds`='2024-01-01', `audit_flag`='Y') values ('1');
+  INSERT INTO TABLE `mc_parts2`  PARTITION (`ds`='2024-04-04', `audit_flag`='N') values ('2');
+  INSERT INTO TABLE `mc_parts2`  PARTITION (`ds`='2027-01-09', `audit_flag`='Y') values ('3');
+  INSERT INTO TABLE `mc_parts2`  PARTITION (`ds`='2024-01-01', `audit_flag`='N') values ('4');
  */
 suite("test_external_catalog_maxcompute", "p2,external,maxcompute,external_remote,external_remote_maxcompute") {
     String enabled = context.config.otherConfigs.get("enableMaxComputeTest")
@@ -353,6 +362,7 @@ suite("test_external_catalog_maxcompute", "p2,external,maxcompute,external_remot
             order_qt_q5 """ select * from mc_parts where dt > '2023-08-03' order by mc_bigint """
             order_qt_q6 """ select * from mc_parts where dt > '2023-08-03' and mc_bigint > 1002 """
             order_qt_q7 """ select * from mc_parts where dt < '2023-08-03' or (mc_bigint > 1003 and dt > '2023-08-04') order by mc_bigint, dt; """
+            qt_q8 """ desc mc_parts """
         }
 
         sql """ switch `${mc_catalog_name}`; """
@@ -380,6 +390,8 @@ suite("test_external_catalog_maxcompute", "p2,external,maxcompute,external_remot
         sql """ refresh catalog ${mc_catalog_name} """
         sql """ switch `${mc_catalog_name}`; """
         sql """ use `${mc_db}`; """
+
+        qt_multi_partition_q1 """ desc multi_partitions """
         order_qt_multi_partition_q1 """ show partitions from multi_partitions; """
         order_qt_multi_partition_q2 """ select pt, create_time, yy, mm, dd from multi_partitions where pt>-1 and yy > '' and mm > '' and dd >'' order by pt , dd; """
         order_qt_multi_partition_q3 """ select sum(pt), create_time, yy, mm, dd from multi_partitions where yy > '' and mm > '' and dd >'' group by create_time, yy, mm, dd order by create_time,dd ; """
@@ -425,5 +437,24 @@ suite("test_external_catalog_maxcompute", "p2,external,maxcompute,external_remot
         order_qt_show_partition """ show partitions from  mc_parts """ 
         
 
+        order_qt_part2_q1 """ select * from mc_parts2 """
+        order_qt_part2_q2 """ SELECT * FROM `mc_parts2` WHERE `ds` = '2024-01-01' AND `audit_flag` = 'Y'; """ 
+        order_qt_part2_q3 """ SELECT * FROM `mc_parts2` WHERE `audit_flag` = 'Y';""" 
+        order_qt_part2_q4 """ SELECT * FROM `mc_parts2` WHERE `ds` BETWEEN '2024-01-01' AND '2027-01-01';""" 
+        order_qt_part2_q5 """ SELECT ds FROM `mc_parts2` WHERE `ds` != '2027-01-09';""" 
+        order_qt_part2_q6 """ SELECT ds,audit_flag,id FROM `mc_parts2` WHERE `ds` != '2027-01-09';""" 
+        order_qt_part2_q7 """ SELECT audit_flag,ds,ds,id,id,id FROM `mc_parts2`;""" 
+        order_qt_part2_q8 """ SELECT audit_flag FROM `mc_parts2` WHERE `ds` != '2027-01-09';""" 
+        qt_part2_q9 """ desc  mc_parts2 """
+
+
+        qt_where_1 """ WITH active_us_sites AS (SELECT web_site_sk,         web_site_id,         web_name,         web_open_date_sk,         web_close_date_sk,         web_company_name,         web_city,        
+              web_state,         web_country,         CONCAT_WS(' ', web_street_number, web_street_name, web_street_type, web_suite_number) AS full_address, COUNT(1) OVER (PARTITION BY web_site_id) AS a     FROM web_site ) 
+              SELECT      web_site_sk,     web_site_id,     web_name,     web_company_name,     full_address,     CONCAT(web_city, ', ', web_state) AS city_state,    
+               web_country , a FROM active_us_sites where a>=1   ORDER BY web_site_sk;"""
+
+        qt_where_2 """select * from web_site where web_mkt_id > 100000000000000 ORDER BY web_site_sk;"""
+        qt_where_3 """ select * from web_site where  web_close_date_sk >  CURRENT_DATE() ORDER BY web_site_sk; """
+        qt_where_4 """ select * from web_site where  web_rec_end_date  <  CURRENT_DATE() ORDER BY web_site_sk; """
     }
 }

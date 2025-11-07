@@ -39,6 +39,12 @@ feHttpAddress = "127.0.0.1:8030"
 feHttpUser = "root"
 feHttpPassword = ""
 
+// ccr, need BE enable_feature_binlog=true and FE enable_feature_binlog = true
+ccrDownstreamUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoadLocalInfile=true"
+ccrDownstreamUser = "root"
+ccrDownstreamPassword = ""
+ccrDownstreamFeThriftAddress = "127.0.0.1:9030"
+
 // set DORIS_HOME by system properties
 // e.g. java -DDORIS_HOME=./
 suitePath = "${DORIS_HOME}/regression-test/suites"
@@ -179,6 +185,7 @@ dfsNamenodeRpcAddress3=""
 hadoopSecurityAuthentication = ""
 hadoopKerberosKeytabPath = ""
 hadoopKerberosPrincipal = ""
+hadoopSecurityAutoToLocal = ""
 
 
 //paimon catalog test config for bigdata
@@ -198,12 +205,15 @@ extPgPort = 5432
 extPgUser = "****"
 extPgPassword = "***********"
 
-// elasticsearch external test config for bigdata
-enableExternalEsTest = false
-extEsHost = "***********"
-extEsPort = 9200
-extEsUser = "*******"
-extEsPassword = "***********"
+// minio external test config
+enableExternalMinioTest = false
+extMinioHost = "***.**.**.**"
+extMinioPort = 9000
+extMinioDomain = "myminio.com"
+extMinioAk = "minioadmin"
+extMinioSk = "minioadmin"
+extMinioRegion = "us-east-1"
+extMinioBucket = "test-bucket"
 
 enableExternalHudiTest = false
 hudiEmrCatalog = "***********"
@@ -227,6 +237,17 @@ extArrowFlightSqlPassword= ""
 // iceberg rest catalog config
 iceberg_rest_uri_port=18181
 iceberg_minio_port=19001
+iceberg_rest_uri_port_s3=19181
+iceberg_rest_uri_port_oss=19182
+iceberg_rest_uri_port_cos=19183
+iceberg_rest_uri_port_obs=19184
+iceberg_rest_uri_port_gcs=19185
+iceberg_rest_uri_port_hdfs=19186
+iceberg_rest_hdfs_port=20020
+
+// polaris rest catalog config
+polaris_rest_uri_port=20181
+polaris_minio_port=20001
 
 // If the failure suite num exceeds this config
 // all following suite will be skipped to fast quit the run.
@@ -244,6 +265,7 @@ enableTrinoConnectorTest = false
 enableKerberosTest=false
 kerberosHmsPort=9883
 kerberosHdfsPort=8820
+enableRefactorParamsHdfsTest=true
 
 
 // LakeSoul catalog test config
@@ -266,3 +288,15 @@ cbsS3Sk = "*******"
 cbsS3Endpoint = "oss-cn-beijing.aliyuncs.com"
 cbsS3Bucket = "test-bucket"
 cbsS3Prefix = "test-cluster-prefix"
+
+// External Env
+enableExternalIcebergTest = false
+// The properties string of iceberg catalog
+icebergS3TablesCatalog = ""
+
+enableExternalHudiTest = false
+// The properties string of hudi catalog
+hudiEmrCatalog = ""
+icebergS3TablesCatalog=""
+icebergS3TablesCatalogGlueRest=""
+

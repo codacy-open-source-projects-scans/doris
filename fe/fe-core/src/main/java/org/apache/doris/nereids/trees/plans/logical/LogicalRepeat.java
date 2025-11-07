@@ -34,9 +34,12 @@ import org.apache.doris.nereids.util.Utils;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * LogicalRepeat.
@@ -49,6 +52,7 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
 
     private final List<List<Expression>> groupingSets;
     private final List<NamedExpression> outputExpressions;
+    private final boolean withInProjection;
 
     /**
      * Desc: Constructor for LogicalRepeat.
@@ -57,7 +61,7 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
             List<List<Expression>> groupingSets,
             List<NamedExpression> outputExpressions,
             CHILD_TYPE child) {
-        this(groupingSets, outputExpressions, Optional.empty(), Optional.empty(), child);
+        this(groupingSets, outputExpressions, Optional.empty(), Optional.empty(), true, child);
     }
 
     /**
@@ -65,6 +69,7 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
      */
     public LogicalRepeat(List<List<Expression>> groupingSets, List<NamedExpression> outputExpressions,
             Optional<GroupExpression> groupExpression, Optional<LogicalProperties> logicalProperties,
+            boolean withInProjection,
             CHILD_TYPE child) {
         super(PlanType.LOGICAL_REPEAT, groupExpression, logicalProperties, child);
         this.groupingSets = Objects.requireNonNull(groupingSets, "groupingSets can not be null")
@@ -73,6 +78,7 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
                 .collect(ImmutableList.toImmutableList());
         this.outputExpressions = ImmutableList.copyOf(
                 Objects.requireNonNull(outputExpressions, "outputExpressions can not be null"));
+        this.withInProjection = withInProjection;
     }
 
     @Override
@@ -96,6 +102,36 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
                 "groupingSets", groupingSets,
                 "outputExpressions", outputExpressions
         );
+    }
+
+    @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        // org.apache.doris.nereids.parser.LogicalPlanBuilder.withProjection will generate different plan for
+        // distinct aggregation so use withInProjection flag to control whether to generate a select statement
+        // eg: select distinct log_time from example_tbl_duplicate group by log_time,log_type with rollup;
+        // select log_time from example_tbl_duplicate group by log_time,log_type with rollup;
+        if (!withInProjection) {
+            sb.append("SELECT ");
+            sb.append(
+                    outputExpressions.stream().map(Expression::toDigest)
+                            .collect(Collectors.joining(", "))
+            );
+            sb.append(" FROM ");
+        }
+        sb.append(child().toDigest());
+        sb.append(" GROUP BY GROUPING SETS (");
+        for (int i = 0; i < groupingSets.size(); i++) {
+            List<Expression> groupingSet = groupingSets.get(i);
+            String subSet = groupingSet.stream().map(Expression::toDigest)
+                    .collect(Collectors.joining(",", "(", ")"));
+            sb.append(subSet);
+            if (i != groupingSets.size() - 1) {
+                sb.append(", ");
+            }
+        }
+        sb.append(")");
+        return sb.toString();
     }
 
     @Override
@@ -144,7 +180,7 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
     @Override
     public LogicalRepeat<CHILD_TYPE> withGroupExpression(Optional<GroupExpression> groupExpression) {
         return new LogicalRepeat<>(groupingSets, outputExpressions, groupExpression,
-                Optional.of(getLogicalProperties()), child());
+                Optional.of(getLogicalProperties()), withInProjection, child());
     }
 
     @Override
@@ -152,7 +188,7 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1);
         return new LogicalRepeat<>(groupingSets, outputExpressions, groupExpression, logicalProperties,
-                children.get(0));
+                withInProjection, children.get(0));
     }
 
     public LogicalRepeat<CHILD_TYPE> withGroupSets(List<List<Expression>> groupingSets) {
@@ -178,6 +214,11 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
         return new LogicalRepeat<>(groupingSets, newOutput, child);
     }
 
+    public LogicalRepeat<CHILD_TYPE> withInProjection(boolean withInProjection) {
+        return new LogicalRepeat<>(groupingSets, outputExpressions,
+                Optional.empty(), Optional.empty(), withInProjection, child());
+    }
+
     public boolean canBindVirtualSlot() {
         return bound() && outputExpressions.stream()
                 .noneMatch(output -> output.containsType(VirtualSlotReference.class));
@@ -190,16 +231,26 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
 
     @Override
     public void computeUniform(DataTrait.Builder builder) {
-        builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+        // don't generate uniform slot
+        // TODO: this need be supported later
     }
 
     @Override
     public void computeEqualSet(DataTrait.Builder builder) {
+        Set<Expression> common = getCommonGroupingSetExpressions();
+        Set<Slot> slots = new HashSet<>();
+        for (Expression expr : common) {
+            if (!(expr instanceof Slot)) {
+                return;
+            }
+            slots.add((Slot) expr);
+        }
         builder.addEqualSet(child().getLogicalProperties().getTrait());
+        builder.pruneEqualSetSlots(slots);
     }
 
     @Override
     public void computeFd(DataTrait.Builder builder) {
-        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
+        // don't generate fd
     }
 }

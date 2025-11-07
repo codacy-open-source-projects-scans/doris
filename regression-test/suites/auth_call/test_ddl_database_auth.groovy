@@ -25,19 +25,19 @@ suite("test_ddl_database_auth","p0,auth_call") {
     String tableName = 'test_ddl_database_auth_tb'
     String tableNameNew = 'test_ddl_database_auth_tb_new'
 
-    //cloud-mode
-    if (isCloudMode()) {
-        def clusters = sql " SHOW CLUSTERS; "
-        assertTrue(!clusters.isEmpty())
-        def validCluster = clusters[0][0]
-        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
-    }
-
     try_sql("DROP USER ${user}")
     try_sql """drop database if exists ${dbName}"""
     try_sql """drop database if exists ${dbNameNew}"""
     sql """CREATE USER '${user}' IDENTIFIED BY '${pwd}'"""
     sql """grant select_priv on regression_test to ${user}"""
+
+    //cloud-mode
+    if (isCloudMode()) {
+        def clusters = sql " SHOW CLUSTERS; "
+        assertTrue(!clusters.isEmpty())
+        def validCluster = clusters[0][0]
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
+    }
 
     // ddl create
     connect(user, "${pwd}", context.config.jdbcUrl) {

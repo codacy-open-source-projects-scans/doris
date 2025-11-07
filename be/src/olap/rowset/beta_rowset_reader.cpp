@@ -44,11 +44,13 @@
 #include "olap/schema_cache.h"
 #include "olap/tablet_meta.h"
 #include "olap/tablet_schema.h"
+#include "runtime/descriptors.h"
 #include "util/runtime_profile.h"
 #include "vec/core/block.h"
 #include "vec/olap/vgeneric_iterators.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 using namespace ErrorCode;
 
 BetaRowsetReader::BetaRowsetReader(BetaRowsetSharedPtr rowset)
@@ -68,17 +70,15 @@ RowsetReaderSharedPtr BetaRowsetReader::clone() {
     return RowsetReaderSharedPtr(new BetaRowsetReader(_rowset));
 }
 
-bool BetaRowsetReader::update_profile(RuntimeProfile* profile) {
+void BetaRowsetReader::update_profile(RuntimeProfile* profile) {
     if (_iterator != nullptr) {
-        return _iterator->update_profile(profile);
+        _iterator->update_profile(profile);
     }
-    return false;
 }
 
 Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context,
                                                std::vector<RowwiseIteratorUPtr>* out_iters,
                                                bool use_cache) {
-    RETURN_IF_ERROR(_rowset->load());
     _read_context = read_context;
     // The segment iterator is created with its own statistics,
     // and the member variable '_stats'  is initialized by '_stats(&owned_stats)'.
@@ -92,6 +92,9 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
     if (_read_context->stats != nullptr) {
         _stats = _read_context->stats;
     }
+    SCOPED_RAW_TIMER(&_stats->rowset_reader_get_segment_iterators_timer_ns);
+
+    RETURN_IF_ERROR(_rowset->load());
 
     // convert RowsetReaderContext to StorageReadOptions
     _read_options.block_row_max = read_context->batch_size;
@@ -99,6 +102,12 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
     _read_options.push_down_agg_type_opt = _read_context->push_down_agg_type_opt;
     _read_options.remaining_conjunct_roots = _read_context->remaining_conjunct_roots;
     _read_options.common_expr_ctxs_push_down = _read_context->common_expr_ctxs_push_down;
+    _read_options.virtual_column_exprs = _read_context->virtual_column_exprs;
+    _read_options.ann_topn_runtime = _read_context->ann_topn_runtime;
+    _read_options.vir_cid_to_idx_in_block = _read_context->vir_cid_to_idx_in_block;
+    _read_options.vir_col_idx_to_type = _read_context->vir_col_idx_to_type;
+    _read_options.score_runtime = _read_context->score_runtime;
+    _read_options.collection_statistics = _read_context->collection_statistics;
     _read_options.rowset_id = _rowset->rowset_id();
     _read_options.version = _rowset->version();
     _read_options.tablet_id = _rowset->rowset_meta()->tablet_id();
@@ -133,6 +142,10 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
             read_columns.push_back(cid);
         }
     }
+    // disable condition cache if you have delete condition
+    _read_context->condition_cache_digest =
+            delete_columns_set.empty() ? _read_context->condition_cache_digest : 0;
+    // create segment iterators
     VLOG_NOTICE << "read columns size: " << read_columns.size();
     _input_schema = std::make_shared<Schema>(_read_context->tablet_schema->columns(), read_columns);
     if (_read_context->predicates != nullptr) {
@@ -152,17 +165,19 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
     // Take a delete-bitmap for each segment, the bitmap contains all deletes
     // until the max read version, which is read_context->version.second
     if (_read_context->delete_bitmap != nullptr) {
-        SCOPED_RAW_TIMER(&_stats->delete_bitmap_get_agg_ns);
-        RowsetId rowset_id = rowset()->rowset_id();
-        for (uint32_t seg_id = 0; seg_id < rowset()->num_segments(); ++seg_id) {
-            auto d = _read_context->delete_bitmap->get_agg(
-                    {rowset_id, seg_id, _read_context->version.second});
-            if (d->isEmpty()) {
-                continue; // Empty delete bitmap for the segment
+        {
+            SCOPED_RAW_TIMER(&_stats->delete_bitmap_get_agg_ns);
+            RowsetId rowset_id = rowset()->rowset_id();
+            for (uint32_t seg_id = 0; seg_id < rowset()->num_segments(); ++seg_id) {
+                auto d = _read_context->delete_bitmap->get_agg(
+                        {rowset_id, seg_id, _read_context->version.second});
+                if (d->isEmpty()) {
+                    continue; // Empty delete bitmap for the segment
+                }
+                VLOG_TRACE << "Get the delete bitmap for rowset: " << rowset_id.to_string()
+                           << ", segment id:" << seg_id << ", size:" << d->cardinality();
+                _read_options.delete_bitmap.emplace(seg_id, std::move(d));
             }
-            VLOG_TRACE << "Get the delete bitmap for rowset: " << rowset_id.to_string()
-                       << ", segment id:" << seg_id << ", size:" << d->cardinality();
-            _read_options.delete_bitmap.emplace(seg_id, std::move(d));
         }
     }
 
@@ -205,6 +220,14 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
                 _read_context->runtime_state->query_options().disable_file_cache;
     }
 
+    if (_read_context->condition_cache_digest) {
+        for (const auto& key_range : _read_options.key_ranges) {
+            _read_context->condition_cache_digest =
+                    key_range.get_digest(_read_context->condition_cache_digest);
+        }
+        _read_options.condition_cache_digest = _read_context->condition_cache_digest;
+    }
+
     _read_options.io_ctx.expiration_time =
             read_context->ttl_seconds > 0 && _rowset->rowset_meta()->newest_write_timestamp() > 0
                     ? _rowset->rowset_meta()->newest_write_timestamp() + read_context->ttl_seconds
@@ -213,7 +236,6 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
         _read_options.io_ctx.expiration_time = 0;
     }
 
-    // load segments
     bool enable_segment_cache = true;
     auto* state = read_context->runtime_state;
     if (state != nullptr) {
@@ -224,72 +246,45 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
     // When reader type is for query, session variable `enable_segment_cache` should be respected.
     bool should_use_cache = use_cache || (_read_context->reader_type == ReaderType::READER_QUERY &&
                                           enable_segment_cache);
-    SegmentCacheHandle segment_cache_handle;
-    RETURN_IF_ERROR(SegmentLoader::instance()->load_segments(_rowset, &segment_cache_handle,
-                                                             should_use_cache,
-                                                             /*need_load_pk_index_and_bf*/ false));
 
-    // create iterator for each segment
-    auto& segments = segment_cache_handle.get_segments();
-    _segments_rows.resize(segments.size());
-    for (size_t i = 0; i < segments.size(); i++) {
-        _segments_rows[i] = segments[i]->num_rows();
-    }
-    if (_read_context->record_rowids) {
-        // init segment rowid map for rowid conversion
-        std::vector<uint32_t> segment_num_rows;
-        RETURN_IF_ERROR(get_segment_num_rows(&segment_num_rows));
-        RETURN_IF_ERROR(_read_context->rowid_conversion->init_segment_map(rowset()->rowset_id(),
-                                                                          segment_num_rows));
-    }
-
+    auto segment_count = _rowset->num_segments();
     auto [seg_start, seg_end] = _segment_offsets;
+    // If seg_start == seg_end, it means that the segments of a rowset is not
+    // split scanned by multiple scanners, and the rowset reader is used to read the whole rowset.
     if (seg_start == seg_end) {
         seg_start = 0;
-        seg_end = segments.size();
+        seg_end = segment_count;
+    }
+    if (_read_context->record_rowids && _read_context->rowid_conversion) {
+        // init segment rowid map for rowid conversion
+        std::vector<uint32_t> segment_rows;
+        RETURN_IF_ERROR(_rowset->get_segment_num_rows(&segment_rows, _stats));
+        RETURN_IF_ERROR(_read_context->rowid_conversion->init_segment_map(rowset()->rowset_id(),
+                                                                          segment_rows));
     }
 
-    const bool is_merge_iterator = _is_merge_iterator();
-    const bool use_lazy_init_iterators =
-            !is_merge_iterator && _read_context->reader_type == ReaderType::READER_QUERY;
-    for (int i = seg_start; i < seg_end; i++) {
-        auto& seg_ptr = segments[i];
+    for (int64_t i = seg_start; i < seg_end; i++) {
+        SCOPED_RAW_TIMER(&_stats->rowset_reader_create_iterators_timer_ns);
         std::unique_ptr<RowwiseIterator> iter;
 
-        if (use_lazy_init_iterators) {
-            /// For non-merging iterators, we don't need to initialize them all at once when creating them.
-            /// Instead, we should initialize each iterator separately when really using them.
-            /// This optimization minimizes the lifecycle of resources like column readers
-            /// and prevents excessive memory consumption, especially for wide tables.
-            if (_segment_row_ranges.empty()) {
-                _read_options.row_ranges.clear();
-                iter = std::make_unique<LazyInitSegmentIterator>(seg_ptr, _input_schema,
-                                                                 _read_options);
-            } else {
-                DCHECK_EQ(seg_end - seg_start, _segment_row_ranges.size());
-                auto local_options = _read_options;
-                local_options.row_ranges = _segment_row_ranges[i - seg_start];
-                iter = std::make_unique<LazyInitSegmentIterator>(seg_ptr, _input_schema,
-                                                                 local_options);
-            }
+        /// For iterators, we don't need to initialize them all at once when creating them.
+        /// Instead, we should initialize each iterator separately when really using them.
+        /// This optimization minimizes the lifecycle of resources like column readers
+        /// and prevents excessive memory consumption, especially for wide tables.
+        if (_segment_row_ranges.empty()) {
+            _read_options.row_ranges.clear();
+            iter = std::make_unique<LazyInitSegmentIterator>(_rowset, i, should_use_cache,
+                                                             _input_schema, _read_options);
         } else {
-            Status status;
-            /// If `_segment_row_ranges` is empty, the segment is not split.
-            if (_segment_row_ranges.empty()) {
-                _read_options.row_ranges.clear();
-                status = seg_ptr->new_iterator(_input_schema, _read_options, &iter);
-            } else {
-                DCHECK_EQ(seg_end - seg_start, _segment_row_ranges.size());
-                auto local_options = _read_options;
-                local_options.row_ranges = _segment_row_ranges[i - seg_start];
-                status = seg_ptr->new_iterator(_input_schema, local_options, &iter);
+            DCHECK_EQ(seg_end - seg_start, _segment_row_ranges.size());
+            auto local_options = _read_options;
+            local_options.row_ranges = _segment_row_ranges[i - seg_start];
+            if (local_options.condition_cache_digest) {
+                local_options.condition_cache_digest =
+                        local_options.row_ranges.get_digest(local_options.condition_cache_digest);
             }
-
-            if (!status.ok()) {
-                LOG(WARNING) << "failed to create iterator[" << seg_ptr->id()
-                             << "]: " << status.to_string();
-                return Status::Error<ROWSET_READER_INIT>(status.to_string());
-            }
+            iter = std::make_unique<LazyInitSegmentIterator>(_rowset, i, should_use_cache,
+                                                             _input_schema, local_options);
         }
 
         if (iter->empty()) {
@@ -317,14 +312,16 @@ Status BetaRowsetReader::_init_iterator() {
     std::vector<RowwiseIteratorUPtr> iterators;
     RETURN_IF_ERROR(get_segment_iterators(_read_context, &iterators));
 
+    SCOPED_RAW_TIMER(&_stats->rowset_reader_init_iterators_timer_ns);
+
     if (_read_context->merged_rows == nullptr) {
         _read_context->merged_rows = &_merged_rows;
     }
     // merge or union segment iterator
-    if (_is_merge_iterator()) {
+    if (is_merge_iterator()) {
         auto sequence_loc = -1;
         if (_read_context->sequence_id_idx != -1) {
-            for (size_t loc = 0; loc < _read_context->return_columns->size(); loc++) {
+            for (int loc = 0; loc < _read_context->return_columns->size(); loc++) {
                 if (_read_context->return_columns->at(loc) == _read_context->sequence_id_idx) {
                     sequence_loc = loc;
                     break;
@@ -351,61 +348,6 @@ Status BetaRowsetReader::_init_iterator() {
     return Status::OK();
 }
 
-Status BetaRowsetReader::next_block(vectorized::Block* block) {
-    SCOPED_RAW_TIMER(&_stats->block_fetch_ns);
-    RETURN_IF_ERROR(_init_iterator_once());
-    if (_empty) {
-        return Status::Error<END_OF_FILE>("BetaRowsetReader is empty");
-    }
-
-    RuntimeState* runtime_state = nullptr;
-    if (_read_context != nullptr) {
-        runtime_state = _read_context->runtime_state;
-    }
-
-    do {
-        auto s = _iterator->next_batch(block);
-        if (!s.ok()) {
-            if (!s.is<END_OF_FILE>()) {
-                LOG(WARNING) << "failed to read next block: " << s.to_string();
-            }
-            return s;
-        }
-
-        if (runtime_state != nullptr && runtime_state->is_cancelled()) [[unlikely]] {
-            return runtime_state->cancel_reason();
-        }
-    } while (block->empty());
-
-    return Status::OK();
-}
-
-Status BetaRowsetReader::next_block_view(vectorized::BlockView* block_view) {
-    SCOPED_RAW_TIMER(&_stats->block_fetch_ns);
-    RETURN_IF_ERROR(_init_iterator_once());
-
-    RuntimeState* runtime_state = nullptr;
-    if (_read_context != nullptr) {
-        runtime_state = _read_context->runtime_state;
-    }
-
-    do {
-        auto s = _iterator->next_block_view(block_view);
-        if (!s.ok()) {
-            if (!s.is<END_OF_FILE>()) {
-                LOG(WARNING) << "failed to read next block view: " << s.to_string();
-            }
-            return s;
-        }
-
-        if (runtime_state != nullptr && runtime_state->is_cancelled()) [[unlikely]] {
-            return runtime_state->cancel_reason();
-        }
-    } while (block_view->empty());
-
-    return Status::OK();
-}
-
 bool BetaRowsetReader::_should_push_down_value_predicates() const {
     // if unique table with rowset [0-x] or [0-1] [2-y] [...],
     // value column predicates can be pushdown on rowset [0-x] or [2-y], [2-y]
@@ -416,10 +358,5 @@ bool BetaRowsetReader::_should_push_down_value_predicates() const {
              _read_context->sequence_id_idx == -1) ||
             _read_context->enable_unique_key_merge_on_write);
 }
-
-Status BetaRowsetReader::get_segment_num_rows(std::vector<uint32_t>* segment_num_rows) {
-    segment_num_rows->assign(_segments_rows.cbegin(), _segments_rows.cend());
-    return Status::OK();
-}
-
+#include "common/compile_check_end.h"
 } // namespace doris

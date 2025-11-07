@@ -22,6 +22,7 @@ import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.plans.DiffOutputInAsterisk;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.RelationId;
@@ -41,13 +42,15 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * The node of logical plan for sub query and alias
  *
  * @param <CHILD_TYPE> param
  */
-public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_TYPE> {
+public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_TYPE>
+        implements DiffOutputInAsterisk {
 
     protected RelationId relationId;
     private final List<String> qualifier;
@@ -79,7 +82,16 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
 
     @Override
     public List<Slot> computeOutput() {
-        List<Slot> childOutput = child().getOutput();
+        return computeOutputInternal(false);
+    }
+
+    @Override
+    public List<Slot> computeAsteriskOutput() {
+        return computeOutputInternal(true);
+    }
+
+    private List<Slot> computeOutputInternal(boolean asteriskOutput) {
+        List<Slot> childOutput = asteriskOutput ? child().getAsteriskOutput() : child().getOutput();
         List<String> columnAliases = this.columnAliases.orElseGet(ImmutableList::of);
         ImmutableList.Builder<Slot> currentOutput = ImmutableList.builder();
         for (int i = 0; i < childOutput.size(); i++) {
@@ -128,6 +140,18 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
     }
 
     @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("(").append(child().toDigest()).append(") AS ");
+        sb.append(qualifier.get(0));
+        if (columnAliases.isPresent()) {
+            columnAliases.get().stream()
+                    .collect(Collectors.joining(", ", "(", ")"));
+        }
+        return sb.toString();
+    }
+
+    @Override
     public boolean equals(Object o) {
         if (this == o) {
             return true;
@@ -135,8 +159,8 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
-        LogicalSubQueryAlias that = (LogicalSubQueryAlias) o;
-        return qualifier.equals(that.qualifier) && this.child().equals(that.child());
+        LogicalSubQueryAlias<?> that = (LogicalSubQueryAlias) o;
+        return qualifier.equals(that.qualifier);
     }
 
     @Override

@@ -18,6 +18,8 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("dup_mv_plus") {
+    // this mv rewrite would not be rewritten in RBO, so set NOT_IN_RBO explicitly
+    sql "set pre_materialized_view_rewrite_strategy = NOT_IN_RBO"
     sql """ DROP TABLE IF EXISTS dup_mv_plus; """
 
     sql """
@@ -36,7 +38,7 @@ suite ("dup_mv_plus") {
     sql "insert into dup_mv_plus select 2,2,2,'b';"
     sql "insert into dup_mv_plus select 3,-3,null,'c';"
 
-    createMV ("create materialized view k12p as select k1,k2+1 from dup_mv_plus;")
+    createMV ("create materialized view k12p as select k1 as a1,k2+1 from dup_mv_plus;")
     sleep(3000)
 
     sql "insert into dup_mv_plus select -4,-4,-4,'d';"
@@ -44,6 +46,8 @@ suite ("dup_mv_plus") {
     sql "SET enable_fallback_to_original_planner=false"
 
     sql "analyze table dup_mv_plus with sync;"
+    sql """alter table dup_mv_plus modify column k1 set stats ('row_count'='4');"""
+
     sql """set enable_stats=false;"""
 
     order_qt_select_star "select * from dup_mv_plus order by k1;"
@@ -85,7 +89,6 @@ suite ("dup_mv_plus") {
     order_qt_select_mv "select k1,k2+1 from dup_mv_plus order by k2;"
 
     sql """set enable_stats=true;"""
-    sql """alter table dup_mv_plus modify column k1 set stats ('row_count'='4');"""
 
     mv_rewrite_success("select k1,k2+1 from dup_mv_plus order by k1;", "k12p")
 

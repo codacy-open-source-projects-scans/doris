@@ -28,11 +28,12 @@
 
 #include "common/logging.h"
 #include "common/util.h"
-#include "meta-service/keys.h"
 #include "meta-service/meta_service.h"
 #include "meta-service/meta_service_helper.h"
-#include "meta-service/txn_kv.h"
-#include "meta-service/txn_kv_error.h"
+#include "meta-store/clone_chain_reader.h"
+#include "meta-store/keys.h"
+#include "meta-store/txn_kv.h"
+#include "meta-store/txn_kv_error.h"
 
 namespace doris::cloud {
 
@@ -168,12 +169,51 @@ void merge_tablet_stats(TabletStatsPB& stats, const TabletStats& detached_stats)
     stats.set_segment_size(stats.segment_size() + detached_stats.segment_size);
 }
 
+void detach_tablet_stats(const TabletStatsPB& stats, TabletStats& detached_stats) {
+    detached_stats.data_size = stats.data_size();
+    detached_stats.num_rows = stats.num_rows();
+    detached_stats.num_rowsets = stats.num_rowsets();
+    detached_stats.num_segs = stats.num_segments();
+    detached_stats.index_size = stats.index_size();
+    detached_stats.segment_size = stats.segment_size();
+}
+
 void internal_get_tablet_stats(MetaServiceCode& code, std::string& msg, Transaction* txn,
                                const std::string& instance_id, const TabletIndexPB& idx,
                                TabletStatsPB& stats, bool snapshot) {
     TabletStats detached_stats;
     internal_get_tablet_stats(code, msg, txn, instance_id, idx, stats, detached_stats, snapshot);
-    merge_tablet_stats(stats, detached_stats);
+    if (code == MetaServiceCode::OK) {
+        merge_tablet_stats(stats, detached_stats);
+    }
+}
+
+void internal_get_load_tablet_stats(MetaServiceCode& code, std::string& msg,
+                                    CloneChainReader& meta_reader, Transaction* txn,
+                                    const std::string& instance_id, const TabletIndexPB& tablet_idx,
+                                    TabletStatsPB& stats, bool snapshot) {
+    int64_t tablet_id = tablet_idx.tablet_id();
+    Versionstamp versionstamp;
+
+    // Try to read existing versioned tablet stats
+    TxnErrorCode err =
+            meta_reader.get_tablet_load_stats(txn, tablet_id, &stats, &versionstamp, snapshot);
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        // If versioned stats doesn't exist, read from single version
+        TabletStatsPB compact_stats;
+        TabletStats detached_stats;
+        internal_get_tablet_stats(code, msg, txn, instance_id, tablet_idx, compact_stats,
+                                  detached_stats, snapshot);
+        if (code == MetaServiceCode::OK) {
+            // Only the detached stats are valid for load tablet stats.
+            merge_tablet_stats(stats, detached_stats);
+        }
+    } else if (err != TxnErrorCode::TXN_OK) {
+        code = cast_as<ErrCategory::READ>(err);
+        msg = fmt::format("failed to get versioned tablet stats, err={}", err);
+        LOG(WARNING) << msg << " tablet_id=" << tablet_id;
+        return;
+    }
 }
 
 MetaServiceResponseStatus parse_fix_tablet_stats_param(

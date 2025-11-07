@@ -239,7 +239,12 @@ void HttpStreamAction::on_chunk_data(HttpRequest* req) {
     struct evhttp_request* ev_req = req->get_evhttp_request();
     auto evbuf = evhttp_request_get_input_buffer(ev_req);
 
-    SCOPED_ATTACH_TASK(ExecEnv::GetInstance()->stream_load_pipe_tracker());
+    // In HttpStreamAction::on_chunk_data
+    //      -> process_put
+    //      -> StreamLoadExecutor::execute_plan_fragment
+    //      -> exec_plan_fragment
+    // , SCOPED_ATTACH_TASK will be called.
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->stream_load_pipe_tracker());
 
     int64_t start_read_data_time = MonotonicNanos();
     Status st = ctx->allocate_schema_buffer();
@@ -330,6 +335,9 @@ Status HttpStreamAction::process_put(HttpRequest* http_req,
     } else {
         LOG(WARNING) << "_exec_env->cluster_info not set backend_id";
     }
+    if (ctx->wal_id > 0) {
+        request.__set_partial_update(false);
+    }
 
     // plan this load
     TNetworkAddress master_addr = _exec_env->cluster_info()->master_fe_addr;
@@ -339,6 +347,7 @@ Status HttpStreamAction::process_put(HttpRequest* http_req,
             [&request, ctx](FrontendServiceConnection& client) {
                 client->streamLoadPut(ctx->put_result, request);
             }));
+    ctx->put_result.pipeline_params.query_options.__set_enable_strict_cast(false);
     ctx->stream_load_put_cost_nanos = MonotonicNanos() - stream_load_put_start_time;
     Status plan_status(Status::create(ctx->put_result.status));
     if (!plan_status.ok()) {
@@ -376,8 +385,8 @@ Status HttpStreamAction::process_put(HttpRequest* http_req,
         }
         ctx->put_result.pipeline_params.__set_content_length(content_length);
     }
-
-    return _exec_env->stream_load_executor()->execute_plan_fragment(ctx);
+    TPipelineFragmentParamsList mocked;
+    return _exec_env->stream_load_executor()->execute_plan_fragment(ctx, mocked);
 }
 
 void HttpStreamAction::_save_stream_load_record(std::shared_ptr<StreamLoadContext> ctx,

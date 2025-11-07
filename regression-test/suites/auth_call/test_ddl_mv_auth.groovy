@@ -25,17 +25,16 @@ suite("test_ddl_mv_auth","p0,auth_call") {
     String mvName = 'test_ddl_mv_auth_mv'
     String rollupName = 'test_ddl_mv_auth_rollup'
 
+    try_sql("DROP USER ${user}")
+    try_sql """drop database if exists ${dbName}"""
+    sql """CREATE USER '${user}' IDENTIFIED BY '${pwd}'"""
     //cloud-mode
     if (isCloudMode()) {
         def clusters = sql " SHOW CLUSTERS; "
         assertTrue(!clusters.isEmpty())
         def validCluster = clusters[0][0]
-        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
     }
-
-    try_sql("DROP USER ${user}")
-    try_sql """drop database if exists ${dbName}"""
-    sql """CREATE USER '${user}' IDENTIFIED BY '${pwd}'"""
     sql """grant select_priv on regression_test to ${user}"""
     sql """create database ${dbName}"""
     sql """create table ${dbName}.${tableName} (
@@ -56,7 +55,7 @@ suite("test_ddl_mv_auth","p0,auth_call") {
     // ddl create
     connect(user, "${pwd}", context.config.jdbcUrl) {
         test {
-            sql """create materialized view ${mvName} as select username from ${dbName}.${tableName};"""
+            sql """create materialized view ${mvName} as select username as a1 from ${dbName}.${tableName};"""
             exception "denied"
         }
         test {
@@ -68,7 +67,7 @@ suite("test_ddl_mv_auth","p0,auth_call") {
     connect(user, "${pwd}", context.config.jdbcUrl) {
         sql """use ${dbName}"""
         test {
-            sql """create materialized view ${mvName} as select username from ${dbName}.${tableName};"""
+            sql """create materialized view ${mvName} as select username as a2 from ${dbName}.${tableName};"""
             exception "denied"
         }
         test {
@@ -79,10 +78,10 @@ suite("test_ddl_mv_auth","p0,auth_call") {
     sql """grant alter_priv on ${dbName}.${tableName} to ${user}"""
     connect(user, "${pwd}", context.config.jdbcUrl) {
         sql """use ${dbName}"""
-        sql """create materialized view ${mvName} as select username from ${dbName}.${tableName};"""
-        waitingMVTaskFinishedByMvName(dbName, tableName)
+        sql """create materialized view ${mvName} as select username as a3 from ${dbName}.${tableName};"""
+        waitingMVTaskFinishedByMvName(dbName, tableName, mvName)
         sql """alter table ${dbName}.${tableName} add rollup ${rollupName}(username)"""
-        waitingMVTaskFinishedByMvName(dbName, tableName)
+        waitingMVTaskFinishedByMvName(dbName, tableName, rollupName)
 
         def mv_res = sql """desc ${dbName}.${tableName} all;"""
         logger.info("mv_res: " + mv_res)

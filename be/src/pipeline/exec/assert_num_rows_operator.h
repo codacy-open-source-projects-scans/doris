@@ -39,11 +39,15 @@ public:
     AssertNumRowsOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
                            const DescriptorTbl& descs);
 
+#ifdef BE_TEST
+    AssertNumRowsOperatorX() = default;
+#endif
+
     Status pull(RuntimeState* state, vectorized::Block* block, bool* eos) override;
 
     [[nodiscard]] bool is_source() const override { return false; }
 
-    DataDistribution required_data_distribution() const override {
+    DataDistribution required_data_distribution(RuntimeState* /*state*/) const override {
         return {ExchangeType::PASSTHROUGH};
     }
 

@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "common/be_mock_util.h"
 #include "common/status.h"
 #include "runtime/types.h"
 #include "util/runtime_profile.h"
@@ -48,11 +49,14 @@ class BufferWritable;
 class IColumn;
 
 class AggFnEvaluator {
+public:
     ENABLE_FACTORY_CREATOR(AggFnEvaluator);
+    MOCK_DEFINE(virtual) ~AggFnEvaluator() = default;
 
 public:
     static Status create(ObjectPool* pool, const TExpr& desc, const TSortInfo& sort_info,
-                         const bool without_key, AggFnEvaluator** result);
+                         const bool without_key, const bool is_window_function,
+                         AggFnEvaluator** result);
 
     Status prepare(RuntimeState* state, const RowDescriptor& desc,
                    const SlotDescriptor* intermediate_slot_desc,
@@ -70,19 +74,19 @@ public:
     void destroy(AggregateDataPtr place);
 
     // agg_function
-    Status execute_single_add(Block* block, AggregateDataPtr place, Arena* arena = nullptr);
+    Status execute_single_add(Block* block, AggregateDataPtr place, Arena& arena);
 
-    Status execute_batch_add(Block* block, size_t offset, AggregateDataPtr* places,
-                             Arena* arena = nullptr, bool agg_many = false);
+    Status execute_batch_add(Block* block, size_t offset, AggregateDataPtr* places, Arena& arena,
+                             bool agg_many = false);
 
     Status execute_batch_add_selected(Block* block, size_t offset, AggregateDataPtr* places,
-                                      Arena* arena = nullptr);
+                                      Arena& arena);
 
     Status streaming_agg_serialize(Block* block, BufferWritable& buf, const size_t num_rows,
-                                   Arena* arena);
+                                   Arena& arena);
 
     Status streaming_agg_serialize_to_column(Block* block, MutableColumnPtr& dst,
-                                             const size_t num_rows, Arena* arena);
+                                             const size_t num_rows, Arena& arena);
 
     void insert_result_info(AggregateDataPtr place, IColumn* column);
 
@@ -107,6 +111,8 @@ public:
 
     AggFnEvaluator* clone(RuntimeState* state, ObjectPool* pool);
 
+    bool is_blockable() const;
+
 private:
     const TFunction _fn;
 
@@ -116,15 +122,21 @@ private:
     // 2. executed with group by key
     const bool _without_key;
 
-    AggFnEvaluator(const TExprNode& desc, const bool without_key);
+    const bool _is_window_function;
+
+    AggFnEvaluator(const TExprNode& desc, const bool without_key, const bool is_window_function);
     AggFnEvaluator(AggFnEvaluator& evaluator, RuntimeState* state);
 
+#ifdef BE_TEST
+    AggFnEvaluator(bool is_merge, bool without_key, const bool is_window_function)
+            : _is_merge(is_merge),
+              _without_key(without_key),
+              _is_window_function(is_window_function) {};
+#endif
     Status _calc_argument_columns(Block* block);
 
     DataTypes _argument_types_with_sort;
     DataTypes _real_argument_types;
-
-    const TypeDescriptor _return_type;
 
     const SlotDescriptor* _intermediate_slot_desc = nullptr;
     const SlotDescriptor* _output_slot_desc = nullptr;

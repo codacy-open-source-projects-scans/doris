@@ -51,7 +51,7 @@ public:
 
     std::vector<RowLocation> current_block_row_locations() { return _block_row_locations; }
 
-    bool update_profile(RuntimeProfile* profile) override {
+    void update_profile(RuntimeProfile* profile) override {
         return _vcollect_iter.update_profile(profile);
     }
 
@@ -84,10 +84,8 @@ private:
 
     void _update_agg_value(MutableColumns& columns, int begin, int end, bool is_close = true);
 
-    bool _get_next_row_same();
-
-    // return true if keys of rowsets are mono ascending and disjoint
-    bool _rowsets_mono_asc_disjoint(const ReaderParams& read_params);
+    // return false if keys of rowsets are mono ascending and disjoint
+    bool _rowsets_not_mono_asc_disjoint(const ReaderParams& read_params);
 
     VCollectIterator _vcollect_iter;
     IteratorRowRef _next_row {{}, -1, false};

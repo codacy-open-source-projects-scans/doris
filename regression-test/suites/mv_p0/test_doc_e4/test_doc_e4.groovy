@@ -19,6 +19,9 @@ import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("test_doc_e4") {
 
+    // this mv rewrite would not be rewritten in RBO phase, so set TRY_IN_RBO explicitly to make case stable
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
+
     sql """ DROP TABLE IF EXISTS d_table; """
 
     sql """
@@ -42,6 +45,7 @@ suite ("test_doc_e4") {
     sql "insert into d_table select 3,-3,null,'2022-02-20';"
 
     sql """analyze table d_table with sync;"""
+    sql """alter table d_table modify column k1 set stats ('row_count'='3');"""
     sql """set enable_stats=false;"""
 
     mv_rewrite_success("select abs(k1)+k2+1,sum(abs(k2+2)+k3+3) from d_table group by abs(k1)+k2+1 order by 1,2;", "k1a2p2ap3ps")
@@ -57,7 +61,6 @@ suite ("test_doc_e4") {
     qt_select_mv "select year(k4)+month(k4) from d_table where year(k4) = 2020 order by 1;"
 
     sql """set enable_stats=true;"""
-    sql """alter table d_table modify column k1 set stats ('row_count'='3');"""
     mv_rewrite_success("select abs(k1)+k2+1,sum(abs(k2+2)+k3+3) from d_table group by abs(k1)+k2+1 order by 1,2;", "k1a2p2ap3ps")
 
     mv_rewrite_success("select bin(abs(k1)+k2+1),sum(abs(k2+2)+k3+3) from d_table group by bin(abs(k1)+k2+1);", "k1a2p2ap3ps")

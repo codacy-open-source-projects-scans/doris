@@ -34,6 +34,7 @@ OPTS="$(getopt \
     -l 'version' \
     -l 'metadata_failure_recovery' \
     -l 'console' \
+    -l 'cluster_snapshot:' \
     -- "$@")"
 
 eval set -- "${OPTS}"
@@ -45,6 +46,7 @@ IMAGE_PATH=''
 IMAGE_TOOL=''
 OPT_VERSION=''
 METADATA_FAILURE_RECOVERY=''
+CLUSTER_SNAPSHOT=''
 while true; do
     case "$1" in
     --daemon)
@@ -70,6 +72,10 @@ while true; do
     --image)
         IMAGE_TOOL=1
         IMAGE_PATH="$2"
+        shift 2
+        ;;
+    --cluster_snapshot)
+        CLUSTER_SNAPSHOT="-cluster_snapshot $2"
         shift 2
         ;;
     --)
@@ -204,6 +210,7 @@ else
 fi
 log "Using Java version ${java_version}"
 log "${final_java_opt}"
+export JAVA_OPTS="${final_java_opt}"
 
 # add libs to CLASSPATH
 DORIS_FE_JAR=
@@ -216,8 +223,24 @@ for f in "${DORIS_HOME}/lib"/*.jar; do
 done
 
 # add custom_libs to CLASSPATH
+# ATTN, custom_libs is deprecated, use plugins/java_extensions
 if [[ -d "${DORIS_HOME}/custom_lib" ]]; then
     for f in "${DORIS_HOME}/custom_lib"/*.jar; do
+        CLASSPATH="${CLASSPATH}:${f}"
+    done
+fi
+
+# add jindofs
+# should after jars in lib/, or it will override the hadoop jars in lib/
+if [[ -d "${DORIS_HOME}/lib/jindofs" ]]; then
+    for f in "${DORIS_HOME}/lib/jindofs"/*.jar; do
+        CLASSPATH="${CLASSPATH}:${f}"
+    done
+fi
+
+# add plugins/java_extensions to CLASSPATH
+if [[ -d "${DORIS_HOME}/plugins/java_extensions" ]]; then
+    for f in "${DORIS_HOME}/plugins/java_extensions"/*.jar; do
         CLASSPATH="${CLASSPATH}:${f}"
     done
 fi
@@ -258,6 +281,12 @@ if [[ "${HELPER}" != "" ]]; then
     HELPER="-helper ${HELPER}"
 fi
 
+if [[ "${OPT_VERSION}" != "" ]]; then
+    export DORIS_LOG_TO_STDERR=1
+    ${LIMIT:+${LIMIT}} "${JAVA}" org.apache.doris.DorisFE --version
+    exit 0
+fi
+
 if [[ "${IMAGE_TOOL}" -eq 1 ]]; then
     if [[ -n "${IMAGE_PATH}" ]]; then
         ${LIMIT:+${LIMIT}} "${JAVA}" ${final_java_opt:+${final_java_opt}} ${coverage_opt:+${coverage_opt}} org.apache.doris.DorisFE -i "${IMAGE_PATH}"
@@ -265,12 +294,12 @@ if [[ "${IMAGE_TOOL}" -eq 1 ]]; then
         echo "Internal error, USE IMAGE_TOOL like: ./start_fe.sh --image image_path"
     fi
 elif [[ "${RUN_DAEMON}" -eq 1 ]]; then
-    nohup ${LIMIT:+${LIMIT}} "${JAVA}" ${final_java_opt:+${final_java_opt}} -XX:-OmitStackTraceInFastThrow -XX:OnOutOfMemoryError="kill -9 %p" ${coverage_opt:+${coverage_opt}} org.apache.doris.DorisFE ${HELPER:+${HELPER}} "${METADATA_FAILURE_RECOVERY}" "$@" >>"${STDOUT_LOGGER}" 2>&1 </dev/null &
+    nohup ${LIMIT:+${LIMIT}} "${JAVA}" ${final_java_opt:+${final_java_opt}} -XX:-OmitStackTraceInFastThrow -XX:OnOutOfMemoryError="kill -9 %p" ${coverage_opt:+${coverage_opt}} org.apache.doris.DorisFE ${HELPER:+${HELPER}} "${METADATA_FAILURE_RECOVERY}" "${CLUSTER_SNAPSHOT}" "$@" >>"${STDOUT_LOGGER}" 2>&1 </dev/null &
 elif [[ "${RUN_CONSOLE}" -eq 1 ]]; then
     export DORIS_LOG_TO_STDERR=1
-    ${LIMIT:+${LIMIT}} "${JAVA}" ${final_java_opt:+${final_java_opt}} -XX:-OmitStackTraceInFastThrow -XX:OnOutOfMemoryError="kill -9 %p" ${coverage_opt:+${coverage_opt}} org.apache.doris.DorisFE ${HELPER:+${HELPER}} ${OPT_VERSION:+${OPT_VERSION}} "${METADATA_FAILURE_RECOVERY}" "$@" </dev/null
+    ${LIMIT:+${LIMIT}} "${JAVA}" ${final_java_opt:+${final_java_opt}} -XX:-OmitStackTraceInFastThrow -XX:OnOutOfMemoryError="kill -9 %p" ${coverage_opt:+${coverage_opt}} org.apache.doris.DorisFE ${HELPER:+${HELPER}} ${OPT_VERSION:+${OPT_VERSION}} "${METADATA_FAILURE_RECOVERY}" "${CLUSTER_SNAPSHOT}" "$@" </dev/null
 else
-    ${LIMIT:+${LIMIT}} "${JAVA}" ${final_java_opt:+${final_java_opt}} -XX:-OmitStackTraceInFastThrow -XX:OnOutOfMemoryError="kill -9 %p" ${coverage_opt:+${coverage_opt}} org.apache.doris.DorisFE ${HELPER:+${HELPER}} ${OPT_VERSION:+${OPT_VERSION}} "${METADATA_FAILURE_RECOVERY}" "$@" >>"${STDOUT_LOGGER}" 2>&1 </dev/null
+    ${LIMIT:+${LIMIT}} "${JAVA}" ${final_java_opt:+${final_java_opt}} -XX:-OmitStackTraceInFastThrow -XX:OnOutOfMemoryError="kill -9 %p" ${coverage_opt:+${coverage_opt}} org.apache.doris.DorisFE ${HELPER:+${HELPER}} ${OPT_VERSION:+${OPT_VERSION}} "${METADATA_FAILURE_RECOVERY}" "${CLUSTER_SNAPSHOT}" "$@" >>"${STDOUT_LOGGER}" 2>&1 </dev/null
 fi
 
 if [[ "${OPT_VERSION}" != "" ]]; then

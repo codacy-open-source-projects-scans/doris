@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <gen_cpp/FrontendService_types.h>
 #include <stdint.h>
 
 #include <string>
@@ -24,10 +25,14 @@
 #include "common/status.h"
 
 namespace doris {
-class TDescribeTableParams;
-class TDescribeTableResult;
 class TDescribeTablesParams;
 class TDescribeTablesResult;
+class TFetchRoutineLoadJobRequest;
+class TFetchRoutineLoadJobResult;
+class TFetchLoadJobRequest;
+class TFetchLoadJobResult;
+class TFetchSchemaTableDataRequest;
+class TFetchSchemaTableDataResult;
 class TGetDbsParams;
 class TGetDbsResult;
 class TGetTablesParams;
@@ -86,6 +91,21 @@ public:
                                     TShowProcessListResult* result);
     static Status show_user(const std::string& ip, const int32_t port,
                             const TShowUserRequest& request, TShowUserResult* result);
+
+    static Status fetch_routine_load_job(const std::string& ip, const int32_t port,
+                                         const TFetchRoutineLoadJobRequest& request,
+                                         TFetchRoutineLoadJobResult* result);
+
+    static Status fetch_load_job(const std::string& ip, const int32_t port,
+                                 const TFetchLoadJobRequest& request, TFetchLoadJobResult* result);
+
+    static Status fetch_schema_table_data(const std::string& ip, const int32_t port,
+                                          const TFetchSchemaTableDataRequest& request,
+                                          TFetchSchemaTableDataResult* result);
+
+    static Status get_master_keys(const std::string& ip, const int32_t port,
+                                  const TGetEncryptionKeysRequest& request,
+                                  TGetEncryptionKeysResult* result);
 };
 
 } // namespace doris

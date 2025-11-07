@@ -26,6 +26,8 @@
 #include "vec/data_types/data_type_factory.hpp"
 
 namespace doris {
+#include "common/compile_check_begin.h"
+
 std::vector<SchemaScanner::ColumnDesc> SchemaWorkloadSchedulePolicyScanner::_s_tbls_columns = {
         {"ID", TYPE_BIGINT, sizeof(int64_t), true},
         {"NAME", TYPE_VARCHAR, sizeof(StringRef), true},
@@ -80,8 +82,8 @@ Status SchemaWorkloadSchedulePolicyScanner::_get_workload_schedule_policy_block_
 
     _block = vectorized::Block::create_unique();
     for (int i = 0; i < _s_tbls_columns.size(); ++i) {
-        TypeDescriptor descriptor(_s_tbls_columns[i].type);
-        auto data_type = vectorized::DataTypeFactory::instance().create_data_type(descriptor, true);
+        auto data_type = vectorized::DataTypeFactory::instance().create_data_type(
+                _s_tbls_columns[i].type, true);
         _block->insert(vectorized::ColumnWithTypeAndName(data_type->create_column(), data_type,
                                                          _s_tbls_columns[i].name));
     }
@@ -89,7 +91,7 @@ Status SchemaWorkloadSchedulePolicyScanner::_get_workload_schedule_policy_block_
     _block->reserve(_block_rows_limit);
 
     if (result_data.size() > 0) {
-        int col_size = result_data[0].column_value.size();
+        auto col_size = result_data[0].column_value.size();
         if (col_size != _s_tbls_columns.size()) {
             return Status::InternalError<false>(
                     "workload policy schema is not match for FE and BE");
@@ -118,7 +120,7 @@ Status SchemaWorkloadSchedulePolicyScanner::get_next_block_internal(vectorized::
 
     if (_block == nullptr) {
         RETURN_IF_ERROR(_get_workload_schedule_policy_block_from_fe());
-        _total_rows = _block->rows();
+        _total_rows = (int)_block->rows();
     }
 
     if (_row_idx == _total_rows) {

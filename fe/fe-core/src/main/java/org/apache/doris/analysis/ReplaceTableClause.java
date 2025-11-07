@@ -47,6 +47,15 @@ public class ReplaceTableClause extends AlterTableClause {
         this.isForce = isForce;
     }
 
+    // for nereids
+    public ReplaceTableClause(String tblName, Map<String, String> properties, boolean isForce, boolean swapTable) {
+        super(AlterOpType.REPLACE_TABLE);
+        this.tblName = tblName;
+        this.properties = properties;
+        this.isForce = isForce;
+        this.swapTable = swapTable;
+    }
+
     public String getTblName() {
         return tblName;
     }
@@ -60,7 +69,7 @@ public class ReplaceTableClause extends AlterTableClause {
     }
 
     @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException {
+    public void analyze() throws AnalysisException {
         if (Strings.isNullOrEmpty(tblName)) {
             throw new AnalysisException("No table specified");
         }

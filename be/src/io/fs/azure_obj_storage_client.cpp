@@ -43,6 +43,7 @@
 #include "common/status.h"
 #include "io/fs/obj_storage_client.h"
 #include "util/bvar_helper.h"
+#include "util/coding.h"
 #include "util/s3_util.h"
 
 using namespace Azure::Storage::Blobs;
@@ -54,8 +55,9 @@ std::string wrap_object_storage_path_msg(const doris::io::ObjectStoragePathOptio
 }
 
 auto base64_encode_part_num(int part_num) {
-    return Aws::Utils::HashingUtils::Base64Encode(
-            {reinterpret_cast<unsigned char*>(&part_num), sizeof(part_num)});
+    uint8_t buf[4];
+    doris::encode_fixed32_le(buf, static_cast<uint32_t>(part_num));
+    return Aws::Utils::HashingUtils::Base64Encode({buf, sizeof(buf)});
 }
 
 template <typename Func>
@@ -80,7 +82,7 @@ auto s3_put_rate_limit(Func callback) -> decltype(callback()) {
     return s3_rate_limit(doris::S3RateLimitType::PUT, std::move(callback));
 }
 
-constexpr char SAS_TOKEN_URL_TEMPLATE[] = "https://{}.blob.core.windows.net/{}/{}{}";
+constexpr char SAS_TOKEN_URL_TEMPLATE[] = "{}/{}/{}{}";
 constexpr char BlobNotFound[] = "BlobNotFound";
 } // namespace
 
@@ -311,7 +313,7 @@ ObjectStorageResponse AzureObjStorageClient::list_objects(const ObjectStoragePat
                     return _client->ListBlobs(list_opts);
                 });
                 get_file_file(resp);
-                while (!resp.NextPageToken->empty()) {
+                while (resp.NextPageToken.HasValue()) {
                     list_opts.ContinuationToken = resp.NextPageToken;
                     resp = s3_get_rate_limit([&]() {
                         SCOPED_BVAR_LATENCY(s3_bvar::s3_list_latency);
@@ -387,7 +389,7 @@ ObjectStorageResponse AzureObjStorageClient::delete_objects_recursively(
         return response;
     }
 
-    while (!resp.NextPageToken->empty()) {
+    while (resp.NextPageToken.HasValue()) {
         list_opts.ContinuationToken = resp.NextPageToken;
         resp = s3_get_rate_limit([&]() {
             SCOPED_BVAR_LATENCY(s3_bvar::s3_list_latency);
@@ -416,6 +418,14 @@ std::string AzureObjStorageClient::generate_presigned_url(const ObjectStoragePat
     std::string sasToken = sas_builder.GenerateSasToken(
             Azure::Storage::StorageSharedKeyCredential(conf.ak, conf.sk));
 
-    return fmt::format(SAS_TOKEN_URL_TEMPLATE, conf.ak, conf.bucket, opts.key, sasToken);
+    std::string endpoint = conf.endpoint;
+    if (doris::config::force_azure_blob_global_endpoint) {
+        endpoint = fmt::format("https://{}.blob.core.windows.net", conf.ak);
+    }
+    auto sasURL = fmt::format(SAS_TOKEN_URL_TEMPLATE, endpoint, conf.bucket, opts.key, sasToken);
+    if (sasURL.find("://") == std::string::npos) {
+        sasURL = "https://" + sasURL;
+    }
+    return sasURL;
 }
 } // namespace doris::io

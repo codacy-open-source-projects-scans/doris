@@ -25,6 +25,7 @@ import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.QuotaExceedException;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.service.ExecuteEnv;
@@ -37,6 +38,8 @@ import org.apache.doris.transaction.TransactionState.TxnSourceType;
 import org.apache.doris.transaction.TransactionStatus;
 
 import com.google.common.collect.Lists;
+import lombok.Getter;
+import lombok.Setter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -75,21 +78,28 @@ public abstract class RoutineLoadTaskInfo {
 
     protected boolean isEof = false;
 
+    @Getter
+    @Setter
+    protected boolean delaySchedule = false;
+
     // this status will be set when corresponding transaction's status is changed.
     // so that user or other logic can know the status of the corresponding txn.
     protected TransactionStatus txnStatus = TransactionStatus.UNKNOWN;
 
-    public RoutineLoadTaskInfo(UUID id, long jobId, long timeoutMs, boolean isMultiTable) {
+    public RoutineLoadTaskInfo(UUID id, long jobId, long timeoutMs, boolean isMultiTable,
+                    long lastScheduledTime, boolean isEof) {
         this.id = id;
         this.jobId = jobId;
         this.createTimeMs = System.currentTimeMillis();
         this.timeoutMs = timeoutMs;
         this.isMultiTable = isMultiTable;
+        this.lastScheduledTime = lastScheduledTime;
+        this.isEof = isEof;
     }
 
     public RoutineLoadTaskInfo(UUID id, long jobId, long timeoutMs, long previousBeId,
-                               boolean isMultiTable) {
-        this(id, jobId, timeoutMs, isMultiTable);
+                               boolean isMultiTable, long lastScheduledTime, boolean isEof) {
+        this(id, jobId, timeoutMs, isMultiTable, lastScheduledTime, isEof);
         this.previousBeId = previousBeId;
     }
 
@@ -149,6 +159,10 @@ public abstract class RoutineLoadTaskInfo {
         return isEof;
     }
 
+    public boolean needDedalySchedule() {
+        return delaySchedule || isEof;
+    }
+
     public boolean isTimeout() {
         if (txnStatus == TransactionStatus.COMMITTED || txnStatus == TransactionStatus.VISIBLE) {
             // the corresponding txn is already finished, this task can not be treated as timeout.
@@ -168,11 +182,17 @@ public abstract class RoutineLoadTaskInfo {
     }
 
     private void judgeEof(RLTaskTxnCommitAttachment rlTaskTxnCommitAttachment) {
+        if (DebugPointUtil.isEnable("RoutineLoadTaskInfo.judgeEof")) {
+            this.isEof = false;
+            return;
+        }
         RoutineLoadJob routineLoadJob = routineLoadManager.getJob(jobId);
         if (rlTaskTxnCommitAttachment.getTotalRows() < routineLoadJob.getMaxBatchRows()
                 && rlTaskTxnCommitAttachment.getReceivedBytes() < routineLoadJob.getMaxBatchSizeBytes()
-                && rlTaskTxnCommitAttachment.getTaskExecutionTimeMs() < this.timeoutMs) {
+                && rlTaskTxnCommitAttachment.getTaskExecutionTimeMs() < routineLoadJob.getMaxBatchIntervalS() * 1000) {
             this.isEof = true;
+        } else {
+            this.isEof = false;
         }
     }
 

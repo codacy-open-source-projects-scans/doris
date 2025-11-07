@@ -25,7 +25,9 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <vector>
 
+#include "cloud/cloud_cluster_info.h"
 #include "cloud/cloud_tablet_mgr.h"
 #include "cloud/config.h"
 #include "common/config.h"
@@ -256,7 +258,7 @@ Status HeartbeatServer::_heartbeat(const TMasterInfo& master_info) {
         if (config::meta_service_endpoint.empty() && !master_info.meta_service_endpoint.empty()) {
             auto st = config::set_config("meta_service_endpoint", master_info.meta_service_endpoint,
                                          true);
-            LOG(INFO) << "set config meta_service_endpoing " << master_info.meta_service_endpoint
+            LOG(INFO) << "set config meta_service_endpoint " << master_info.meta_service_endpoint
                       << " " << st;
         }
 
@@ -265,10 +267,29 @@ Status HeartbeatServer::_heartbeat(const TMasterInfo& master_info) {
                             "and BE. "
                          << "FE meta_service_endpoint: " << master_info.meta_service_endpoint
                          << ", BE meta_service_endpoint: " << config::meta_service_endpoint;
-            return Status::InvalidArgument<false>(
-                    "fe and be do not work in same mode, fe meta_service_endpoint: {},"
-                    " be meta_service_endpoint: {}",
-                    master_info.meta_service_endpoint, config::meta_service_endpoint);
+            std::vector<std::string> old_endpoints =
+                    doris::split(config::meta_service_endpoint, ",");
+            std::vector<std::string> new_endpoints =
+                    doris::split(master_info.meta_service_endpoint, ",");
+            auto has_intersection = false;
+            for (auto endpoint : new_endpoints) {
+                if (std::find(old_endpoints.begin(), old_endpoints.end(), endpoint) !=
+                    old_endpoints.end()) {
+                    has_intersection = true;
+                }
+            }
+            if (has_intersection) {
+                auto st = config::set_config("meta_service_endpoint",
+                                             master_info.meta_service_endpoint, true);
+                LOG(INFO) << "change config meta_service_endpoint to "
+                          << master_info.meta_service_endpoint << " " << st;
+            }
+            if (!has_intersection && config::enable_meta_service_endpoint_consistency_check) {
+                return Status::InvalidArgument<false>(
+                        "fe and be do not work in same mode or meta_service_endpoint mismatch,"
+                        "fe meta_service_endpoint: {}, be meta_service_endpoint: {}",
+                        master_info.meta_service_endpoint, config::meta_service_endpoint);
+            }
         }
     }
 
@@ -277,6 +298,12 @@ Status HeartbeatServer::_heartbeat(const TMasterInfo& master_info) {
         config::enable_use_cloud_unique_id_from_fe) {
         auto st = config::set_config("cloud_unique_id", master_info.cloud_unique_id, true);
         LOG(INFO) << "set config cloud_unique_id " << master_info.cloud_unique_id << " " << st;
+    }
+
+    if (master_info.__isset.cloud_cluster_info &&
+        master_info.cloud_cluster_info.__isset.isStandby) {
+        auto* cloud_cluster_info = static_cast<CloudClusterInfo*>(_cluster_info);
+        cloud_cluster_info->set_is_in_standby(master_info.cloud_cluster_info.isStandby);
     }
 
     if (master_info.__isset.tablet_report_inactive_duration_ms) {

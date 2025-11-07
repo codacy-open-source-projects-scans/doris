@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/atomic_shared_ptr.h"
 #include "common/config.h"
 #include "common/status.h"
 #include "olap/base_tablet.h"
@@ -57,6 +58,7 @@ class Adder;
 }
 
 namespace doris {
+#include "common/compile_check_begin.h"
 
 class Tablet;
 class CumulativeCompactionPolicy;
@@ -116,7 +118,7 @@ public:
     DataDir* data_dir() const { return _data_dir; }
     int64_t replica_id() const { return _tablet_meta->replica_id(); }
 
-    const std::string& tablet_path() const { return _tablet_path; }
+    std::string tablet_path() const override { return _tablet_path; }
 
     bool set_tablet_schema_into_rowset_meta();
     Status init();
@@ -146,8 +148,8 @@ public:
     size_t tablet_remote_size();
 
     size_t num_rows();
-    int version_count() const;
-    int stale_version_count() const;
+    size_t version_count() const;
+    size_t stale_version_count() const;
     bool exceed_version_limit(int32_t limit) override;
     uint64_t segment_count() const;
     Version max_version() const;
@@ -160,10 +162,8 @@ public:
     size_t num_null_columns() const;
     size_t num_short_key_columns() const;
     size_t num_rows_per_row_block() const;
-    CompressKind compress_kind() const;
     double bloom_filter_fpp() const;
     size_t next_unique_id() const;
-    size_t row_size() const;
     int64_t avg_rs_meta_serialize_size() const;
 
     // operation in rowsets
@@ -182,24 +182,15 @@ public:
     /// need to delete flag.
     void delete_expired_stale_rowset();
 
-    // Given spec_version, find a continuous version path and store it in version_path.
-    // If quiet is true, then only "does this path exist" is returned.
-    // If skip_missing_version is true, return ok even there are missing versions.
-    Status capture_consistent_versions_unlocked(const Version& spec_version, Versions* version_path,
-                                                bool skip_missing_version, bool quiet) const;
-
     // if quiet is true, no error log will be printed if there are missing versions
     Status check_version_integrity(const Version& version, bool quiet = false);
     bool check_version_exist(const Version& version) const;
     void acquire_version_and_rowsets(
             std::vector<std::pair<Version, RowsetSharedPtr>>* version_rowsets) const;
 
-    Status capture_consistent_rowsets_unlocked(
-            const Version& spec_version, std::vector<RowsetSharedPtr>* rowsets) const override;
-
     // If skip_missing_version is true, skip versions if they are missing.
     Status capture_rs_readers(const Version& spec_version, std::vector<RowSetSplits>* rs_splits,
-                              bool skip_missing_version) override;
+                              const CaptureRowsetOps& opts) override;
 
     // Find the missed versions until the spec_version.
     //
@@ -214,6 +205,7 @@ public:
     std::mutex& get_push_lock() { return _ingest_lock; }
     std::mutex& get_base_compaction_lock() { return _base_compaction_lock; }
     std::mutex& get_cumulative_compaction_lock() { return _cumulative_compaction_lock; }
+    std::shared_mutex& get_meta_store_lock() { return _meta_store_lock; }
 
     std::shared_timed_mutex& get_migration_lock() { return _migration_lock; }
 
@@ -264,9 +256,19 @@ public:
         _last_full_compaction_success_millis = millis;
     }
 
+    int64_t last_cumu_compaction_schedule_time() { return _last_cumu_compaction_schedule_millis; }
+    void set_last_cumu_compaction_schedule_time(int64_t millis) {
+        _last_cumu_compaction_schedule_millis = millis;
+    }
+
     int64_t last_base_compaction_schedule_time() { return _last_base_compaction_schedule_millis; }
     void set_last_base_compaction_schedule_time(int64_t millis) {
         _last_base_compaction_schedule_millis = millis;
+    }
+
+    int64_t last_full_compaction_schedule_time() { return _last_full_compaction_schedule_millis; }
+    void set_last_full_compaction_schedule_time(int64_t millis) {
+        _last_full_compaction_schedule_millis = millis;
     }
 
     void set_last_single_compaction_failure_status(std::string status) {
@@ -325,16 +327,28 @@ public:
         return _cumulative_compaction_policy;
     }
 
+    void set_last_cumu_compaction_status(std::string status) {
+        _last_cumu_compaction_status = std::move(status);
+    }
+
+    std::string get_last_cumu_compaction_status() { return _last_cumu_compaction_status; }
+
     void set_last_base_compaction_status(std::string status) {
         _last_base_compaction_status = std::move(status);
     }
 
     std::string get_last_base_compaction_status() { return _last_base_compaction_status; }
 
+    void set_last_full_compaction_status(std::string status) {
+        _last_full_compaction_status = std::move(status);
+    }
+
+    std::string get_last_full_compaction_status() { return _last_full_compaction_status; }
+
     std::tuple<int64_t, int64_t> get_visible_version_and_time() const;
 
     void set_visible_version(const std::shared_ptr<const VersionWithTime>& visible_version) {
-        std::atomic_store_explicit(&_visible_version, visible_version, std::memory_order_relaxed);
+        _visible_version.store(visible_version);
     }
 
     bool should_fetch_from_peer();
@@ -418,8 +432,8 @@ public:
     CalcDeleteBitmapExecutor* calc_delete_bitmap_executor() override;
     Status save_delete_bitmap(const TabletTxnInfo* txn_info, int64_t txn_id,
                               DeleteBitmapPtr delete_bitmap, RowsetWriter* rowset_writer,
-                              const RowsetIdUnorderedSet& cur_rowset_ids,
-                              int64_t lock_id = -1) override;
+                              const RowsetIdUnorderedSet& cur_rowset_ids, int64_t lock_id = -1,
+                              int64_t next_visible_version = -1) override;
 
     void merge_delete_bitmap(const DeleteBitmap& delete_bitmap);
     bool check_all_rowset_segment();
@@ -463,9 +477,6 @@ public:
 
     void set_binlog_config(BinlogConfig binlog_config);
 
-    void set_alter_failed(bool alter_failed) { _alter_failed = alter_failed; }
-    bool is_alter_failed() { return _alter_failed; }
-
     void set_is_full_compaction_running(bool is_full_compaction_running) {
         _is_full_compaction_running = is_full_compaction_running;
     }
@@ -489,6 +500,10 @@ public:
         }
         _compaction_score -= score;
     }
+
+    Status prepare_txn(TPartitionId partition_id, TTransactionId transaction_id,
+                       const PUniqueId& load_id, bool ingest);
+    // TODO: commit_txn
 
 private:
     Status _init_once_action();
@@ -531,7 +546,7 @@ private:
     void check_table_size_correctness();
     std::string get_segment_path(const RowsetMetaSharedPtr& rs_meta, int64_t seg_id);
     int64_t get_segment_file_size(const RowsetMetaSharedPtr& rs_meta);
-    int64_t get_inverted_index_file_szie(const RowsetMetaSharedPtr& rs_meta);
+    int64_t get_inverted_index_file_size(const RowsetMetaSharedPtr& rs_meta);
 
 public:
     static const int64_t K_INVALID_CUMULATIVE_POINT = -1;
@@ -572,13 +587,19 @@ private:
     std::atomic<int64_t> _last_base_compaction_success_millis;
     // timestamp of last full compaction success
     std::atomic<int64_t> _last_full_compaction_success_millis;
+    // timestamp of last cumu compaction schedule time
+    std::atomic<int64_t> _last_cumu_compaction_schedule_millis;
     // timestamp of last base compaction schedule time
     std::atomic<int64_t> _last_base_compaction_schedule_millis;
+    // timestamp of last full compaction schedule time
+    std::atomic<int64_t> _last_full_compaction_schedule_millis;
     std::atomic<int64_t> _cumulative_point;
     std::atomic<int64_t> _cumulative_promotion_size;
     std::atomic<int32_t> _newly_created_rowset_num;
     std::atomic<int64_t> _last_checkpoint_time;
+    std::string _last_cumu_compaction_status;
     std::string _last_base_compaction_status;
+    std::string _last_full_compaction_status;
 
     // single replica compaction status
     std::string _last_single_compaction_failure_status;
@@ -588,7 +609,7 @@ private:
     std::shared_ptr<CumulativeCompactionPolicy> _cumulative_compaction_policy;
     std::string_view _cumulative_compaction_type;
 
-    // use a seperate thread to check all tablets paths existance
+    // use a separate thread to check all tablets paths existence
     std::atomic<bool> _is_tablet_path_exists;
 
     int64_t _last_missed_version;
@@ -611,13 +632,11 @@ private:
     // may delete compaction input rowsets.
     std::mutex _cold_compaction_lock;
     int64_t _last_failed_follow_cooldown_time = 0;
-    // `_alter_failed` is used to indicate whether the tablet failed to perform a schema change
-    std::atomic<bool> _alter_failed = false;
 
     int64_t _io_error_times = 0;
 
     // partition's visible version. it sync from fe, but not real-time.
-    std::shared_ptr<const VersionWithTime> _visible_version;
+    atomic_shared_ptr<const VersionWithTime> _visible_version;
 
     std::atomic_bool _is_full_compaction_running = false;
 
@@ -689,12 +708,12 @@ inline size_t Tablet::num_rows() {
     return _tablet_meta->num_rows();
 }
 
-inline int Tablet::version_count() const {
+inline size_t Tablet::version_count() const {
     std::shared_lock rdlock(_meta_lock);
     return _tablet_meta->version_count();
 }
 
-inline int Tablet::stale_version_count() const {
+inline size_t Tablet::stale_version_count() const {
     std::shared_lock rdlock(_meta_lock);
     return _tablet_meta->stale_version_count();
 }
@@ -707,7 +726,7 @@ inline Version Tablet::max_version() const {
 inline uint64_t Tablet::segment_count() const {
     std::shared_lock rdlock(_meta_lock);
     uint64_t segment_nums = 0;
-    for (const auto& rs_meta : _tablet_meta->all_rs_metas()) {
+    for (const auto& [_, rs_meta] : _tablet_meta->all_rs_metas()) {
         segment_nums += rs_meta->num_segments();
     }
     return segment_nums;
@@ -737,10 +756,6 @@ inline size_t Tablet::num_rows_per_row_block() const {
     return _tablet_meta->tablet_schema()->num_rows_per_row_block();
 }
 
-inline CompressKind Tablet::compress_kind() const {
-    return _tablet_meta->tablet_schema()->compress_kind();
-}
-
 inline double Tablet::bloom_filter_fpp() const {
     return _tablet_meta->tablet_schema()->bloom_filter_fpp();
 }
@@ -749,12 +764,9 @@ inline size_t Tablet::next_unique_id() const {
     return _tablet_meta->tablet_schema()->next_column_unique_id();
 }
 
-inline size_t Tablet::row_size() const {
-    return _tablet_meta->tablet_schema()->row_size();
-}
-
 inline int64_t Tablet::avg_rs_meta_serialize_size() const {
     return _tablet_meta->avg_rs_meta_serialize_size();
 }
 
+#include "common/compile_check_end.h"
 } // namespace doris

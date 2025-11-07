@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "olap/iterators.h"
 #include "olap/rowset/rowset_reader_context.h"
 #include "olap/utils.h"
 #ifdef USE_LIBCPP
@@ -78,11 +79,10 @@ public:
         return _inner_iter->current_block_row_locations(block_row_locations);
     }
 
-    bool update_profile(RuntimeProfile* profile) {
+    void update_profile(RuntimeProfile* profile) {
         if (_inner_iter != nullptr) {
-            return _inner_iter->update_profile(profile);
+            _inner_iter->update_profile(profile);
         }
-        return false;
     }
 
     inline bool use_topn_next() const { return _topn_limit > 0; }
@@ -148,7 +148,7 @@ private:
 
         [[nodiscard]] virtual Status ensure_first_row_ref() = 0;
 
-        virtual bool update_profile(RuntimeProfile* profile) = 0;
+        virtual void update_profile(RuntimeProfile* profile) = 0;
 
     protected:
         const TabletSchema& _schema;
@@ -209,11 +209,10 @@ private:
 
         Status current_block_row_locations(std::vector<RowLocation>* block_row_locations) override;
 
-        bool update_profile(RuntimeProfile* profile) override {
+        void update_profile(RuntimeProfile* profile) override {
             if (_rs_reader != nullptr) {
-                return _rs_reader->update_profile(profile);
+                _rs_reader->update_profile(profile);
             }
-            return false;
         }
 
         Status refresh_current_row();
@@ -251,9 +250,16 @@ private:
 
         Status _refresh() {
             if (_get_data_by_ref) {
-                return _rs_reader->next_block_view(&_block_view);
+                return _rs_reader->next_batch(&_block_view);
             } else {
-                return _rs_reader->next_block(_block.get());
+                if (_is_merge_iterator) {
+                    _row_is_same.clear();
+                    BlockWithSameBit block_with_same_bit {.block = _block.get(),
+                                                          .same_bit = _row_is_same};
+                    return _rs_reader->next_batch(&block_with_same_bit);
+                } else {
+                    return _rs_reader->next_batch(_block.get());
+                }
             }
         }
 
@@ -264,6 +270,8 @@ private:
         int _current;
         BlockView _block_view;
         std::vector<RowLocation> _block_row_locations;
+        std::vector<bool> _row_is_same;
+        bool _is_merge_iterator = false;
         bool _get_data_by_ref = false;
     };
 
@@ -289,11 +297,10 @@ private:
 
         ~Level1Iterator() override;
 
-        bool update_profile(RuntimeProfile* profile) override {
+        void update_profile(RuntimeProfile* profile) override {
             if (_cur_child != nullptr) {
-                return _cur_child->update_profile(profile);
+                _cur_child->update_profile(profile);
             }
-            return false;
         }
 
         void init_level0_iterators_for_union();

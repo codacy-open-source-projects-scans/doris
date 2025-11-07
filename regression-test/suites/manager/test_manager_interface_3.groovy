@@ -32,7 +32,7 @@ suite('test_manager_interface_3',"p0") {
     String jdbcPassword = context.config.jdbcPassword
     String s3_endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
-    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
+    String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
 //create role $role_name
 //drop role $role_name
 // create user $user_name identified by "$password" default role "$role_name"
@@ -89,8 +89,8 @@ suite('test_manager_interface_3',"p0") {
             def clusters = sql " SHOW CLUSTERS; "
             assertTrue(!clusters.isEmpty())
             def validCluster = clusters[0][0]
-            sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user1}""";
-            sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user2}""";
+            sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user1}""";
+            sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user2}""";
         }
 
         connect(user1, "${pwd}", url) {
@@ -412,7 +412,7 @@ suite('test_manager_interface_3',"p0") {
             def clusters = sql " SHOW CLUSTERS; "
             assertTrue(!clusters.isEmpty())
             def validCluster = clusters[0][0]
-            sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
+            sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
         }
         
         List<List<Object>> result = sql  """ show resources """
@@ -525,7 +525,7 @@ suite('test_manager_interface_3',"p0") {
                 Name: test_manager_resource_case
         ResourceType: jdbc
                 Item: driver_url
-            Value: mysql-connector-java-8.0.25.jar
+            Value: mysql-connector-j-8.4.0.jar
         *************************** 9. row ***************************
                 Name: test_manager_resource_case
         ResourceType: jdbc
@@ -609,7 +609,7 @@ suite('test_manager_interface_3',"p0") {
             def clusters = sql " SHOW CLUSTERS; "
             assertTrue(!clusters.isEmpty())
             def validCluster = clusters[0][0]
-            sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
+            sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
         }
         
         connect(user, "${pwd}", url) { 

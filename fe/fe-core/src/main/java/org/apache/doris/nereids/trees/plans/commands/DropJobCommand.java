@@ -18,7 +18,13 @@
 package org.apache.doris.nereids.trees.plans.commands;
 
 import org.apache.doris.analysis.StmtType;
-import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.catalog.Env;
+import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.ErrorReport;
+import org.apache.doris.job.base.AbstractJob;
+import org.apache.doris.job.exception.JobException;
+import org.apache.doris.job.extensions.insert.streaming.StreamingInsertJob;
+import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.qe.ConnectContext;
@@ -30,8 +36,8 @@ import org.apache.doris.qe.StmtExecutor;
 public class DropJobCommand extends AlterJobStatusCommand implements ForwardWithSync {
     private final boolean ifExists;
 
-    public DropJobCommand(Expression wildWhere, boolean ifExists) {
-        super(PlanType.DROP_JOB_COMMAND, wildWhere);
+    public DropJobCommand(String jobName, boolean ifExists) {
+        super(PlanType.DROP_JOB_COMMAND, jobName);
         this.ifExists = ifExists;
     }
 
@@ -48,4 +54,26 @@ public class DropJobCommand extends AlterJobStatusCommand implements ForwardWith
     public void doRun(ConnectContext ctx, StmtExecutor executor) throws Exception {
         ctx.getEnv().getJobManager().unregisterJob(super.getJobName(), ifExists);
     }
+
+    @Override
+    protected void checkAuth(ConnectContext ctx) throws Exception {
+        AbstractJob job = ctx.getEnv().getJobManager().getJobByNameOrNull(super.getJobName());
+        if (job == null) {
+            if (!ifExists) {
+                throw new JobException("job not exist, jobName: " + super.getJobName());
+            }
+            return;
+        }
+
+        if (job instanceof StreamingInsertJob) {
+            StreamingInsertJob streamingJob = (StreamingInsertJob) job;
+            streamingJob.checkPrivilege(ConnectContext.get());
+            return;
+        }
+
+        if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
+        }
+    }
+
 }

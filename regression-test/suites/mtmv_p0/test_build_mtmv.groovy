@@ -146,21 +146,6 @@ suite("test_build_mtmv") {
         log.info(e.getMessage())
     }
 
-    // not allow create mv use view
-    try {
-        sql """
-            CREATE MATERIALIZED VIEW ${mvNameRenamed}
-            BUILD DEFERRED REFRESH COMPLETE ON MANUAL
-            DISTRIBUTED BY RANDOM BUCKETS 2
-            PROPERTIES ('replication_num' = '1')
-            AS
-            SELECT * from ${viewName};
-        """
-        Assert.fail();
-    } catch (Exception e) {
-        log.info(e.getMessage())
-    }
-
     sql """
         DROP MATERIALIZED VIEW ${mvName}
     """
@@ -420,6 +405,7 @@ suite("test_build_mtmv") {
         log.info(e.getMessage())
     }
 
+    String querySql = "SELECT ${tableName}.username, ${tableNamePv}.pv FROM ${tableName}, ${tableNamePv} WHERE ${tableName}.id=${tableNamePv}.id";
     // alter
     sql """
         CREATE MATERIALIZED VIEW ${mvName}
@@ -427,12 +413,12 @@ suite("test_build_mtmv") {
         DISTRIBUTED BY RANDOM BUCKETS 2
         PROPERTIES ('replication_num' = '1')
         AS
-        SELECT ${tableName}.username, ${tableNamePv}.pv FROM ${tableName}, ${tableNamePv} WHERE ${tableName}.id=${tableNamePv}.id;
+        ${querySql};
     """
     jobName = getJobName("regression_test_mtmv_p0", mvName);
     waitingMTMVTaskFinished(jobName)
     order_qt_select "SELECT * FROM ${mvName}"
-
+    mv_rewrite_success_without_check_chosen("""${querySql}""", "${mvName}")
     // alter refreshMethod
     sql """
         alter MATERIALIZED VIEW ${mvName} REFRESH COMPLETE;
@@ -440,7 +426,7 @@ suite("test_build_mtmv") {
     jobName = getJobName("regression_test_mtmv_p0", mvName);
     waitingMTMVTaskFinished(jobName)
     order_qt_select "SELECT * FROM ${mvName}"
-
+    mv_rewrite_success_without_check_chosen("""${querySql}""", "${mvName}")
     // alter refreshTrigger
     sql """
         alter MATERIALIZED VIEW ${mvName} REFRESH ON MANUAL;
@@ -448,7 +434,7 @@ suite("test_build_mtmv") {
     jobName = getJobName("regression_test_mtmv_p0", mvName);
     waitingMTMVTaskFinished(jobName)
     order_qt_select "SELECT * FROM ${mvName}"
-
+    mv_rewrite_success_without_check_chosen("""${querySql}""", "${mvName}")
     // alter refreshMethod refreshTrigger
     sql """
         alter MATERIALIZED VIEW ${mvName} REFRESH COMPLETE ON MANUAL;
@@ -456,13 +442,13 @@ suite("test_build_mtmv") {
     jobName = getJobName("regression_test_mtmv_p0", mvName);
     waitingMTMVTaskFinished(jobName)
     order_qt_select "SELECT * FROM ${mvName}"
-
+    mv_rewrite_success_without_check_chosen("""${querySql}""", "${mvName}")
     // alter mv property
     sql """
         alter Materialized View ${mvName} set("grace_period"="3333");
     """
     order_qt_select "select MvProperties from mv_infos('database'='regression_test_mtmv_p0') where Name = '${mvName}'"
-
+    mv_rewrite_success_without_check_chosen("""${querySql}""", "${mvName}")
     // not allow use mv modify property of table
     if (!isCloudMode()) {
         try {
@@ -482,7 +468,7 @@ suite("test_build_mtmv") {
     jobName = getJobName("regression_test_mtmv_p0", mvNameRenamed);
     waitingMTMVTaskFinished(jobName)
     order_qt_select "SELECT * FROM ${mvNameRenamed}"
-
+    mv_rewrite_success_without_check_chosen("""${querySql}""", "${mvNameRenamed}")
     sql """
         DROP MATERIALIZED VIEW ${mvNameRenamed}
     """

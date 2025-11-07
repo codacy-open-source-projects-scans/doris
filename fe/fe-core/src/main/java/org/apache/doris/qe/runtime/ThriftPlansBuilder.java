@@ -17,6 +17,9 @@
 
 package org.apache.doris.qe.runtime;
 
+import org.apache.doris.catalog.AIResource;
+import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.Resource;
 import org.apache.doris.common.Config;
 import org.apache.doris.datasource.FileQueryScanNode;
 import org.apache.doris.nereids.trees.plans.distribute.DistributedPlan;
@@ -43,6 +46,7 @@ import org.apache.doris.planner.SortNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.CoordinatorContext;
 import org.apache.doris.thrift.PaloInternalServiceVersion;
+import org.apache.doris.thrift.TAIResource;
 import org.apache.doris.thrift.TDataSinkType;
 import org.apache.doris.thrift.TFileScanRangeParams;
 import org.apache.doris.thrift.TNetworkAddress;
@@ -52,6 +56,7 @@ import org.apache.doris.thrift.TPipelineInstanceParams;
 import org.apache.doris.thrift.TPlanFragment;
 import org.apache.doris.thrift.TPlanFragmentDestination;
 import org.apache.doris.thrift.TQueryOptions;
+import org.apache.doris.thrift.TRuntimeFilterInfo;
 import org.apache.doris.thrift.TRuntimeFilterParams;
 import org.apache.doris.thrift.TScanRangeParams;
 import org.apache.doris.thrift.TTopnFilterDesc;
@@ -112,9 +117,7 @@ public class ThriftPlansBuilder {
                         workerProcessInstanceNum, coordinatorContext);
 
                 TPipelineInstanceParams instanceParam = instanceToThrift(
-                        currentFragmentParam, instanceJob, runtimeFiltersThriftBuilder,
-                        topNFilterThriftSupplier, currentInstanceIndex++
-                );
+                        currentFragmentParam, instanceJob, currentInstanceIndex++);
                 currentFragmentParam.getLocalParams().add(instanceParam);
             }
 
@@ -122,7 +125,8 @@ public class ThriftPlansBuilder {
             // so we can merge and send multiple fragment to a backend use one rpc
             for (Entry<DistributedPlanWorker, TPipelineFragmentParams> kv : workerToCurrentFragment.entrySet()) {
                 TPipelineFragmentParamsList fragments = fragmentsGroupByWorker.computeIfAbsent(
-                        kv.getKey(), w -> new TPipelineFragmentParamsList());
+                        kv.getKey(), w -> beToThrift(kv.getKey(), runtimeFiltersThriftBuilder,
+                                topNFilterThriftSupplier));
                 fragments.addToParamsList(kv.getValue());
             }
         }
@@ -134,7 +138,7 @@ public class ThriftPlansBuilder {
             Collections.reverse(fragmentsGroupByWorker.get(worker).getParamsList());
         }
 
-        setParamsForOlapTableSink(distributedPlans, fragmentsGroupByWorker);
+        setParamsForOlapTableSink(distributedPlans, fragmentsGroupByWorker, coordinatorContext);
 
         // remove redundant params to reduce rpc message size
         for (Entry<DistributedPlanWorker, TPipelineFragmentParamsList> kv : fragmentsGroupByWorker.entrySet()) {
@@ -188,7 +192,8 @@ public class ThriftPlansBuilder {
     }
 
     private static void setParamsForOlapTableSink(List<PipelineDistributedPlan> distributedPlans,
-            Map<DistributedPlanWorker, TPipelineFragmentParamsList> fragmentsGroupByWorker) {
+            Map<DistributedPlanWorker, TPipelineFragmentParamsList> fragmentsGroupByWorker,
+            CoordinatorContext coordinatorContext) {
         int numBackendsWithSink = 0;
         for (PipelineDistributedPlan distributedPlan : distributedPlans) {
             PlanFragment fragment = distributedPlan.getFragmentJob().getFragment();
@@ -201,13 +206,14 @@ public class ThriftPlansBuilder {
             }
         }
 
+        ConnectContext connectContext = coordinatorContext.connectContext;
         for (Entry<DistributedPlanWorker, TPipelineFragmentParamsList> kv : fragmentsGroupByWorker.entrySet()) {
             TPipelineFragmentParamsList fragments = kv.getValue();
             for (TPipelineFragmentParams fragmentParams : fragments.getParamsList()) {
                 if (fragmentParams.getFragment().getOutputSink().getType() == TDataSinkType.OLAP_TABLE_SINK) {
                     int loadStreamPerNode = 1;
-                    if (ConnectContext.get() != null && ConnectContext.get().getSessionVariable() != null) {
-                        loadStreamPerNode = ConnectContext.get().getSessionVariable().getLoadStreamPerNode();
+                    if (connectContext != null && connectContext.getSessionVariable() != null) {
+                        loadStreamPerNode = connectContext.getSessionVariable().getLoadStreamPerNode();
                     }
                     fragmentParams.setLoadStreamPerNode(loadStreamPerNode);
                     fragmentParams.setTotalLoadStreams(numBackendsWithSink * loadStreamPerNode);
@@ -291,6 +297,27 @@ public class ThriftPlansBuilder {
         return destination;
     }
 
+    private static TPipelineFragmentParamsList beToThrift(
+            DistributedPlanWorker worker,
+            RuntimeFiltersThriftBuilder runtimeFiltersThriftBuilder,
+            Supplier<List<TTopnFilterDesc>> topNFilterThriftSupplier) {
+        TPipelineFragmentParamsList beParam = new TPipelineFragmentParamsList();
+        TRuntimeFilterInfo runtimeFilterInfo = new TRuntimeFilterInfo();
+        runtimeFilterInfo.setTopnFilterDescs(topNFilterThriftSupplier.get());
+
+        TRuntimeFilterParams runtimeFilterParams = new TRuntimeFilterParams();
+        runtimeFilterParams.setRuntimeFilterMergeAddr(runtimeFiltersThriftBuilder.mergeAddress);
+        if (worker.host().equals(runtimeFiltersThriftBuilder.mergeAddress.getHostname())
+                && worker.brpcPort() == runtimeFiltersThriftBuilder.mergeAddress.getPort()) {
+            // only set following information for merge BE node
+            runtimeFiltersThriftBuilder.populateRuntimeFilterParams(runtimeFilterParams);
+        }
+        runtimeFilterInfo.setRuntimeFilterParams(runtimeFilterParams);
+        beParam.setRuntimeFilterInfo(runtimeFilterInfo);
+
+        return beParam;
+    }
+
     private static TPipelineFragmentParams fragmentToThriftIfAbsent(
             PipelineDistributedPlan fragmentPlan, AssignedJob assignedJob,
             Map<DistributedPlanWorker, TPipelineFragmentParams> workerToFragmentParams,
@@ -371,6 +398,16 @@ public class ThriftPlansBuilder {
             // local shuffle params: bucket_seq_to_instance_idx and shuffle_idx_to_instance_idx
             params.setBucketSeqToInstanceIdx(computeBucketIdToInstanceId(fragmentPlan, w, instanceToIndex));
             params.setShuffleIdxToInstanceIdx(computeDestIdToInstanceId(fragmentPlan, w, instanceToIndex));
+
+            // Only used for AI Functions
+            Map<String, TAIResource> aiResourceMap = Maps.newLinkedHashMap();
+            for (Resource resource : Env.getCurrentEnv().getResourceMgr().getResource(Resource.ResourceType.AI)) {
+                if (resource instanceof AIResource) {
+                    aiResourceMap.put(resource.getName(), ((AIResource) resource).toThrift());
+                }
+            }
+            params.setAiResources(aiResourceMap);
+
             return params;
         });
     }
@@ -399,25 +436,18 @@ public class ThriftPlansBuilder {
     }
 
     private static TPipelineInstanceParams instanceToThrift(
-            TPipelineFragmentParams currentFragmentParam, AssignedJob instance,
-            RuntimeFiltersThriftBuilder runtimeFiltersThriftBuilder,
-            Supplier<List<TTopnFilterDesc>> topNFilterThriftSupplier, int currentInstanceNum) {
+            TPipelineFragmentParams currentFragmentParam, AssignedJob instance, int currentInstanceNum) {
         TPipelineInstanceParams instanceParam = new TPipelineInstanceParams();
         instanceParam.setFragmentInstanceId(instance.instanceId());
         setScanSourceParam(currentFragmentParam, instance, instanceParam);
 
         instanceParam.setSenderId(instance.indexInUnassignedJob());
         instanceParam.setBackendNum(currentInstanceNum);
-        instanceParam.setRuntimeFilterParams(new TRuntimeFilterParams());
-
-        instanceParam.setTopnFilterDescs(topNFilterThriftSupplier.get());
-
-        // set for runtime filter
-        TRuntimeFilterParams runtimeFilterParams = new TRuntimeFilterParams();
-        runtimeFilterParams.setRuntimeFilterMergeAddr(runtimeFiltersThriftBuilder.mergeAddress);
-        instanceParam.setRuntimeFilterParams(runtimeFilterParams);
-        if (runtimeFiltersThriftBuilder.isMergeRuntimeFilterInstance(instance)) {
-            runtimeFiltersThriftBuilder.setRuntimeFilterThriftParams(runtimeFilterParams);
+        boolean isLocalShuffle = instance instanceof LocalShuffleAssignedJob;
+        if (isLocalShuffle) {
+            // a fragment in a backend only enable local shuffle once for the first local shuffle instance,
+            // because we just skip set scan params for LocalShuffleAssignedJob.receiveDataFromLocal == true
+            ignoreDataDistribution(currentFragmentParam);
         }
         return instanceParam;
     }
@@ -425,15 +455,6 @@ public class ThriftPlansBuilder {
     private static void setScanSourceParam(
             TPipelineFragmentParams currentFragmentParam, AssignedJob instance,
             TPipelineInstanceParams instanceParams) {
-
-        boolean isLocalShuffle = instance instanceof LocalShuffleAssignedJob;
-        if (isLocalShuffle && ((LocalShuffleAssignedJob) instance).receiveDataFromLocal) {
-            // save thrift rpc message size, don't need perNodeScanRanges,
-            // but the perNodeScanRanges is required rpc field
-            instanceParams.setPerNodeScanRanges(Maps.newLinkedHashMap());
-            return;
-        }
-
         ScanSource scanSource = instance.getScanSource();
         PerNodeScanParams scanParams;
         if (scanSource instanceof BucketScanSource) {
@@ -443,12 +464,6 @@ public class ThriftPlansBuilder {
         }
         // perNodeScanRanges is required
         instanceParams.setPerNodeScanRanges(scanParams.perNodeScanRanges);
-
-        if (isLocalShuffle) {
-            // a fragment in a backend only enable local shuffle once for the first local shuffle instance,
-            // because we just skip set scan params for LocalShuffleAssignedJob.receiveDataFromLocal == true
-            ignoreDataDistribution(currentFragmentParam);
-        }
     }
 
     // local shuffle has two functions:

@@ -18,8 +18,9 @@
 package org.apache.doris.nereids.trees.plans.commands;
 
 import org.apache.doris.analysis.StmtType;
+import org.apache.doris.common.InternalErrorCode;
+import org.apache.doris.job.common.FailureReason;
 import org.apache.doris.job.common.JobStatus;
-import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.qe.ConnectContext;
@@ -29,8 +30,8 @@ import org.apache.doris.qe.StmtExecutor;
  * pause job
  */
 public class PauseJobCommand extends AlterJobStatusCommand implements ForwardWithSync {
-    public PauseJobCommand(Expression wildWhere) {
-        super(PlanType.PAUSE_JOB_COMMAND, wildWhere);
+    public PauseJobCommand(String jobName) {
+        super(PlanType.PAUSE_JOB_COMMAND, jobName);
     }
 
     @Override
@@ -40,7 +41,8 @@ public class PauseJobCommand extends AlterJobStatusCommand implements ForwardWit
 
     @Override
     public void doRun(ConnectContext ctx, StmtExecutor executor) throws Exception {
-        ctx.getEnv().getJobManager().alterJobStatus(super.getJobName(), JobStatus.PAUSED);
+        ctx.getEnv().getJobManager().alterJobStatus(super.getJobName(), JobStatus.PAUSED,
+                new FailureReason(InternalErrorCode.MANUAL_PAUSE_ERR, "Job paused by user " + ctx.getQualifiedUser()));
     }
 
     @Override

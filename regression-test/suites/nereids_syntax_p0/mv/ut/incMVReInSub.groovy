@@ -19,6 +19,8 @@ import org.codehaus.groovy.runtime.IOGroovyMethods
 
 // nereids_testIncorrectMVRewriteInSubquery
 suite ("incMVReInSub") {
+    // this mv rewrite would not be rewritten in RBO phase, so set TRY_IN_RBO explicitly to make case stable
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
     sql "SET experimental_enable_nereids_planner=true"
     sql "SET enable_fallback_to_original_planner=false"
     sql """ DROP TABLE IF EXISTS incMVReInSub; """
@@ -35,13 +37,15 @@ suite ("incMVReInSub") {
     sql """insert into incMVReInSub values("2020-01-01",1,"a",1);"""
     sql """insert into incMVReInSub values("2020-01-02",2,"b",2);"""
 
-    createMV("create materialized view incMVReInSub_mv as select user_id, bitmap_union(to_bitmap(tag_id)) from incMVReInSub group by user_id;")
+    createMV("create materialized view incMVReInSub_mv as select user_id as a1, bitmap_union(to_bitmap(tag_id)) from incMVReInSub group by user_id;")
 
     sleep(3000)
 
     sql """insert into incMVReInSub values("2020-01-01",1,"a",2);"""
 
     sql "analyze table incMVReInSub with sync;"
+    sql """alter table incMVReInSub modify column time_col set stats ('row_count'='3');"""
+
     sql """set enable_stats=false;"""
 
     mv_rewrite_fail("select * from incMVReInSub order by time_col;", "incMVReInSub_mv")
@@ -53,7 +57,6 @@ suite ("incMVReInSub") {
     order_qt_select_mv "select user_id, bitmap_union(to_bitmap(tag_id)) from incMVReInSub where user_name in (select user_name from incMVReInSub group by user_name having bitmap_union_count(to_bitmap(tag_id)) >1 ) group by user_id order by user_id;"
 
     sql """set enable_stats=true;"""
-    sql """alter table incMVReInSub modify column time_col set stats ('row_count'='3');"""
 
     mv_rewrite_fail("select * from incMVReInSub order by time_col;", "incMVReInSub_mv")
 

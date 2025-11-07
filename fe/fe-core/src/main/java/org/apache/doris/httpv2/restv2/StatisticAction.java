@@ -27,6 +27,8 @@ import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.collect.Maps;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -36,8 +38,6 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 @RestController
 @RequestMapping("/rest/v2")
@@ -50,13 +50,12 @@ public class StatisticAction extends RestBaseController {
         if (Config.enable_all_http_auth) {
             executeCheckPassword(request, response);
         }
+        if (needRedirect(request.getScheme())) {
+            return redirectToHttps(request);
+        }
 
-        try {
-            if (!Env.getCurrentEnv().isMaster()) {
-                return redirectToMasterOrException(request, response);
-            }
-        } catch (Exception e) {
-            return ResponseEntityBuilder.okWithCommonError(e.getMessage());
+        if (checkForwardToMaster(request)) {
+            return forwardToMaster(request);
         }
 
         Map<String, Object> resultMap = Maps.newHashMap();

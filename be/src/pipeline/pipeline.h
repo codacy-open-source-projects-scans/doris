@@ -83,8 +83,8 @@ public:
 
     bool need_to_local_exchange(const DataDistribution target_data_distribution,
                                 const int idx) const;
-    void init_data_distribution() {
-        set_data_distribution(_operators.front()->required_data_distribution());
+    void init_data_distribution(RuntimeState* state) {
+        set_data_distribution(_operators.front()->required_data_distribution(state));
     }
     void set_data_distribution(const DataDistribution& data_distribution) {
         _data_distribution = data_distribution;
@@ -104,7 +104,7 @@ public:
         _tasks[i] = task;
     }
 
-    void make_all_runnable();
+    void make_all_runnable(PipelineId wake_by);
 
     void set_num_tasks(int num_tasks) {
         _num_tasks = num_tasks;
@@ -138,6 +138,7 @@ public:
     }
 
     int num_tasks_of_parent() const { return _num_tasks_of_parent; }
+    std::string& name() { return _name; }
 
 private:
     void _init_profile();
@@ -148,7 +149,6 @@ private:
     std::vector<std::shared_ptr<Pipeline>> _children;
 
     PipelineId _pipeline_id;
-    int _previous_schedule_id = -1;
 
     // pipline id + operator names. init when:
     //  build_operators(), if pipeline;

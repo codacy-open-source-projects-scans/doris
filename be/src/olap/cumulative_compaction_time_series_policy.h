@@ -42,17 +42,18 @@ public:
     /// When the first time the tablet does compact, this calculation is executed. Its main policy is to find first rowset
     /// which does not satisfied the _compaction_goal_size * 0.8.
     /// The result of compaction may be slightly smaller than the _compaction_goal_size.
-    void calculate_cumulative_point(Tablet* tablet,
-                                    const std::vector<RowsetMetaSharedPtr>& all_rowsets,
+    void calculate_cumulative_point(Tablet* tablet, const RowsetMetaMapContainer& all_rowsets,
                                     int64_t current_cumulative_point,
                                     int64_t* cumulative_point) override;
 
     /// Its main policy is picking rowsets from candidate rowsets by Condition 1, 2, 3.
-    int pick_input_rowsets(Tablet* tablet, const std::vector<RowsetSharedPtr>& candidate_rowsets,
-                           const int64_t max_compaction_score, const int64_t min_compaction_score,
-                           std::vector<RowsetSharedPtr>* input_rowsets,
-                           Version* last_delete_version, size_t* compaction_score,
-                           bool allow_delete = false) override;
+    int32_t pick_input_rowsets(Tablet* tablet,
+                               const std::vector<RowsetSharedPtr>& candidate_rowsets,
+                               const int64_t max_compaction_score,
+                               const int64_t min_compaction_score,
+                               std::vector<RowsetSharedPtr>* input_rowsets,
+                               Version* last_delete_version, size_t* compaction_score,
+                               bool allow_delete = false) override;
 
     /// The point must be updated after each cumulative compaction is completed.
     /// We want each rowset to do cumulative compaction once.
@@ -60,10 +61,22 @@ public:
                                  RowsetSharedPtr _output_rowset,
                                  Version& last_delete_version) override;
 
-    void update_compaction_level(Tablet* tablet, const std::vector<RowsetSharedPtr>& input_rowsets,
+    int64_t get_compaction_level(Tablet* tablet, const std::vector<RowsetSharedPtr>& input_rowsets,
                                  RowsetSharedPtr output_rowset) override;
 
     std::string_view name() override { return CUMULATIVE_TIME_SERIES_POLICY; }
+
+    static int32_t pick_input_rowsets(BaseTablet* tablet, int64_t last_cumu,
+                                      const std::vector<RowsetSharedPtr>& candidate_rowsets,
+                                      const int64_t max_compaction_score,
+                                      const int64_t min_compaction_score,
+                                      std::vector<RowsetSharedPtr>* input_rowsets,
+                                      Version* last_delete_version, size_t* compaction_score,
+                                      bool allow_delete = false);
+
+    static int64_t get_compaction_level(BaseTablet* tablet,
+                                        const std::vector<RowsetSharedPtr>& input_rowsets,
+                                        RowsetSharedPtr output_rowset);
 };
 
 } // namespace doris

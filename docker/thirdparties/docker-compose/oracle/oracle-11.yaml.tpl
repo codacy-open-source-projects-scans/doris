@@ -39,13 +39,6 @@ services:
       - TZ=Asia/Shanghai
     networks:
       - doris--oracle_11
-  doris--oracle-hello-world:
-    image: hello-world
-    depends_on:
-      doris--oracle_11:
-        condition: service_healthy 
-    networks:
-      - doris--oracle_11
 
 networks:
   doris--oracle_11:
@@ -53,3 +46,7 @@ networks:
       driver: default
       config:
         - subnet: 168.40.0.0/24
+
+# login in container
+# sqlplus system/oracle@127.0.0.1:1521
+# sqlplus DORIS_TEST/123456@127.0.0.1:1521

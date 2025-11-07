@@ -169,6 +169,7 @@ std::string HistogramMetric::to_string() const {
 std::string HistogramMetric::to_prometheus(const std::string& display_name,
                                            const Labels& entity_labels,
                                            const Labels& metric_labels) const {
+    // TODO: Use std::string concate for better performance.
     std::stringstream ss;
     for (const auto& percentile : _s_output_percentiles) {
         auto quantile_lable = Labels({{"quantile", percentile.first}});
@@ -314,7 +315,7 @@ std::shared_ptr<MetricEntity> MetricRegistry::get_entity(const std::string& name
 void MetricRegistry::trigger_all_hooks(bool force) const {
     std::lock_guard<std::mutex> l(_lock);
     for (const auto& entity : _entities) {
-        std::lock_guard<std::mutex> l(entity.first->_lock);
+        std::lock_guard<std::mutex> le(entity.first->_lock);
         entity.first->trigger_hook_unlocked(force);
     }
 }
@@ -322,12 +323,12 @@ void MetricRegistry::trigger_all_hooks(bool force) const {
 std::string MetricRegistry::to_prometheus(bool with_tablet_metrics) const {
     // Reorder by MetricPrototype
     EntityMetricsByType entity_metrics_by_types;
-    std::lock_guard<std::mutex> l(_lock);
+    std::lock_guard<std::mutex> l1(_lock);
     for (const auto& entity : _entities) {
         if (entity.first->_type == MetricEntityType::kTablet && !with_tablet_metrics) {
             continue;
         }
-        std::lock_guard<std::mutex> l(entity.first->_lock);
+        std::lock_guard<std::mutex> l2(entity.first->_lock);
         entity.first->trigger_hook_unlocked(false);
         for (const auto& metric : entity.first->_metrics) {
             std::pair<MetricEntity*, Metric*> new_elem =
@@ -370,7 +371,7 @@ std::string MetricRegistry::to_json(bool with_tablet_metrics) const {
         if (entity.first->_type == MetricEntityType::kTablet && !with_tablet_metrics) {
             continue;
         }
-        std::lock_guard<std::mutex> l(entity.first->_lock);
+        std::lock_guard<std::mutex> le(entity.first->_lock);
         entity.first->trigger_hook_unlocked(false);
         for (const auto& metric : entity.first->_metrics) {
             rj::Value metric_obj(rj::kObjectType);
@@ -408,7 +409,7 @@ std::string MetricRegistry::to_core_string() const {
     std::stringstream ss;
     std::lock_guard<std::mutex> l(_lock);
     for (const auto& entity : _entities) {
-        std::lock_guard<std::mutex> l(entity.first->_lock);
+        std::lock_guard<std::mutex> le(entity.first->_lock);
         entity.first->trigger_hook_unlocked(false);
         for (const auto& metric : entity.first->_metrics) {
             if (metric.first->is_core_metric) {

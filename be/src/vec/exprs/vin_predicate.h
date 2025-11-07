@@ -36,13 +36,17 @@ class VExprContext;
 } // namespace doris
 
 namespace doris::vectorized {
-class VInPredicate final : public VExpr {
+class VInPredicate MOCK_REMOVE(final) : public VExpr {
     ENABLE_FACTORY_CREATOR(VInPredicate);
 
 public:
     VInPredicate(const TExprNode& node);
+#ifdef BE_TEST
+    VInPredicate() = default;
+#endif
     ~VInPredicate() override = default;
-    Status execute(VExprContext* context, Block* block, int* result_column_id) override;
+    Status execute(VExprContext* context, Block* block, int* result_column_id) const override;
+    size_t estimate_memory(const size_t rows) override;
     Status prepare(RuntimeState* state, const RowDescriptor& desc, VExprContext* context) override;
     Status open(RuntimeState* state, VExprContext* context,
                 FunctionContext::FunctionStateScope scope) override;
@@ -56,11 +60,13 @@ public:
     bool is_not_in() const { return _is_not_in; };
     Status evaluate_inverted_index(VExprContext* context, uint32_t segment_num_rows) override;
 
+    uint64_t get_digest(uint64_t seed) const override { return 0; }
+
 private:
     FunctionBasePtr _function;
     std::string _expr_name;
 
-    const bool _is_not_in;
+    MOCK_REMOVE(const) bool _is_not_in;
     static const constexpr char* function_name = "in";
     uint32_t _in_list_value_count_threshold = 10;
     bool _is_args_all_constant = false;

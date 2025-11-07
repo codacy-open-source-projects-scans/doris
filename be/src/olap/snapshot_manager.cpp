@@ -65,7 +65,37 @@ using std::stringstream;
 using std::vector;
 
 namespace doris {
+#include "common/compile_check_begin.h"
 using namespace ErrorCode;
+
+LocalSnapshotLockGuard LocalSnapshotLock::acquire(const std::string& path) {
+    std::unique_lock<std::mutex> l(_lock);
+    auto& ctx = _local_snapshot_contexts[path];
+    while (ctx._is_locked) {
+        ctx._waiting_count++;
+        ctx._cv.wait(l);
+        ctx._waiting_count--;
+    }
+
+    ctx._is_locked = true;
+    return {path};
+}
+
+void LocalSnapshotLock::release(const std::string& path) {
+    std::lock_guard<std::mutex> l(_lock);
+    auto iter = _local_snapshot_contexts.find(path);
+    if (iter == _local_snapshot_contexts.end()) {
+        return;
+    }
+
+    auto& ctx = iter->second;
+    ctx._is_locked = false;
+    if (ctx._waiting_count > 0) {
+        ctx._cv.notify_one();
+    } else {
+        _local_snapshot_contexts.erase(iter);
+    }
+}
 
 SnapshotManager::SnapshotManager(StorageEngine& engine) : _engine(engine) {
     _mem_tracker =
@@ -118,6 +148,8 @@ Status SnapshotManager::make_snapshot(const TSnapshotRequest& request, string* s
 }
 
 Status SnapshotManager::release_snapshot(const string& snapshot_path) {
+    auto local_snapshot_guard = LocalSnapshotLock::instance().acquire(snapshot_path);
+
     // If the requested snapshot_path is located in the root/snapshot folder, it is considered legal and can be deleted.
     // Otherwise, it is considered an illegal request and returns an error result.
     SCOPED_ATTACH_TASK(_mem_tracker);
@@ -153,10 +185,8 @@ Result<std::vector<PendingRowsetGuard>> SnapshotManager::convert_rowset_ids(
 
     // load original tablet meta
     auto cloned_meta_file = fmt::format("{}/{}.hdr", clone_dir, tablet_id);
-    TabletMeta cloned_tablet_meta;
-    RETURN_IF_ERROR_RESULT(cloned_tablet_meta.create_from_file(cloned_meta_file));
     TabletMetaPB cloned_tablet_meta_pb;
-    cloned_tablet_meta.to_meta_pb(&cloned_tablet_meta_pb);
+    RETURN_IF_ERROR_RESULT(TabletMeta::load_from_file(cloned_meta_file, &cloned_tablet_meta_pb));
 
     TabletMetaPB new_tablet_meta_pb;
     new_tablet_meta_pb = cloned_tablet_meta_pb;
@@ -199,6 +229,8 @@ Result<std::vector<PendingRowsetGuard>> SnapshotManager::convert_rowset_ids(
                 src_rs_id.init(visible_rowset.rowset_id_v2());
             }
             rowset_id_mapping[src_rs_id] = rowset_id;
+            rowset_meta->set_source_rowset_id(visible_rowset.rowset_id_v2());
+            rowset_meta->set_source_tablet_id(cloned_tablet_meta_pb.tablet_id());
         } else {
             // remote rowset
             *rowset_meta = visible_rowset;
@@ -234,6 +266,8 @@ Result<std::vector<PendingRowsetGuard>> SnapshotManager::convert_rowset_ids(
                 src_rs_id.init(stale_rowset.rowset_id_v2());
             }
             rowset_id_mapping[src_rs_id] = rowset_id;
+            rowset_meta->set_source_rowset_id(stale_rowset.rowset_id_v2());
+            rowset_meta->set_source_tablet_id(cloned_tablet_meta_pb.tablet_id());
         } else {
             // remote rowset
             *rowset_meta = stale_rowset;
@@ -249,7 +283,7 @@ Result<std::vector<PendingRowsetGuard>> SnapshotManager::convert_rowset_ids(
         const auto& cloned_del_bitmap_pb = cloned_tablet_meta_pb.delete_bitmap();
         DeleteBitmapPB* new_del_bitmap_pb = new_tablet_meta_pb.mutable_delete_bitmap();
         int rst_ids_size = cloned_del_bitmap_pb.rowset_ids_size();
-        for (size_t i = 0; i < rst_ids_size; ++i) {
+        for (int i = 0; i < rst_ids_size; ++i) {
             RowsetId rst_id;
             rst_id.init(cloned_del_bitmap_pb.rowset_ids(i));
             // It should not happen, if we can't convert some rowid in delete bitmap, the
@@ -269,7 +303,7 @@ Status SnapshotManager::_rename_rowset_id(const RowsetMetaPB& rs_meta_pb,
                                           const std::string& new_tablet_path,
                                           TabletSchemaSPtr tablet_schema, const RowsetId& rowset_id,
                                           RowsetMetaPB* new_rs_meta_pb) {
-    Status res = Status::OK();
+    Status st = Status::OK();
     RowsetMetaSharedPtr rowset_meta(new RowsetMeta());
     rowset_meta->init_from_pb(rs_meta_pb);
     RowsetSharedPtr org_rowset;
@@ -297,11 +331,11 @@ Status SnapshotManager::_rename_rowset_id(const RowsetMetaPB& rs_meta_pb,
 
     auto rs_writer = DORIS_TRY(RowsetFactory::create_rowset_writer(_engine, context, false));
 
-    res = rs_writer->add_rowset(org_rowset);
-    if (!res.ok()) {
+    st = rs_writer->add_rowset(org_rowset);
+    if (!st.ok()) {
         LOG(WARNING) << "failed to add rowset "
                      << " id = " << org_rowset->rowset_id() << " to rowset " << rowset_id;
-        return res;
+        return st;
     }
     RowsetSharedPtr new_rowset;
     RETURN_NOT_OK_STATUS_WITH_WARN(rs_writer->build(new_rowset),
@@ -448,7 +482,7 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
                 }
             }
             // be would definitely set it as true no matter has missed version or not
-            // but it would take no effets on the following range loop
+            // but it would take no effects on the following range loop
             if (!is_single_rowset_clone && request.__isset.missing_version) {
                 for (int64_t missed_version : request.missing_version) {
                     Version version = {missed_version, missed_version};
@@ -534,13 +568,22 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
                     res = check_version_continuity(consistent_rowsets);
                     if (res.ok() && max_cooldowned_version < version) {
                         // Pick consistent rowsets of remaining required version
-                        res = ref_tablet->capture_consistent_rowsets_unlocked(
-                                {max_cooldowned_version + 1, version}, &consistent_rowsets);
+                        auto ret = ref_tablet->capture_consistent_rowsets_unlocked(
+                                {max_cooldowned_version + 1, version}, CaptureRowsetOps {});
+                        if (ret) {
+                            consistent_rowsets = std::move(ret->rowsets);
+                        } else {
+                            res = std::move(ret.error());
+                        }
                     }
                 } else {
-                    // get shortest version path
-                    res = ref_tablet->capture_consistent_rowsets_unlocked(Version(0, version),
-                                                                          &consistent_rowsets);
+                    auto ret = ref_tablet->capture_consistent_rowsets_unlocked(Version(0, version),
+                                                                               CaptureRowsetOps {});
+                    if (ret) {
+                        consistent_rowsets = std::move(ret->rowsets);
+                    } else {
+                        res = std::move(ret.error());
+                    }
                 }
                 if (!res.ok()) {
                     LOG(WARNING) << "fail to select versions to span. res=" << res;
@@ -554,7 +597,7 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
 
             // copy the tablet meta to new_tablet_meta inside header lock
             CHECK(res.ok()) << res;
-            ref_tablet->generate_tablet_meta_copy_unlocked(*new_tablet_meta);
+            ref_tablet->generate_tablet_meta_copy_unlocked(*new_tablet_meta, false);
             // The delete bitmap update operation and the add_inc_rowset operation is not atomic,
             // so delete bitmap may contains some data generated by invisible rowset, we should
             // get rid of these useless bitmaps when doing snapshot.
@@ -719,7 +762,7 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
                         linked_success_files.push_back(snapshot_segment_index_file_path);
                     }
                 } else {
-                    if (tablet_schema.has_inverted_index()) {
+                    if (tablet_schema.has_inverted_index() || tablet_schema.has_ann_index()) {
                         auto index_file = InvertedIndexDescriptor::get_index_file_path_v2(
                                 InvertedIndexDescriptor::get_index_file_path_prefix(
                                         segment_file_path));
@@ -750,9 +793,9 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
         LOG(WARNING) << "fail to make snapshot, try to delete the snapshot path. path="
                      << snapshot_id_path.c_str();
 
-        bool exists = true;
-        RETURN_IF_ERROR(io::global_local_filesystem()->exists(snapshot_id_path, &exists));
-        if (exists) {
+        bool exist = true;
+        RETURN_IF_ERROR(io::global_local_filesystem()->exists(snapshot_id_path, &exist));
+        if (exist) {
             VLOG_NOTICE << "remove snapshot path. [path=" << snapshot_id_path << "]";
             RETURN_IF_ERROR(io::global_local_filesystem()->delete_directory(snapshot_id_path));
         }
@@ -762,5 +805,5 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
 
     return res;
 }
-
+#include "common/compile_check_end.h"
 } // namespace doris

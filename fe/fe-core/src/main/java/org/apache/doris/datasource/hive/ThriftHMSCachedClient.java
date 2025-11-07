@@ -17,20 +17,21 @@
 
 package org.apache.doris.datasource.hive;
 
-import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.common.Config;
-import org.apache.doris.common.security.authentication.HadoopAuthenticator;
+import org.apache.doris.common.security.authentication.ExecutionAuthenticator;
 import org.apache.doris.datasource.DatabaseMetadata;
 import org.apache.doris.datasource.TableMetadata;
 import org.apache.doris.datasource.hive.event.MetastoreNotificationFetchException;
-import org.apache.doris.datasource.property.constants.HMSProperties;
+import org.apache.doris.datasource.property.metastore.HMSBaseProperties;
+import org.apache.doris.info.TableNameInfo;
 
 import com.aliyun.datalake.metastore.hive2.ProxyMetaStoreClient;
 import com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+import org.apache.hadoop.hive.common.ValidReadTxnList;
 import org.apache.hadoop.hive.common.ValidReaderWriteIdList;
 import org.apache.hadoop.hive.common.ValidTxnList;
 import org.apache.hadoop.hive.common.ValidTxnWriteIdList;
@@ -93,21 +94,18 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
     private boolean isClosed = false;
     private final int poolSize;
     private final HiveConf hiveConf;
-    private HadoopAuthenticator hadoopAuthenticator;
+    private ExecutionAuthenticator executionAuthenticator;
 
-    public ThriftHMSCachedClient(HiveConf hiveConf, int poolSize) {
+    public ThriftHMSCachedClient(HiveConf hiveConf, int poolSize, ExecutionAuthenticator executionAuthenticator) {
         Preconditions.checkArgument(poolSize > 0, poolSize);
         if (hiveConf != null) {
-            hiveConf.set(ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT.name(),
+            HiveConf.setVar(hiveConf, ConfVars.METASTORE_CLIENT_SOCKET_TIMEOUT,
                     String.valueOf(Config.hive_metastore_client_timeout_second));
         }
         this.hiveConf = hiveConf;
         this.poolSize = poolSize;
         this.isClosed = false;
-    }
-
-    public void setHadoopAuthenticator(HadoopAuthenticator hadoopAuthenticator) {
-        this.hadoopAuthenticator = hadoopAuthenticator;
+        this.executionAuthenticator = executionAuthenticator;
     }
 
     @Override
@@ -529,7 +527,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
     }
 
     @Override
-    public void acquireSharedLock(String queryId, long txnId, String user, TableName tblName,
+    public void acquireSharedLock(String queryId, long txnId, String user, TableNameInfo tblName,
                                   List<String> partitionNames, long timeoutMs) {
         LockRequestBuilder request = new LockRequestBuilder(queryId).setTransactionId(txnId).setUser(user);
         List<LockComponent> lockComponents = createLockComponentsForRead(tblName, partitionNames);
@@ -564,7 +562,8 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
     }
 
     @Override
-    public ValidWriteIdList getValidWriteIds(String fullTableName, long currentTransactionId) {
+    public Map<String, String> getValidWriteIds(String fullTableName, long currentTransactionId) {
+        Map<String, String> conf = new HashMap<>();
         try (ThriftHMSClient client = getClient()) {
             try {
                 return ugiDoAs(() -> {
@@ -581,7 +580,10 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
                     ValidTxnWriteIdList validTxnWriteIdList = TxnUtils.createValidTxnWriteIdList(currentTransactionId,
                             tableValidWriteIdsList);
                     ValidWriteIdList writeIdList = validTxnWriteIdList.getTableValidWriteIdList(fullTableName);
-                    return writeIdList;
+
+                    conf.put(AcidUtil.VALID_TXNS_KEY, validTransactions.writeToString());
+                    conf.put(AcidUtil.VALID_WRITEIDS_KEY, writeIdList.writeToString());
+                    return conf;
                 });
             } catch (Exception e) {
                 client.setThrowable(e);
@@ -591,7 +593,14 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
             // Ignore this exception when the version of hive is not compatible with these apis.
             // Currently, the workaround is using a max watermark.
             LOG.warn("failed to get valid write ids for {}, transaction {}", fullTableName, currentTransactionId, e);
-            return new ValidReaderWriteIdList(fullTableName, new long[0], new BitSet(), Long.MAX_VALUE);
+
+            ValidTxnList validTransactions = new ValidReadTxnList(
+                    new long[0], new BitSet(), Long.MAX_VALUE, Long.MAX_VALUE);
+            ValidWriteIdList writeIdList = new ValidReaderWriteIdList(
+                    fullTableName, new long[0], new BitSet(), Long.MAX_VALUE);
+            conf.put(AcidUtil.VALID_TXNS_KEY, validTransactions.writeToString());
+            conf.put(AcidUtil.VALID_WRITEIDS_KEY, writeIdList.writeToString());
+            return conf;
         }
     }
 
@@ -608,7 +617,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
         }
     }
 
-    private static List<LockComponent> createLockComponentsForRead(TableName tblName, List<String> partitionNames) {
+    private static List<LockComponent> createLockComponentsForRead(TableNameInfo tblName, List<String> partitionNames) {
         List<LockComponent> components = Lists.newArrayListWithCapacity(
                 partitionNames.isEmpty() ? 1 : partitionNames.size());
         if (partitionNames.isEmpty()) {
@@ -621,7 +630,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
         return components;
     }
 
-    private static LockComponent createLockComponentForRead(TableName tblName, Optional<String> partitionName) {
+    private static LockComponent createLockComponentForRead(TableNameInfo tblName, Optional<String> partitionName) {
         LockComponentBuilder builder = new LockComponentBuilder();
         builder.setShared();
         builder.setOperationType(DataOperationType.SELECT);
@@ -637,11 +646,11 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
         private volatile Throwable throwable;
 
         private ThriftHMSClient(HiveConf hiveConf) throws MetaException {
-            String type = hiveConf.get(HMSProperties.HIVE_METASTORE_TYPE);
-            if (HMSProperties.DLF_TYPE.equalsIgnoreCase(type)) {
+            String type = hiveConf.get(HMSBaseProperties.HIVE_METASTORE_TYPE);
+            if (HMSBaseProperties.DLF_TYPE.equalsIgnoreCase(type)) {
                 client = RetryingMetaStoreClient.getProxy(hiveConf, DUMMY_HOOK_LOADER,
                         ProxyMetaStoreClient.class.getName());
-            } else if (HMSProperties.GLUE_TYPE.equalsIgnoreCase(type)) {
+            } else if (HMSBaseProperties.GLUE_TYPE.equalsIgnoreCase(type)) {
                 client = RetryingMetaStoreClient.getProxy(hiveConf, DUMMY_HOOK_LOADER,
                         AWSCatalogMetastoreClient.class.getName());
             } else {
@@ -666,7 +675,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
         }
     }
 
-    private ThriftHMSClient getClient() throws MetaException {
+    private ThriftHMSClient getClient() {
         ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
         try {
             Thread.currentThread().setContextClassLoader(ClassLoader.getSystemClassLoader());
@@ -699,7 +708,7 @@ public class ThriftHMSCachedClient implements HMSCachedClient {
 
     private <T> T ugiDoAs(PrivilegedExceptionAction<T> action) {
         try {
-            return hadoopAuthenticator.doAs(action);
+            return executionAuthenticator.execute(action::run);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }

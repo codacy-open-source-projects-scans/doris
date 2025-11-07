@@ -77,9 +77,11 @@ DEFINE_COUNTER_METRIC_PROTOTYPE_2ARG(streaming_load_duration_ms, MetricUnit::MIL
 DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(streaming_load_current_processing, MetricUnit::REQUESTS);
 
 bvar::LatencyRecorder g_stream_load_receive_data_latency_ms("stream_load_receive_data_latency_ms");
+bvar::LatencyRecorder g_stream_load_commit_and_publish_latency_ms("stream_load",
+                                                                  "commit_and_publish_ms");
 
 static constexpr size_t MIN_CHUNK_SIZE = 64 * 1024;
-static const string CHUNK = "chunked";
+static const std::string CHUNK = "chunked";
 
 #ifdef BE_TEST
 TStreamLoadPutResult k_stream_load_put_result;
@@ -151,6 +153,9 @@ void StreamLoadAction::handle(HttpRequest* req) {
     // update statistics
     streaming_load_requests_total->increment(1);
     streaming_load_duration_ms->increment(ctx->load_cost_millis);
+    if (!ctx->data_saved_path.empty()) {
+        _exec_env->load_path_mgr()->clean_tmp_files(ctx->data_saved_path);
+    }
 }
 
 Status StreamLoadAction::_handle(std::shared_ptr<StreamLoadContext> ctx) {
@@ -165,7 +170,8 @@ Status StreamLoadAction::_handle(std::shared_ptr<StreamLoadContext> ctx) {
     if (!ctx->use_streaming) {
         // we need to close file first, then execute_plan_fragment here
         ctx->body_sink.reset();
-        RETURN_IF_ERROR(_exec_env->stream_load_executor()->execute_plan_fragment(ctx));
+        TPipelineFragmentParamsList mocked;
+        RETURN_IF_ERROR(_exec_env->stream_load_executor()->execute_plan_fragment(ctx, mocked));
     }
 
     // wait stream load finish
@@ -185,6 +191,8 @@ Status StreamLoadAction::_handle(std::shared_ptr<StreamLoadContext> ctx) {
         int64_t commit_and_publish_start_time = MonotonicNanos();
         RETURN_IF_ERROR(_exec_env->stream_load_executor()->commit_txn(ctx.get()));
         ctx->commit_and_publish_txn_cost_nanos = MonotonicNanos() - commit_and_publish_start_time;
+        g_stream_load_commit_and_publish_latency_ms
+                << ctx->commit_and_publish_txn_cost_nanos / 1000000;
     }
     return Status::OK();
 }
@@ -208,7 +216,8 @@ int StreamLoadAction::on_header(HttpRequest* req) {
     }
 
     LOG(INFO) << "new income streaming load request." << ctx->brief() << ", db=" << ctx->db
-              << ", tbl=" << ctx->table << ", group_commit=" << ctx->group_commit;
+              << ", tbl=" << ctx->table << ", group_commit=" << ctx->group_commit
+              << ", HTTP headers=" << req->get_all_headers();
     ctx->begin_receive_and_read_data_cost_nanos = MonotonicNanos();
 
     if (st.ok()) {
@@ -247,19 +256,11 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<Strea
     }
 
     // get format of this put
-    if (!http_req->header(HTTP_COMPRESS_TYPE).empty() &&
-        iequal(http_req->header(HTTP_FORMAT_KEY), "JSON")) {
-        return Status::NotSupported("compress data of JSON format is not supported.");
-    }
     std::string format_str = http_req->header(HTTP_FORMAT_KEY);
     if (iequal(format_str, BeConsts::CSV_WITH_NAMES) ||
         iequal(format_str, BeConsts::CSV_WITH_NAMES_AND_TYPES)) {
         ctx->header_type = format_str;
         //treat as CSV
-        format_str = BeConsts::CSV;
-    }
-    if (iequal(format_str, "hive_text")) {
-        ctx->header_type = format_str;
         format_str = BeConsts::CSV;
     }
     LoadUtil::parse_format(format_str, http_req->header(HTTP_COMPRESS_TYPE), &ctx->format,
@@ -329,11 +330,7 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, std::shared_ptr<Strea
     }
 
     if (!http_req->header(HTTP_TIMEOUT).empty()) {
-        try {
-            ctx->timeout_second = std::stoi(http_req->header(HTTP_TIMEOUT));
-        } catch (const std::invalid_argument& e) {
-            return Status::InvalidArgument("Invalid timeout format, {}", e.what());
-        }
+        ctx->timeout_second = DORIS_TRY(safe_stoi(http_req->header(HTTP_TIMEOUT), HTTP_TIMEOUT));
     }
     if (!http_req->header(HTTP_COMMENT).empty()) {
         ctx->load_comment = http_req->header(HTTP_COMMENT);
@@ -425,6 +422,7 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         if (ctx->is_chunked_transfer) {
             pipe = std::make_shared<io::StreamLoadPipe>(
                     io::kMaxPipeBufferedBytes /* max_buffered_bytes */);
+            pipe->set_is_chunked_transfer(true);
         } else {
             pipe = std::make_shared<io::StreamLoadPipe>(
                     io::kMaxPipeBufferedBytes /* max_buffered_bytes */,
@@ -435,13 +433,14 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         ctx->pipe = pipe;
         RETURN_IF_ERROR(_exec_env->new_load_stream_mgr()->put(ctx->id, ctx));
     } else {
-        RETURN_IF_ERROR(_data_saved_path(http_req, &request.path));
+        RETURN_IF_ERROR(_data_saved_path(http_req, &request.path, ctx->body_bytes));
         auto file_sink = std::make_shared<MessageBodyFileSink>(request.path);
         RETURN_IF_ERROR(file_sink->open());
         request.__isset.path = true;
         request.fileType = TFileType::FILE_LOCAL;
         request.__set_file_size(ctx->body_bytes);
         ctx->body_sink = file_sink;
+        ctx->data_saved_path = request.path;
     }
     if (!http_req->header(HTTP_COLUMNS).empty()) {
         request.__set_columns(http_req->header(HTTP_COLUMNS));
@@ -492,16 +491,18 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     } else {
         request.__set_negative(false);
     }
+    bool strictMode = false;
     if (!http_req->header(HTTP_STRICT_MODE).empty()) {
         if (iequal(http_req->header(HTTP_STRICT_MODE), "false")) {
-            request.__set_strictMode(false);
+            strictMode = false;
         } else if (iequal(http_req->header(HTTP_STRICT_MODE), "true")) {
-            request.__set_strictMode(true);
+            strictMode = true;
         } else {
             return Status::InvalidArgument("Invalid strict mode format. Must be bool type");
         }
+        request.__set_strictMode(strictMode);
     }
-    // timezone first. if not, try time_zone
+    // timezone first. if not, try system time_zone
     if (!http_req->header(HTTP_TIMEZONE).empty()) {
         request.__set_timezone(http_req->header(HTTP_TIMEZONE));
     } else if (!http_req->header(HTTP_TIME_ZONE).empty()) {
@@ -529,6 +530,23 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
     } else {
         request.__set_strip_outer_array(false);
     }
+
+    if (!http_req->header(HTTP_READ_JSON_BY_LINE).empty()) {
+        if (iequal(http_req->header(HTTP_READ_JSON_BY_LINE), "true")) {
+            request.__set_read_json_by_line(true);
+        } else {
+            request.__set_read_json_by_line(false);
+        }
+    } else {
+        request.__set_read_json_by_line(false);
+    }
+
+    if (http_req->header(HTTP_READ_JSON_BY_LINE).empty() &&
+        http_req->header(HTTP_STRIP_OUTER_ARRAY).empty()) {
+        request.__set_read_json_by_line(true);
+        request.__set_strip_outer_array(false);
+    }
+
     if (!http_req->header(HTTP_NUM_AS_STRING).empty()) {
         if (iequal(http_req->header(HTTP_NUM_AS_STRING), "true")) {
             request.__set_num_as_string(true);
@@ -548,31 +566,15 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         request.__set_fuzzy_parse(false);
     }
 
-    if (!http_req->header(HTTP_READ_JSON_BY_LINE).empty()) {
-        if (iequal(http_req->header(HTTP_READ_JSON_BY_LINE), "true")) {
-            request.__set_read_json_by_line(true);
-        } else {
-            request.__set_read_json_by_line(false);
-        }
-    } else {
-        request.__set_read_json_by_line(false);
-    }
-
     if (!http_req->header(HTTP_FUNCTION_COLUMN + "." + HTTP_SEQUENCE_COL).empty()) {
         request.__set_sequence_col(
                 http_req->header(HTTP_FUNCTION_COLUMN + "." + HTTP_SEQUENCE_COL));
     }
 
     if (!http_req->header(HTTP_SEND_BATCH_PARALLELISM).empty()) {
-        try {
-            request.__set_send_batch_parallelism(
-                    std::stoi(http_req->header(HTTP_SEND_BATCH_PARALLELISM)));
-        } catch (const std::invalid_argument& e) {
-            return Status::InvalidArgument("send_batch_parallelism must be an integer, {}",
-                                           e.what());
-        } catch (const std::out_of_range& e) {
-            return Status::InvalidArgument("send_batch_parallelism out of range, {}", e.what());
-        }
+        int parallelism = DORIS_TRY(safe_stoi(http_req->header(HTTP_SEND_BATCH_PARALLELISM),
+                                              HTTP_SEND_BATCH_PARALLELISM));
+        request.__set_send_batch_parallelism(parallelism);
     }
 
     if (!http_req->header(HTTP_LOAD_TO_SINGLE_TABLET).empty()) {
@@ -628,7 +630,11 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         }
     }
     if (!http_req->header(HTTP_SKIP_LINES).empty()) {
-        request.__set_skip_lines(std::stoi(http_req->header(HTTP_SKIP_LINES)));
+        int skip_lines = DORIS_TRY(safe_stoi(http_req->header(HTTP_SKIP_LINES), HTTP_SKIP_LINES));
+        if (skip_lines < 0) {
+            return Status::InvalidArgument("Invalid 'skip_lines': {}", skip_lines);
+        }
+        request.__set_skip_lines(skip_lines);
     }
     if (!http_req->header(HTTP_ENABLE_PROFILE).empty()) {
         if (iequal(http_req->header(HTTP_ENABLE_PROFILE), "true")) {
@@ -696,6 +702,7 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
                     unique_key_update_mode_str);
         }
     }
+
     if (http_req->header(HTTP_UNIQUE_KEY_UPDATE_MODE).empty() &&
         !http_req->header(HTTP_PARTIAL_COLUMNS).empty()) {
         // only consider `partial_columns` parameter when `unique_key_update_mode` is not set
@@ -706,13 +713,32 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         }
     }
 
+    if (!http_req->header(HTTP_PARTIAL_UPDATE_NEW_ROW_POLICY).empty()) {
+        static const std::map<std::string, TPartialUpdateNewRowPolicy::type> policy_map {
+                {"APPEND", TPartialUpdateNewRowPolicy::APPEND},
+                {"ERROR", TPartialUpdateNewRowPolicy::ERROR}};
+
+        auto policy_name = http_req->header(HTTP_PARTIAL_UPDATE_NEW_ROW_POLICY);
+        std::transform(policy_name.begin(), policy_name.end(), policy_name.begin(),
+                       [](unsigned char c) { return std::toupper(c); });
+        auto it = policy_map.find(policy_name);
+        if (it == policy_map.end()) {
+            return Status::InvalidArgument(
+                    "Invalid partial_update_new_key_behavior {}, must be one of {'APPEND', "
+                    "'ERROR'}",
+                    policy_name);
+        }
+        request.__set_partial_update_new_key_policy(it->second);
+    }
+
     if (!http_req->header(HTTP_MEMTABLE_ON_SINKNODE).empty()) {
         bool value = iequal(http_req->header(HTTP_MEMTABLE_ON_SINKNODE), "true");
         request.__set_memtable_on_sink_node(value);
     }
     if (!http_req->header(HTTP_LOAD_STREAM_PER_NODE).empty()) {
-        int value = std::stoi(http_req->header(HTTP_LOAD_STREAM_PER_NODE));
-        request.__set_stream_per_node(value);
+        int stream_per_node = DORIS_TRY(
+                safe_stoi(http_req->header(HTTP_LOAD_STREAM_PER_NODE), HTTP_LOAD_STREAM_PER_NODE));
+        request.__set_stream_per_node(stream_per_node);
     }
     if (ctx->group_commit) {
         if (!http_req->header(HTTP_GROUP_COMMIT).empty()) {
@@ -723,8 +749,16 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         }
     }
 
-    if (!http_req->header(HTTP_CLOUD_CLUSTER).empty()) {
+    if (!http_req->header(HTTP_COMPUTE_GROUP).empty()) {
+        request.__set_cloud_cluster(http_req->header(HTTP_COMPUTE_GROUP));
+    } else if (!http_req->header(HTTP_CLOUD_CLUSTER).empty()) {
         request.__set_cloud_cluster(http_req->header(HTTP_CLOUD_CLUSTER));
+    }
+
+    if (!http_req->header(HTTP_EMPTY_FIELD_AS_NULL).empty()) {
+        if (iequal(http_req->header(HTTP_EMPTY_FIELD_AS_NULL), "true")) {
+            request.__set_empty_field_as_null(true);
+        }
     }
 
 #ifndef BE_TEST
@@ -745,6 +779,9 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
         LOG(WARNING) << "plan streaming load failed. errmsg=" << plan_status << ctx->brief();
         return plan_status;
     }
+    DCHECK(ctx->put_result.__isset.pipeline_params);
+    ctx->put_result.pipeline_params.query_options.__set_enable_strict_cast(false);
+    ctx->put_result.pipeline_params.query_options.__set_enable_insert_strict(strictMode);
     if (config::is_cloud_mode() && ctx->two_phase_commit && ctx->is_mow_table()) {
         return Status::NotSupported("stream load 2pc is unsupported for mow table");
     }
@@ -769,22 +806,25 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req,
                 content_length *= 3;
             }
         }
-        ctx->put_result.params.__set_content_length(content_length);
+        ctx->put_result.pipeline_params.__set_content_length(content_length);
     }
 
-    VLOG_NOTICE << "params is " << apache::thrift::ThriftDebugString(ctx->put_result.params);
+    VLOG_NOTICE << "params is "
+                << apache::thrift::ThriftDebugString(ctx->put_result.pipeline_params);
     // if we not use streaming, we must download total content before we begin
     // to process this load
     if (!ctx->use_streaming) {
         return Status::OK();
     }
-
-    return _exec_env->stream_load_executor()->execute_plan_fragment(ctx);
+    TPipelineFragmentParamsList mocked;
+    return _exec_env->stream_load_executor()->execute_plan_fragment(ctx, mocked);
 }
 
-Status StreamLoadAction::_data_saved_path(HttpRequest* req, std::string* file_path) {
+Status StreamLoadAction::_data_saved_path(HttpRequest* req, std::string* file_path,
+                                          int64_t file_bytes) {
     std::string prefix;
-    RETURN_IF_ERROR(_exec_env->load_path_mgr()->allocate_dir(req->param(HTTP_DB_KEY), "", &prefix));
+    RETURN_IF_ERROR(_exec_env->load_path_mgr()->allocate_dir(req->param(HTTP_DB_KEY), "", &prefix,
+                                                             file_bytes));
     timeval tv;
     gettimeofday(&tv, nullptr);
     struct tm tm;
@@ -854,7 +894,12 @@ Status StreamLoadAction::_handle_group_commit(HttpRequest* req,
                            iequal(req->header(HTTP_PARTIAL_COLUMNS), "true");
     auto temp_partitions = !req->header(HTTP_TEMP_PARTITIONS).empty();
     auto partitions = !req->header(HTTP_PARTITIONS).empty();
-    if (!partial_columns && !partitions && !temp_partitions && !ctx->two_phase_commit) {
+    auto update_mode =
+            !req->header(HTTP_UNIQUE_KEY_UPDATE_MODE).empty() &&
+            (iequal(req->header(HTTP_UNIQUE_KEY_UPDATE_MODE), "UPDATE_FIXED_COLUMNS") ||
+             iequal(req->header(HTTP_UNIQUE_KEY_UPDATE_MODE), "UPDATE_FLEXIBLE_COLUMNS"));
+    if (!partial_columns && !partitions && !temp_partitions && !ctx->two_phase_commit &&
+        !update_mode) {
         if (!config::wait_internal_group_commit_finish && !ctx->label.empty()) {
             return Status::InvalidArgument("label and group_commit can't be set at the same time");
         }

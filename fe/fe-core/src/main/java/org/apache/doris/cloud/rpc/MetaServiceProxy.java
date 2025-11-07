@@ -22,12 +22,14 @@ import org.apache.doris.common.Config;
 import org.apache.doris.rpc.RpcException;
 
 import com.google.common.collect.Maps;
-import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.LinkedList;
 import java.util.Map;
+import java.util.Queue;
+import java.util.Random;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
@@ -41,15 +43,19 @@ public class MetaServiceProxy {
     // use concurrent map to allow access serviceMap in multi thread.
     private ReentrantLock lock = new ReentrantLock();
     private final Map<String, MetaServiceClient> serviceMap;
+    private Queue<Long> lastConnTimeMs = new LinkedList<>();
 
     static {
         if (Config.isCloudMode() && (Config.meta_service_endpoint == null || Config.meta_service_endpoint.isEmpty())) {
-            throw new RuntimeException("in cloud mode, please configure cloud_unique_id and meta_service_endpoint");
+            throw new RuntimeException("in cloud mode, please configure meta_service_endpoint in fe.conf");
         }
     }
 
     public MetaServiceProxy() {
         this.serviceMap = Maps.newConcurrentMap();
+        for (int i = 0; i < 3; ++i) {
+            lastConnTimeMs.add(0L);
+        }
     }
 
     private static class SingletonHolder {
@@ -75,6 +81,16 @@ public class MetaServiceProxy {
 
     public static MetaServiceProxy getInstance() {
         return MetaServiceProxy.SingletonHolder.get();
+    }
+
+    public boolean needReconn() {
+        lock.lock();
+        try {
+            long now = System.currentTimeMillis();
+            return (now - lastConnTimeMs.element() > Config.meta_service_rpc_reconnect_interval_ms);
+        } finally {
+            lock.unlock();
+        }
     }
 
     public Cloud.GetInstanceResponse getInstance(Cloud.GetInstanceRequest request)
@@ -138,6 +154,8 @@ public class MetaServiceProxy {
             if (service == null) {
                 service = new MetaServiceClient(address);
                 serviceMap.put(address, service);
+                lastConnTimeMs.add(System.currentTimeMillis());
+                lastConnTimeMs.remove();
             }
             return service;
         } finally {
@@ -150,28 +168,58 @@ public class MetaServiceProxy {
 
     public static class MetaServiceClientWrapper {
         private final MetaServiceProxy proxy;
+        private Random random = new Random();
 
         public MetaServiceClientWrapper(MetaServiceProxy proxy) {
             this.proxy = proxy;
         }
 
         public <Response> Response executeRequest(Function<MetaServiceClient, Response> function) throws RpcException {
-            int tried = 0;
-            while (tried++ < 3) {
+            long maxRetries = Config.meta_service_rpc_retry_cnt;
+            for (long tried = 1; tried <= maxRetries; tried++) {
+                MetaServiceClient client = null;
                 try {
-                    MetaServiceClient client = proxy.getProxy();
+                    client = proxy.getProxy();
                     return function.apply(client);
                 } catch (StatusRuntimeException sre) {
-                    if (sre.getStatus().getCode() == Status.Code.UNAVAILABLE || tried == 3) {
+                    LOG.warn("failed to request meta service code {}, msg {}, trycnt {}", sre.getStatus().getCode(),
+                            sre.getMessage(), tried);
+                    boolean shouldRetry = false;
+                    switch (sre.getStatus().getCode()) {
+                        case UNAVAILABLE:
+                        case UNKNOWN:
+                            shouldRetry = true;
+                            break;
+                        case DEADLINE_EXCEEDED:
+                            shouldRetry = tried <= Config.meta_service_rpc_timeout_retry_times;
+                            break;
+                        default:
+                            shouldRetry = false;
+                    }
+                    if (!shouldRetry || tried >= maxRetries) {
                         throw new RpcException("", sre.getMessage(), sre);
                     }
                 } catch (Exception e) {
-                    throw new RpcException("", e.getMessage(), e);
-                } catch (Throwable t) {
-                    throw new RpcException("", t.getMessage());
+                    LOG.warn("failed to request meta servive trycnt {}", tried, e);
+                    if (tried >= maxRetries) {
+                        throw new RpcException("", e.getMessage(), e);
+                    }
+                } finally {
+                    if (proxy.needReconn() && client != null) {
+                        client.shutdown(true);
+                    }
+                }
+
+                int delay = 20 + random.nextInt(200 - 20 + 1);
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException interruptedException) {
+                    Thread.currentThread().interrupt();
+                    throw new RpcException("", interruptedException.getMessage(), interruptedException);
                 }
             }
-            return null; // impossible and unreachable, just make the compiler happy
+            // impossible and unreachable, just make the compiler happy
+            throw new RpcException("", "All retries exhausted", null);
         }
     }
 
@@ -341,6 +389,10 @@ public class MetaServiceProxy {
         return w.executeRequest((client) -> client.removeDeleteBitmapUpdateLock(request));
     }
 
+    /**
+     * This method is deprecated, there is no code to call it.
+     */
+    @Deprecated
     public Cloud.AlterObjStoreInfoResponse alterObjStoreInfo(Cloud.AlterObjStoreInfoRequest request)
             throws RpcException {
         return w.executeRequest((client) -> client.alterObjStoreInfo(request));
@@ -367,6 +419,11 @@ public class MetaServiceProxy {
         return w.executeRequest((client) -> client.resetRLProgress(request));
     }
 
+    public Cloud.ResetStreamingJobOffsetResponse resetStreamingJobOffset(Cloud.ResetStreamingJobOffsetRequest request)
+            throws RpcException {
+        return w.executeRequest((client) -> client.resetStreamingJobOffset(request));
+    }
+
     public Cloud.GetObjStoreInfoResponse
             getObjStoreInfo(Cloud.GetObjStoreInfoRequest request) throws RpcException {
         return w.executeRequest((client) -> client.getObjStoreInfo(request));
@@ -379,5 +436,47 @@ public class MetaServiceProxy {
 
     public Cloud.CreateInstanceResponse createInstance(Cloud.CreateInstanceRequest request) throws RpcException {
         return w.executeRequest((client) -> client.createInstance(request));
+    }
+
+    public Cloud.GetStreamingTaskCommitAttachResponse getStreamingTaskCommitAttach(
+            Cloud.GetStreamingTaskCommitAttachRequest request) throws RpcException {
+        return w.executeRequest((client) -> client.getStreamingTaskCommitAttach(request));
+    }
+
+    public Cloud.DeleteStreamingJobResponse deleteStreamingJob(Cloud.DeleteStreamingJobRequest request)
+            throws RpcException {
+        return w.executeRequest((client) -> client.deleteStreamingJob(request));
+    }
+
+    public Cloud.AlterInstanceResponse alterInstance(Cloud.AlterInstanceRequest request) throws RpcException {
+        return w.executeRequest((client) -> client.alterInstance(request));
+    }
+
+    public Cloud.BeginSnapshotResponse beginSnapshot(Cloud.BeginSnapshotRequest request) throws RpcException {
+        return w.executeRequest((client) -> client.beginSnapshot(request));
+    }
+
+    public Cloud.UpdateSnapshotResponse updateSnapshot(Cloud.UpdateSnapshotRequest request) throws RpcException {
+        return w.executeRequest((client) -> client.updateSnapshot(request));
+    }
+
+    public Cloud.CommitSnapshotResponse commitSnapshot(Cloud.CommitSnapshotRequest request) throws RpcException {
+        return w.executeRequest((client) -> client.commitSnapshot(request));
+    }
+
+    public Cloud.AbortSnapshotResponse abortSnapshot(Cloud.AbortSnapshotRequest request) throws RpcException {
+        return w.executeRequest((client) -> client.abortSnapshot(request));
+    }
+
+    public Cloud.ListSnapshotResponse listSnapshot(Cloud.ListSnapshotRequest request) throws RpcException {
+        return w.executeRequest((client) -> client.listSnapshot(request));
+    }
+
+    public Cloud.DropSnapshotResponse dropSnapshot(Cloud.DropSnapshotRequest request) throws RpcException {
+        return w.executeRequest((client) -> client.dropSnapshot(request));
+    }
+
+    public Cloud.CloneInstanceResponse cloneInstance(Cloud.CloneInstanceRequest request) throws RpcException {
+        return w.executeRequest((client) -> client.cloneInstance(request));
     }
 }

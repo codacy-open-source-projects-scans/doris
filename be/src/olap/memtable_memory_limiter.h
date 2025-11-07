@@ -19,8 +19,11 @@
 
 #include <stdint.h>
 
+#include <functional>
+
 #include "common/status.h"
 #include "runtime/memory/mem_tracker.h"
+#include "runtime/workload_group/workload_group.h"
 #include "util/countdown_latch.h"
 #include "util/stopwatch.hpp"
 
@@ -39,7 +42,9 @@ public:
 
     // check if the total mem consumption exceeds limit.
     // If yes, it will flush memtable to try to reduce memory consumption.
-    void handle_memtable_flush();
+    // Every write operation will call this API to check if need flush memtable OR hang
+    // when memory is not available.
+    void handle_memtable_flush(std::function<bool()> cancel_check);
 
     void register_writer(std::weak_ptr<MemTableWriter> writer);
 
@@ -57,9 +62,8 @@ private:
     bool _hard_limit_reached();
     bool _load_usage_low();
     int64_t _need_flush();
-    void _flush_active_memtables(int64_t need_flush);
+    int64_t _flush_active_memtables(int64_t need_flush);
     void _refresh_mem_tracker();
-
     std::mutex _lock;
     std::condition_variable _hard_limit_end_cond;
     int64_t _mem_usage = 0;

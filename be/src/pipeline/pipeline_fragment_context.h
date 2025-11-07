@@ -30,9 +30,7 @@
 #include <vector>
 
 #include "common/status.h"
-#include "pipeline/local_exchange/local_exchanger.h"
 #include "pipeline/pipeline.h"
-#include "pipeline/pipeline_fragment_context.h"
 #include "pipeline/pipeline_task.h"
 #include "runtime/query_context.h"
 #include "runtime/runtime_state.h"
@@ -62,12 +60,14 @@ public:
     // because they take locks.
     using report_status_callback = std::function<Status(
             const ReportStatusRequest, std::shared_ptr<pipeline::PipelineFragmentContext>&&)>;
-    PipelineFragmentContext(const TUniqueId& query_id, const int fragment_id,
+    PipelineFragmentContext(TUniqueId query_id, const TPipelineFragmentParams& request,
                             std::shared_ptr<QueryContext> query_ctx, ExecEnv* exec_env,
                             const std::function<void(RuntimeState*, Status*)>& call_back,
-                            const report_status_callback& report_status_cb);
+                            report_status_callback report_status_cb);
 
-    ~PipelineFragmentContext();
+    ~PipelineFragmentContext() override;
+
+    void print_profile(const std::string& extra_info);
 
     std::vector<std::shared_ptr<TRuntimeProfileTree>> collect_realtime_profile() const;
     std::shared_ptr<TRuntimeProfileTree> collect_realtime_load_channel_profile() const;
@@ -80,13 +80,10 @@ public:
 
     PipelinePtr add_pipeline(PipelinePtr parent = nullptr, int idx = -1);
 
-    RuntimeState* get_runtime_state() { return _runtime_state.get(); }
-
     QueryContext* get_query_ctx() { return _query_ctx.get(); }
-    // should be protected by lock?
-    [[nodiscard]] bool is_canceled() const { return _runtime_state->is_cancelled(); }
+    [[nodiscard]] bool is_canceled() const { return _query_ctx->is_cancelled(); }
 
-    Status prepare(const doris::TPipelineFragmentParams& request, ThreadPool* thread_pool);
+    Status prepare(ThreadPool* thread_pool);
 
     Status submit();
 
@@ -94,13 +91,11 @@ public:
 
     void cancel(const Status reason);
 
-    // TODO: Support pipeline runtime filter
-
     TUniqueId get_query_id() const { return _query_id; }
 
     [[nodiscard]] int get_fragment_id() const { return _fragment_id; }
 
-    void close_a_pipeline(PipelineId pipeline_id);
+    void decrement_running_task(PipelineId pipeline_id);
 
     Status send_report(bool);
 
@@ -115,33 +110,37 @@ public:
 
     [[nodiscard]] int next_sink_operator_id() { return _sink_operator_id--; }
 
+    [[nodiscard]] size_t get_revocable_size(bool* has_running_task) const;
+
+    [[nodiscard]] std::vector<PipelineTask*> get_revocable_tasks() const;
+
     void clear_finished_tasks() {
         for (size_t j = 0; j < _tasks.size(); j++) {
             for (size_t i = 0; i < _tasks[j].size(); i++) {
-                _tasks[j][i]->stop_if_finished();
+                _tasks[j][i].first->stop_if_finished();
             }
         }
     }
 
+    std::string get_load_error_url();
+    std::string get_first_error_msg();
+
 private:
-    Status _build_pipelines(ObjectPool* pool, const doris::TPipelineFragmentParams& request,
-                            const DescriptorTbl& descs, OperatorPtr* root, PipelinePtr cur_pipe);
+    Status _build_pipelines(ObjectPool* pool, const DescriptorTbl& descs, OperatorPtr* root,
+                            PipelinePtr cur_pipe);
     Status _create_tree_helper(ObjectPool* pool, const std::vector<TPlanNode>& tnodes,
-                               const doris::TPipelineFragmentParams& request,
                                const DescriptorTbl& descs, OperatorPtr parent, int* node_idx,
                                OperatorPtr* root, PipelinePtr& cur_pipe, int child_idx,
                                const bool followed_by_shuffled_join);
 
-    Status _create_operator(ObjectPool* pool, const TPlanNode& tnode,
-                            const doris::TPipelineFragmentParams& request,
-                            const DescriptorTbl& descs, OperatorPtr& op, PipelinePtr& cur_pipe,
-                            int parent_idx, int child_idx, const bool followed_by_shuffled_join);
+    Status _create_operator(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs,
+                            OperatorPtr& op, PipelinePtr& cur_pipe, int parent_idx, int child_idx,
+                            const bool followed_by_shuffled_join);
     template <bool is_intersect>
     Status _build_operators_for_set_operation_node(ObjectPool* pool, const TPlanNode& tnode,
                                                    const DescriptorTbl& descs, OperatorPtr& op,
                                                    PipelinePtr& cur_pipe, int parent_idx,
-                                                   int child_idx,
-                                                   const doris::TPipelineFragmentParams& request);
+                                                   int child_idx);
 
     Status _create_data_sink(ObjectPool* pool, const TDataSink& thrift_sink,
                              const std::vector<TExpr>& output_exprs,
@@ -167,8 +166,7 @@ private:
                                     const std::map<int, int>& bucket_seq_to_instance_idx,
                                     const std::map<int, int>& shuffle_idx_to_instance_idx);
 
-    Status _build_pipeline_tasks(const doris::TPipelineFragmentParams& request,
-                                 ThreadPool* thread_pool);
+    Status _build_pipeline_tasks(ThreadPool* thread_pool);
     void _close_fragment_instance();
     void _init_next_report_time();
 
@@ -215,7 +213,12 @@ private:
     std::atomic_bool _disable_period_report = true;
     std::atomic_uint64_t _previous_report_time = 0;
 
-    // profile reporting-related
+    // This callback is used to notify the FE of the status of the fragment.
+    // For example:
+    // 1. when the fragment is cancelled, it will be called.
+    // 2. when the fragment is finished, it will be called. especially, when the fragment is
+    // a insert into select statement, it should notfiy FE every fragment's status.
+    // And also, this callback is called periodly to notify FE the load process.
     report_status_callback _report_status_cb;
 
     DescriptorTbl* _desc_tbl = nullptr;
@@ -225,8 +228,25 @@ private:
     bool _use_serial_source = false;
 
     OperatorPtr _root_op = nullptr;
-    // this is a [n * m] matrix. n is parallelism of pipeline engine and m is the number of pipelines.
-    std::vector<std::vector<std::unique_ptr<PipelineTask>>> _tasks;
+    //
+    /**
+     * Matrix stores tasks with local runtime states.
+     * This is a [n * m] matrix. n is parallelism of pipeline engine and m is the number of pipelines.
+     *
+     * 2-D matrix:
+     * +-------------------------+------------+-------+
+     * |            | Pipeline 0 | Pipeline 1 |  ...  |
+     * +------------+------------+------------+-------+
+     * | Instance 0 |  task 0-0  |  task 0-1  |  ...  |
+     * +------------+------------+------------+-------+
+     * | Instance 1 |  task 1-0  |  task 1-1  |  ...  |
+     * +------------+------------+------------+-------+
+     * | ...                                          |
+     * +--------------------------------------+-------+
+     */
+    std::vector<
+            std::vector<std::pair<std::shared_ptr<PipelineTask>, std::unique_ptr<RuntimeState>>>>
+            _tasks;
 
     // TODO: remove the _sink and _multi_cast_stream_sink_senders to set both
     // of it in pipeline task not the fragment_context
@@ -271,39 +291,38 @@ private:
 
     int _operator_id = 0;
     int _sink_operator_id = 0;
-    std::map<int, std::pair<std::shared_ptr<LocalExchangeSharedState>, std::shared_ptr<Dependency>>>
-            _op_id_to_le_state;
+    /**
+     * Some states are shared by tasks in different pipeline task (e.g. local exchange , broadcast join).
+     *
+     * local exchange sink 0 ->                               -> local exchange source 0
+     *                            LocalExchangeSharedState
+     * local exchange sink 1 ->                               -> local exchange source 1
+     *
+     * hash join build sink 0 ->                               -> hash join build source 0
+     *                              HashJoinSharedState
+     * hash join build sink 1 ->                               -> hash join build source 1
+     *
+     * So we should keep states here.
+     */
+    std::map<int,
+             std::pair<std::shared_ptr<BasicSharedState>, std::vector<std::shared_ptr<Dependency>>>>
+            _op_id_to_shared_state;
 
     std::map<PipelineId, Pipeline*> _pip_id_to_pipeline;
-    // UniqueId -> runtime mgr
-    std::map<UniqueId, std::unique_ptr<RuntimeFilterMgr>> _runtime_filter_mgr_map;
+    std::vector<std::unique_ptr<RuntimeFilterMgr>> _runtime_filter_mgr_map;
 
     //Here are two types of runtime states:
     //    - _runtime state is at the Fragment level.
     //    - _task_runtime_states is at the task level, unique to each task.
 
     std::vector<TUniqueId> _fragment_instance_ids;
-    /**
-     * Local runtime states for each task.
-     *
-     * 2-D matrix:
-     * +-------------------------+------------+-------+
-     * |            | Instance 0 | Instance 1 |  ...  |
-     * +------------+------------+------------+-------+
-     * | Pipeline 0 |  task 0-0  |  task 0-1  |  ...  |
-     * +------------+------------+------------+-------+
-     * | Pipeline 1 |  task 1-0  |  task 1-1  |  ...  |
-     * +------------+------------+------------+-------+
-     * | ...                                          |
-     * +--------------------------------------+-------+
-     */
-    std::vector<std::vector<std::unique_ptr<RuntimeState>>> _task_runtime_states;
-
-    std::vector<RuntimeFilterParamsContext*> _runtime_filter_states;
 
     // Total instance num running on all BEs
     int _total_instances = -1;
     bool _require_bucket_distribution = false;
+
+    TPipelineFragmentParams _params;
+    int32_t _parallel_instances = 0;
 };
 } // namespace pipeline
 } // namespace doris

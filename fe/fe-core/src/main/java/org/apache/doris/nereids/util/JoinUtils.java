@@ -26,6 +26,7 @@ import org.apache.doris.nereids.properties.DistributionSpecHash;
 import org.apache.doris.nereids.properties.DistributionSpecHash.ShuffleType;
 import org.apache.doris.nereids.properties.DistributionSpecReplicated;
 import org.apache.doris.nereids.properties.PhysicalProperties;
+import org.apache.doris.nereids.rules.rewrite.AdjustNullable;
 import org.apache.doris.nereids.rules.rewrite.ForeignKeyContext;
 import org.apache.doris.nereids.trees.expressions.EqualPredicate;
 import org.apache.doris.nereids.trees.expressions.ExprId;
@@ -53,6 +54,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -303,11 +305,8 @@ public class JoinUtils {
         boolean noNeedCheckColocateGroup = hitSameIndex && (leftTablePartitions.equals(rightTablePartitions))
                 && (leftTablePartitions.size() <= 1);
         ColocateTableIndex colocateIndex = Env.getCurrentColocateIndex();
-        if (noNeedCheckColocateGroup) {
-            return true;
-        }
-        if (!colocateIndex.isSameGroup(leftTableId, rightTableId)
-                || colocateIndex.isGroupUnstable(colocateIndex.getGroup(leftTableId))) {
+        if (!noNeedCheckColocateGroup && (!colocateIndex.isSameGroup(leftTableId, rightTableId)
+                || colocateIndex.isGroupUnstable(colocateIndex.getGroup(leftTableId)))) {
             return false;
         }
 
@@ -420,33 +419,49 @@ public class JoinUtils {
      * @return return the output slots
      */
     public static List<Slot> getJoinOutput(JoinType joinType, Plan left, Plan right) {
+        return getJoinOutput(joinType, left, right, false);
+    }
+
+    /**
+     * calculate the output slot of a join operator according join type and its children
+     *
+     * @param joinType the type of join operator
+     * @param left left child
+     * @param right right child
+     * @param asteriskOutput when true, return output for asterisk
+     *
+     * @return return the output slots
+     */
+    public static List<Slot> getJoinOutput(JoinType joinType, Plan left, Plan right, boolean asteriskOutput) {
+        List<Slot> leftOutput = asteriskOutput ? left.getAsteriskOutput() : left.getOutput();
+        List<Slot> rightOutput = asteriskOutput ? right.getAsteriskOutput() : right.getOutput();
         switch (joinType) {
             case LEFT_SEMI_JOIN:
             case LEFT_ANTI_JOIN:
             case NULL_AWARE_LEFT_ANTI_JOIN:
-                return ImmutableList.copyOf(left.getOutput());
+                return ImmutableList.copyOf(leftOutput);
             case RIGHT_SEMI_JOIN:
             case RIGHT_ANTI_JOIN:
-                return ImmutableList.copyOf(right.getOutput());
+                return ImmutableList.copyOf(rightOutput);
             case LEFT_OUTER_JOIN:
                 return ImmutableList.<Slot>builder()
-                        .addAll(left.getOutput())
-                        .addAll(applyNullable(right.getOutput(), true))
+                        .addAll(leftOutput)
+                        .addAll(applyNullable(rightOutput, true))
                         .build();
             case RIGHT_OUTER_JOIN:
                 return ImmutableList.<Slot>builder()
-                        .addAll(applyNullable(left.getOutput(), true))
-                        .addAll(right.getOutput())
+                        .addAll(applyNullable(leftOutput, true))
+                        .addAll(rightOutput)
                         .build();
             case FULL_OUTER_JOIN:
                 return ImmutableList.<Slot>builder()
-                        .addAll(applyNullable(left.getOutput(), true))
-                        .addAll(applyNullable(right.getOutput(), true))
+                        .addAll(applyNullable(leftOutput, true))
+                        .addAll(applyNullable(rightOutput, true))
                         .build();
             default:
                 return ImmutableList.<Slot>builder()
-                        .addAll(left.getOutput())
-                        .addAll(right.getOutput())
+                        .addAll(leftOutput)
+                        .addAll(rightOutput)
                         .build();
         }
     }
@@ -470,5 +485,24 @@ public class JoinUtils {
                 .collect(Collectors.toSet());
         markSlots.retainAll(bottom.getOutputSet());
         return markSlots.isEmpty();
+    }
+
+    /**
+     * Use the children nullable property of the join to adjust the slot used by the join conjuncts.
+     * Such as 'a left join b left join c where b.condition > 1'
+     * if the join change to '(b left join c) right a where b.condition > 1',
+     * the nullable property of b.condition should be false
+     */
+    public static LogicalJoin<? extends Plan, ? extends Plan> adjustJoinConjunctsNullable(
+            LogicalJoin<? extends Plan, ? extends Plan> join) {
+        Map<ExprId, Slot> equalConjunctsSlotMap = new HashMap<>();
+        for (Plan child : join.children()) {
+            for (Slot slot : child.getOutput()) {
+                equalConjunctsSlotMap.put(slot.getExprId(), slot);
+            }
+        }
+        // other conjuncts should use join output slot
+        return AdjustNullable.doVisitLogicalJoin(
+                join, equalConjunctsSlotMap, false, false);
     }
 }

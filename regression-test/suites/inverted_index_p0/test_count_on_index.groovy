@@ -32,7 +32,7 @@ suite("test_count_on_index_httplogs", "p0") {
                           INDEX size_idx (`size`) USING INVERTED COMMENT '',
                           INDEX status_idx (`status`) USING INVERTED COMMENT '',
                           INDEX clientip_idx (`clientip`) USING INVERTED COMMENT '',
-                          INDEX request_idx (`request`) USING INVERTED PROPERTIES("parser"="english") COMMENT ''
+                          INDEX request_idx (`request`) using inverted properties("support_phrase" = "true", "parser" = "english", "lower_case" = "true") COMMENT ''
                         ) ENGINE=OLAP
                         DUPLICATE KEY(`@timestamp`)
                         COMMENT 'OLAP'
@@ -68,7 +68,7 @@ suite("test_count_on_index_httplogs", "p0") {
                               INDEX size_idx (`size`) USING INVERTED COMMENT '',
                               INDEX status_idx (`status`) USING INVERTED COMMENT '',
                               INDEX clientip_idx (`clientip`) USING INVERTED COMMENT '',
-                              INDEX request_idx (`request`) USING INVERTED PROPERTIES("parser"="english") COMMENT ''
+                              INDEX request_idx (`request`) using inverted properties("support_phrase" = "true", "parser" = "english", "lower_case" = "true") COMMENT ''
                             ) ENGINE=OLAP
                             UNIQUE KEY(`@timestamp`)
                             COMMENT 'OLAP'
@@ -403,6 +403,17 @@ suite("test_count_on_index_httplogs", "p0") {
         explain {
             sql("select COUNT(value1) from ${tableName6} where value1 > 20 or value2 < 10")
             contains "pushAggOp=NONE"
+        }
+
+        explain {
+            sql("select COUNT(23) from ${tableName6} where value1 > 20 and value2 > 5")
+            contains "pushAggOp=COUNT_ON_INDEX"
+        }
+
+        sql """ set disable_nereids_rules='COUNT_LITERAL_REWRITE'; """
+        explain {
+            sql("select COUNT(23) from ${tableName6} where value1 > 20 and value2 > 5")
+            contains "pushAggOp=COUNT_ON_INDEX"
         }
 
     } finally {

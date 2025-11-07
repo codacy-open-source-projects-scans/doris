@@ -19,15 +19,15 @@ package org.apache.doris.nereids.rules.expression.rules;
 
 import org.apache.doris.nereids.rules.expression.ExpressionRewriteTestHelper;
 import org.apache.doris.nereids.rules.expression.ExpressionRuleExecutor;
+import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Coalesce;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.NullIf;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Nullable;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Nvl;
 import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
-import org.apache.doris.nereids.types.BooleanType;
+import org.apache.doris.nereids.types.DateTimeV2Type;
 import org.apache.doris.nereids.types.StringType;
-import org.apache.doris.nereids.types.VarcharType;
 
 import com.google.common.collect.ImmutableList;
 import org.junit.jupiter.api.Test;
@@ -58,10 +58,10 @@ public class SimplifyConditionalFunctionTest extends ExpressionRewriteTestHelper
         assertRewrite(new Coalesce(slot, nonNullableSlot), new Coalesce(slot, nonNullableSlot));
 
         // coalesce(null, null) -> null
-        assertRewrite(new Coalesce(NullLiteral.INSTANCE, NullLiteral.INSTANCE), new NullLiteral(BooleanType.INSTANCE));
+        assertRewrite(new Coalesce(NullLiteral.INSTANCE, NullLiteral.INSTANCE), NullLiteral.INSTANCE);
 
         // coalesce(null) -> null
-        assertRewrite(new Coalesce(NullLiteral.INSTANCE), new NullLiteral(BooleanType.INSTANCE));
+        assertRewrite(new Coalesce(NullLiteral.INSTANCE), NullLiteral.INSTANCE);
 
         // coalesce(non-nullable_slot) -> non-nullable_slot
         assertRewrite(new Coalesce(nonNullableSlot), nonNullableSlot);
@@ -71,6 +71,18 @@ public class SimplifyConditionalFunctionTest extends ExpressionRewriteTestHelper
 
         // coalesce(null, nullable_slot, literal) -> coalesce(nullable_slot, slot, literal)
         assertRewrite(new Coalesce(slot, nonNullableSlot), new Coalesce(slot, nonNullableSlot));
+
+        SlotReference datetimeSlot = new SlotReference("dt", DateTimeV2Type.of(0), false);
+        // coalesce(null_datetime(0), non-nullable_slot_datetime(6))
+        assertRewrite(
+                new Coalesce(new NullLiteral(DateTimeV2Type.of(6)), datetimeSlot),
+                new Cast(datetimeSlot, DateTimeV2Type.of(6))
+        );
+        // coalesce(non-nullable_slot_datetime(6), null_datetime(0))
+        assertRewrite(
+                new Coalesce(datetimeSlot, new NullLiteral(DateTimeV2Type.of(6))),
+                new Cast(datetimeSlot, DateTimeV2Type.of(6))
+        );
     }
 
     @Test
@@ -91,7 +103,19 @@ public class SimplifyConditionalFunctionTest extends ExpressionRewriteTestHelper
         assertRewrite(new Nvl(nonNullableSlot, NullLiteral.INSTANCE), nonNullableSlot);
 
         // nvl(null, null) -> null
-        assertRewrite(new Nvl(NullLiteral.INSTANCE, NullLiteral.INSTANCE), new NullLiteral(BooleanType.INSTANCE));
+        assertRewrite(new Nvl(NullLiteral.INSTANCE, NullLiteral.INSTANCE), NullLiteral.INSTANCE);
+
+        SlotReference datetimeSlot = new SlotReference("dt", DateTimeV2Type.of(0), false);
+        // nvl(null_datetime(0), non-nullable_slot_datetime(6))
+        assertRewrite(
+                new Nvl(new NullLiteral(DateTimeV2Type.of(6)), datetimeSlot),
+                new Cast(datetimeSlot, DateTimeV2Type.of(6))
+        );
+        // nvl(non-nullable_slot_datetime(6), null_datetime(0))
+        assertRewrite(
+                new Nvl(datetimeSlot, new NullLiteral(DateTimeV2Type.of(6))),
+                new Cast(datetimeSlot, DateTimeV2Type.of(6))
+        );
     }
 
     @Test
@@ -101,13 +125,22 @@ public class SimplifyConditionalFunctionTest extends ExpressionRewriteTestHelper
         SlotReference nonNullableSlot = new SlotReference("b", StringType.INSTANCE, false);
         // nullif(null, slot) -> null
         assertRewrite(new NullIf(NullLiteral.INSTANCE, slot),
-                new Nullable(new NullLiteral(VarcharType.SYSTEM_DEFAULT)));
+                new Nullable(new NullLiteral(StringType.INSTANCE)));
 
         // nullif(nullable_slot, null) -> slot
         assertRewrite(new NullIf(slot, NullLiteral.INSTANCE), new Nullable(slot));
 
         // nullif(non-nullable_slot, null) -> non-nullable_slot
         assertRewrite(new NullIf(nonNullableSlot, NullLiteral.INSTANCE), new Nullable(nonNullableSlot));
+
+        // nullif(null_datetime(0), null_datetime(6)) -> null_datetime(6)
+        assertRewrite(
+                new NullIf(
+                        new NullLiteral(DateTimeV2Type.of(0)),
+                        new NullLiteral(DateTimeV2Type.of(6))
+                ),
+                new Cast(new Nullable(new NullLiteral(DateTimeV2Type.of(0))), DateTimeV2Type.of(6))
+        );
     }
 
 }

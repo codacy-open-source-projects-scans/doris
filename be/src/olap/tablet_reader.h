@@ -32,9 +32,10 @@
 #include "agent/be_exec_version_manager.h"
 #include "common/status.h"
 #include "exprs/function_filter.h"
-#include "gutil/strings/substitute.h"
 #include "io/io_common.h"
+#include "olap/base_tablet.h"
 #include "olap/delete_handler.h"
+#include "olap/filter_olap_param.h"
 #include "olap/iterators.h"
 #include "olap/olap_common.h"
 #include "olap/olap_tuple.h"
@@ -91,12 +92,6 @@ class TabletReader {
     };
 
 public:
-    struct ReadSource {
-        std::vector<RowSetSplits> rs_splits;
-        std::vector<RowsetMetaSharedPtr> delete_predicates;
-        // Fill delete predicates with `rs_splits`
-        void fill_delete_predicates();
-    };
     // Params for Reader,
     // mainly include tablet, data version and fetch range.
     struct ReaderParams {
@@ -117,9 +112,14 @@ public:
             return BeExecVersionManager::get_newest_version();
         }
 
-        void set_read_source(ReadSource read_source) {
+        void set_read_source(TabletReadSource read_source, bool skip_delete_bitmap = false) {
             rs_splits = std::move(read_source.rs_splits);
             delete_predicates = std::move(read_source.delete_predicates);
+#ifndef BE_TEST
+            if (tablet->enable_unique_key_merge_on_write() && !skip_delete_bitmap) {
+                delete_bitmap = std::move(read_source.delete_bitmap);
+            }
+#endif
         }
 
         BaseTabletSPtr tablet;
@@ -137,28 +137,28 @@ public:
         bool start_key_include = false;
         bool end_key_include = false;
 
-        std::vector<TCondition> conditions;
-        std::vector<std::pair<string, std::shared_ptr<BloomFilterFuncBase>>> bloom_filters;
-        std::vector<std::pair<string, std::shared_ptr<BitmapFilterFuncBase>>> bitmap_filters;
-        std::vector<std::pair<string, std::shared_ptr<HybridSetBase>>> in_filters;
+        std::vector<FilterOlapParam<TCondition>> conditions;
+        std::vector<FilterOlapParam<std::shared_ptr<BloomFilterFuncBase>>> bloom_filters;
+        std::vector<FilterOlapParam<std::shared_ptr<BitmapFilterFuncBase>>> bitmap_filters;
+        std::vector<FilterOlapParam<std::shared_ptr<HybridSetBase>>> in_filters;
         std::vector<FunctionFilter> function_filters;
         std::vector<RowsetMetaSharedPtr> delete_predicates;
         // slots that cast may be eliminated in storage layer
-        std::map<std::string, TypeDescriptor> target_cast_type_for_variants;
+        std::map<std::string, vectorized::DataTypePtr> target_cast_type_for_variants;
 
         std::vector<RowSetSplits> rs_splits;
         // For unique key table with merge-on-write
-        DeleteBitmap* delete_bitmap = nullptr;
+        DeleteBitmapPtr delete_bitmap = nullptr;
 
         // return_columns is init from query schema
-        std::vector<uint32_t> return_columns;
+        std::vector<ColumnId> return_columns;
         // output_columns only contain columns in OrderByExprs and outputExprs
         std::set<int32_t> output_columns;
         RuntimeProfile* profile = nullptr;
         RuntimeState* runtime_state = nullptr;
 
         // use only in vec exec engine
-        std::vector<uint32_t>* origin_return_columns = nullptr;
+        std::vector<ColumnId>* origin_return_columns = nullptr;
         std::unordered_set<uint32_t>* tablet_columns_convert_to_null_set = nullptr;
         TPushAggOp::type push_down_agg_type_opt = TPushAggOp::NONE;
         vectorized::VExpr* remaining_vconjunct_root = nullptr;
@@ -194,6 +194,16 @@ public:
         std::string to_string() const;
 
         int64_t batch_size = -1;
+
+        std::map<ColumnId, vectorized::VExprContextSPtr> virtual_column_exprs;
+        std::map<ColumnId, size_t> vir_cid_to_idx_in_block;
+        std::map<size_t, vectorized::DataTypePtr> vir_col_idx_to_type;
+
+        std::shared_ptr<vectorized::ScoreRuntime> score_runtime;
+        CollectionStatisticsPtr collection_statistics;
+        std::shared_ptr<segment_v2::AnnTopNRuntime> ann_topn_runtime;
+
+        uint64_t condition_cache_digest = 0;
     };
 
     TabletReader() = default;
@@ -230,7 +240,7 @@ public:
     const OlapReaderStatistics& stats() const { return _stats; }
     OlapReaderStatistics* mutable_stats() { return &_stats; }
 
-    virtual bool update_profile(RuntimeProfile* profile) { return false; }
+    virtual void update_profile(RuntimeProfile* profile) {}
     static Status init_reader_params_and_create_block(
             TabletSharedPtr tablet, ReaderType reader_type,
             const std::vector<RowsetSharedPtr>& input_rowsets,
@@ -278,8 +288,9 @@ protected:
 
     const TabletSchema& tablet_schema() { return *_tablet_schema; }
 
-    std::unique_ptr<vectorized::Arena> _predicate_arena;
-    std::vector<uint32_t> _return_columns;
+    vectorized::Arena _predicate_arena;
+    std::vector<ColumnId> _return_columns;
+
     // used for special optimization for query : ORDER BY key [ASC|DESC] LIMIT n
     // columns for orderby keys
     std::vector<uint32_t> _orderby_key_columns;
@@ -297,6 +308,7 @@ protected:
     std::vector<ColumnPredicate*> _value_col_predicates;
     DeleteHandler _delete_handler;
 
+    // Indicates whether the tablets has do a aggregation in storage engine.
     bool _aggregation = false;
     // for agg query, we don't need to finalize when scan agg object data
     ReaderType _reader_type = ReaderType::READER_QUERY;

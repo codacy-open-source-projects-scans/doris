@@ -20,9 +20,9 @@ package org.apache.doris.common.proc;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.profile.RuntimeProfile;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.ListComparator;
-import org.apache.doris.common.util.RuntimeProfile;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
@@ -50,8 +50,8 @@ public class BackendsProcDir implements ProcDirInterface {
             .add("LastStartTime").add("LastHeartbeat").add("Alive").add("SystemDecommissioned").add("TabletNum")
             .add("DataUsedCapacity").add("TrashUsedCapacity").add("AvailCapacity").add("TotalCapacity").add("UsedPct")
             .add("MaxDiskUsedPct").add("RemoteUsedCapacity").add("Tag").add("ErrMsg").add("Version").add("Status")
-            .add("HeartbeatFailureCounter").add("NodeRole").add("CpuCores").add("Memory")
-            .build();
+            .add("HeartbeatFailureCounter").add("NodeRole").add("CpuCores").add("Memory").add("LiveSince")
+            .add("RunningTasks").build();
 
     public static final ImmutableList<String> DISK_TITLE_NAMES = new ImmutableList.Builder<String>()
             .add("BackendId").add("Host").add("RootPath").add("DirType").add("DiskState")
@@ -173,6 +173,13 @@ public class BackendsProcDir implements ProcDirInterface {
 
             // memory
             backendInfo.add(RuntimeProfile.printCounter(backend.getBeMemory(), TUnit.BYTES));
+
+            // liveSince
+            backendInfo.add(TimeUtils.longToTimeString(backend.getLiveSince()));
+
+            // runningFragments
+            backendInfo.add(String.valueOf(backend.getRunningTasks()));
+
             comparableBackendInfos.add(backendInfo);
         }
 

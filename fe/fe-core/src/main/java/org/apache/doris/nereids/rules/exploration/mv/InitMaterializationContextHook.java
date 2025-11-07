@@ -26,16 +26,19 @@ import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.MaterializedIndexMeta;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.TableIf;
-import org.apache.doris.mtmv.BaseTableInfo;
+import org.apache.doris.common.Pair;
+import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.mtmv.MTMVCache;
+import org.apache.doris.mtmv.MTMVPlanUtil;
 import org.apache.doris.mtmv.MTMVUtil;
 import org.apache.doris.nereids.CascadesContext;
-import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.PlannerHook;
+import org.apache.doris.nereids.StatementContext;
+import org.apache.doris.nereids.hint.Hint;
+import org.apache.doris.nereids.hint.UseMvHint;
 import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.trees.plans.Plan;
-import org.apache.doris.nereids.trees.plans.visitor.TableCollector;
-import org.apache.doris.nereids.trees.plans.visitor.TableCollector.TableCollectorContext;
+import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -46,12 +49,10 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
-import java.util.BitSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * If enable query rewrite with mv, should init materialization context after analyze
@@ -62,8 +63,22 @@ public class InitMaterializationContextHook implements PlannerHook {
     public static final InitMaterializationContextHook INSTANCE = new InitMaterializationContextHook();
 
     @Override
-    public void afterAnalyze(NereidsPlanner planner) {
-        initMaterializationContext(planner.getCascadesContext());
+    public void afterRewrite(CascadesContext cascadesContext) {
+        // collect partitions table used, this is for query rewrite by materialized view
+        // this is needed before init hook, because compare partition version in init hook would use this
+        if (cascadesContext.getStatementContext().isNeedPreMvRewrite()) {
+            for (Plan plan : cascadesContext.getStatementContext().getTmpPlanForMvRewrite()) {
+                MaterializedViewUtils.collectTableUsedPartitions(plan, cascadesContext);
+            }
+        } else {
+            MaterializedViewUtils.collectTableUsedPartitions(cascadesContext.getRewritePlan(), cascadesContext);
+        }
+        StatementContext statementContext = cascadesContext.getStatementContext();
+        if (statementContext.getConnectContext().getExecutor() != null) {
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .setNereidsCollectTablePartitionFinishTime(TimeUtils.getStartTimeMs());
+        }
+        initMaterializationContext(cascadesContext);
     }
 
     @VisibleForTesting
@@ -80,51 +95,92 @@ public class InitMaterializationContextHook implements PlannerHook {
      */
     protected void doInitMaterializationContext(CascadesContext cascadesContext) {
         if (cascadesContext.getConnectContext().getSessionVariable().isInDebugMode()) {
-            LOG.info(String.format("MaterializationContext init return because is in debug mode, current queryId is %s",
-                    cascadesContext.getConnectContext().getQueryIdentifier()));
+            LOG.info("MaterializationContext init return because is in debug mode, current queryId is {}",
+                    cascadesContext.getConnectContext().getQueryIdentifier());
             return;
         }
-        // Only collect the table or mv which query use directly, to avoid useless mv partition in rewrite
-        // Keep use one connection context when in query, if new connect context,
-        // the ConnectionContext.get() will change
-        TableCollectorContext collectorContext = new TableCollectorContext(Sets.newHashSet(), false,
-                cascadesContext.getConnectContext());
-        try {
-            Plan rewritePlan = cascadesContext.getRewritePlan();
-            rewritePlan.accept(TableCollector.INSTANCE, collectorContext);
-        } catch (Exception e) {
-            LOG.warn(String.format("MaterializationContext init table collect fail, current queryId is %s",
-                    cascadesContext.getConnectContext().getQueryIdentifier()), e);
+        if (cascadesContext.getStatementContext().isShortCircuitQuery()) {
+            LOG.debug("MaterializationContext init return because isShortCircuitQuery, current queryId is {}",
+                    cascadesContext.getConnectContext().getQueryIdentifier());
             return;
         }
-        Set<TableIf> collectedTables = collectorContext.getCollectedTables();
+        Set<TableIf> collectedTables = Sets.newHashSet(cascadesContext.getStatementContext().getTables().values());
         if (collectedTables.isEmpty()) {
             return;
         }
         // Create sync materialization context
-        if (cascadesContext.getConnectContext().getSessionVariable()
-                .isEnableSyncMvCostBasedRewrite()) {
-            for (TableIf tableIf : collectedTables) {
-                if (tableIf instanceof OlapTable) {
-                    for (SyncMaterializationContext context : createSyncMvContexts(
-                            (OlapTable) tableIf, cascadesContext)) {
-                        cascadesContext.addMaterializationContext(context);
-                    }
+        for (TableIf tableIf : collectedTables) {
+            if (tableIf instanceof OlapTable) {
+                for (MaterializationContext context : createSyncMvContexts(
+                        (OlapTable) tableIf, cascadesContext)) {
+                    cascadesContext.addMaterializationContext(context);
                 }
             }
         }
+
         // Create async materialization context
         for (MaterializationContext context : createAsyncMaterializationContext(cascadesContext,
-                collectorContext.getCollectedTables())) {
+                collectedTables)) {
             cascadesContext.addMaterializationContext(context);
         }
     }
 
+    private List<MaterializationContext> getMvIdWithUseMvHint(List<MaterializationContext> mtmvCtxs,
+                                                                UseMvHint useMvHint) {
+        List<MaterializationContext> hintMTMVs = new ArrayList<>();
+        for (MaterializationContext mtmvCtx : mtmvCtxs) {
+            List<String> mvQualifier = mtmvCtx.generateMaterializationIdentifier();
+            if (useMvHint.getUseMvTableColumnMap().containsKey(mvQualifier)) {
+                hintMTMVs.add(mtmvCtx);
+            }
+        }
+        return hintMTMVs;
+    }
+
+    private List<MaterializationContext> getMvIdWithNoUseMvHint(List<MaterializationContext> mtmvCtxs,
+                                                                    UseMvHint useMvHint) {
+        List<MaterializationContext> hintMTMVs = new ArrayList<>();
+        if (useMvHint.isAllMv()) {
+            useMvHint.setStatus(Hint.HintStatus.SUCCESS);
+            return hintMTMVs;
+        }
+        for (MaterializationContext mtmvCtx : mtmvCtxs) {
+            List<String> mvQualifier = mtmvCtx.generateMaterializationIdentifier();
+            if (useMvHint.getNoUseMvTableColumnMap().containsKey(mvQualifier)) {
+                useMvHint.setStatus(Hint.HintStatus.SUCCESS);
+                useMvHint.getNoUseMvTableColumnMap().put(mvQualifier, true);
+            } else {
+                hintMTMVs.add(mtmvCtx);
+            }
+        }
+        return hintMTMVs;
+    }
+
+    /**
+     * get mtmvs by hint
+     * @param mtmvCtxs input mtmvs which could be used to rewrite sql
+     * @return set of mtmvs which pass the check of useMvHint
+     */
+    public List<MaterializationContext> getMaterializationContextByHint(List<MaterializationContext> mtmvCtxs) {
+        Optional<UseMvHint> useMvHint = ConnectContext.get().getStatementContext().getUseMvHint("USE_MV");
+        Optional<UseMvHint> noUseMvHint = ConnectContext.get().getStatementContext().getUseMvHint("NO_USE_MV");
+        if (!useMvHint.isPresent() && !noUseMvHint.isPresent()) {
+            return mtmvCtxs;
+        }
+        List<MaterializationContext> result = mtmvCtxs;
+        if (noUseMvHint.isPresent()) {
+            result = getMvIdWithNoUseMvHint(result, noUseMvHint.get());
+        }
+        if (useMvHint.isPresent()) {
+            result = getMvIdWithUseMvHint(result, useMvHint.get());
+        }
+        return result;
+    }
+
     protected Set<MTMV> getAvailableMTMVs(Set<TableIf> usedTables, CascadesContext cascadesContext) {
-        List<BaseTableInfo> usedBaseTables =
-                usedTables.stream().map(BaseTableInfo::new).collect(Collectors.toList());
         return Env.getCurrentEnv().getMtmvService().getRelationManager()
-                .getAvailableMTMVs(usedBaseTables, cascadesContext.getConnectContext(),
+                .getAvailableMTMVs(cascadesContext.getStatementContext().getCandidateMTMVs(),
+                        cascadesContext.getConnectContext(),
                         false, ((connectContext, mtmv) -> {
                             return MTMVUtil.mtmvContainsExternalTable(mtmv) && (!connectContext.getSessionVariable()
                                     .isEnableMaterializedViewRewriteWhenBaseTableUnawareness());
@@ -142,7 +198,7 @@ public class InitMaterializationContextHook implements PlannerHook {
             return ImmutableList.of();
         }
         if (CollectionUtils.isEmpty(availableMTMVs)) {
-            LOG.debug("Enable materialized view rewrite but availableMTMVs is empty, current queryId "
+            LOG.info("Enable materialized view rewrite but availableMTMVs is empty, query id "
                     + "is {}", cascadesContext.getConnectContext().getQueryIdentifier());
             return ImmutableList.of();
         }
@@ -151,39 +207,43 @@ public class InitMaterializationContextHook implements PlannerHook {
             MTMVCache mtmvCache = null;
             try {
                 mtmvCache = materializedView.getOrGenerateCache(cascadesContext.getConnectContext());
-                // If mv property use_for_rewrite is set false, should not partition in
-                // query rewrite by materialized view
-                if (!materializedView.isUseForRewrite()) {
-                    LOG.debug("mv doesn't part in query rewrite process because "
-                            + "use_for_rewrite is false, mv is {}", materializedView.getName());
-                    continue;
-                }
                 if (mtmvCache == null) {
                     continue;
                 }
                 // For async materialization context, the cascades context when construct the struct info maybe
                 // different from the current cascadesContext
                 // so regenerate the struct info table bitset
-                StructInfo mvStructInfo = mtmvCache.getStructInfo();
-                BitSet tableBitSetInCurrentCascadesContext = new BitSet();
-                mvStructInfo.getRelations().forEach(relation -> tableBitSetInCurrentCascadesContext.set(
-                        cascadesContext.getStatementContext().getTableId(relation.getTable()).asInt()));
-                asyncMaterializationContext.add(new AsyncMaterializationContext(materializedView,
-                        mtmvCache.getLogicalPlan(), mtmvCache.getOriginalPlan(), ImmutableList.of(),
-                        ImmutableList.of(), cascadesContext,
-                        mtmvCache.getStructInfo().withTableBitSet(tableBitSetInCurrentCascadesContext)));
+                if (!cascadesContext.getStatementContext().isNeedPreMvRewrite()) {
+                    asyncMaterializationContext.add(doCreateAsyncMaterializationContext(materializedView,
+                            mtmvCache, mtmvCache.getAllRulesRewrittenPlanAndStructInfo(), cascadesContext
+                    ));
+                } else {
+                    for (Pair<Plan, StructInfo> planAndStructInfo
+                            : mtmvCache.getPartRulesRewrittenPlanAndStructInfos()) {
+                        asyncMaterializationContext.add(doCreateAsyncMaterializationContext(materializedView,
+                                mtmvCache, planAndStructInfo, cascadesContext
+                        ));
+                    }
+                }
             } catch (Exception e) {
                 LOG.warn(String.format("MaterializationContext init mv cache generate fail, current queryId is %s",
                         cascadesContext.getConnectContext().getQueryIdentifier()), e);
             }
         }
-        return asyncMaterializationContext;
+        return getMaterializationContextByHint(asyncMaterializationContext);
     }
 
-    private List<SyncMaterializationContext> createSyncMvContexts(OlapTable olapTable,
+    private static AsyncMaterializationContext doCreateAsyncMaterializationContext(MTMV mtmv, MTMVCache cache,
+            Pair<Plan, StructInfo> planAndStructInfo,
+            CascadesContext cascadesContext) {
+        return new AsyncMaterializationContext(mtmv, planAndStructInfo.key(), cache.getOriginalFinalPlan(),
+                ImmutableList.of(), ImmutableList.of(), cascadesContext, planAndStructInfo.value());
+    }
+
+    private List<MaterializationContext> createSyncMvContexts(OlapTable olapTable,
             CascadesContext cascadesContext) {
         int indexNumber = olapTable.getIndexNumber();
-        List<SyncMaterializationContext> contexts = new ArrayList<>(indexNumber);
+        List<MaterializationContext> contexts = new ArrayList<>(indexNumber);
         long baseIndexId = olapTable.getBaseIndexId();
         int keyCount = 0;
         for (Column column : olapTable.getFullSchema()) {
@@ -191,10 +251,10 @@ public class InitMaterializationContextHook implements PlannerHook {
         }
         for (Map.Entry<Long, MaterializedIndexMeta> entry : olapTable.getVisibleIndexIdToMeta().entrySet()) {
             long indexId = entry.getKey();
+            String indexName = olapTable.getIndexNameById(indexId);
             try {
                 if (indexId != baseIndexId) {
                     MaterializedIndexMeta meta = entry.getValue();
-                    String indexName = olapTable.getIndexNameById(indexId);
                     String createMvSql;
                     if (meta.getDefineStmt() != null) {
                         // get the original create mv sql
@@ -217,28 +277,43 @@ public class InitMaterializationContextHook implements PlannerHook {
                             LOG.warn(String.format("can't parse %s ", createMvSql));
                             continue;
                         }
-                        MTMVCache mtmvCache = MaterializedViewUtils.createMTMVCache(querySql.get(),
+                        ConnectContext basicMvContext = MTMVPlanUtil.createBasicMvContext(
                                 cascadesContext.getConnectContext());
-                        contexts.add(new SyncMaterializationContext(mtmvCache.getLogicalPlan(),
-                                mtmvCache.getOriginalPlan(), olapTable, meta.getIndexId(), indexName,
-                                cascadesContext, mtmvCache.getStatistics()));
+                        basicMvContext.setDatabase(meta.getDbName());
+                        MTMVCache mtmvCache = MTMVCache.from(querySql.get(),
+                                basicMvContext, true,
+                                false, cascadesContext.getConnectContext());
+                        if (!cascadesContext.getStatementContext().isNeedPreMvRewrite()) {
+                            contexts.add(new SyncMaterializationContext(
+                                    mtmvCache.getAllRulesRewrittenPlanAndStructInfo().key(),
+                                    mtmvCache.getOriginalFinalPlan(), olapTable, meta.getIndexId(), indexName,
+                                    cascadesContext, mtmvCache.getStatistics()));
+                        } else {
+                            for (Pair<Plan, StructInfo> planAndStructInfo
+                                    : mtmvCache.getPartRulesRewrittenPlanAndStructInfos()) {
+                                contexts.add(new SyncMaterializationContext(planAndStructInfo.key(),
+                                        planAndStructInfo.key(), olapTable, meta.getIndexId(), indexName,
+                                        cascadesContext, mtmvCache.getStatistics()));
+                            }
+                        }
                     } else {
                         LOG.warn(String.format("can't assemble create mv sql for index ", indexName));
                     }
                 }
             } catch (Exception exception) {
-                LOG.warn(String.format("createSyncMvContexts exception, index id is %s, index name is %s",
-                        entry.getValue(), entry.getValue()), exception);
+                LOG.warn(String.format("createSyncMvContexts exception, index id is %s, index name is %s, "
+                                + "table name is %s", entry.getValue(), indexName, olapTable.getQualifiedName()),
+                        exception);
             }
         }
-        return contexts;
+        return getMaterializationContextByHint(contexts);
     }
 
     private String assembleCreateMvSqlForDupOrUniqueTable(String baseTableName, String mvName, List<Column> columns) {
         StringBuilder createMvSqlBuilder = new StringBuilder();
         createMvSqlBuilder.append(String.format("create materialized view %s as select ", mvName));
         for (Column col : columns) {
-            createMvSqlBuilder.append(String.format("%s, ", col.getName()));
+            createMvSqlBuilder.append(String.format("%s, ", getIdentSql(col.getName())));
         }
         removeLastTwoChars(createMvSqlBuilder);
         createMvSqlBuilder.append(String.format(" from %s", baseTableName));
@@ -267,13 +342,13 @@ public class InitMaterializationContextHook implements PlannerHook {
                         case BITMAP_UNION:
                         case QUANTILE_UNION: {
                             aggColumnsStringBuilder
-                                    .append(String.format("%s(%s), ", aggregateType, col.getName()));
+                                    .append(String.format("%s(%s), ", aggregateType, getIdentSql(col.getName())));
                             break;
                         }
                         case GENERIC: {
                             AggStateType aggStateType = (AggStateType) col.getType();
                             aggColumnsStringBuilder.append(String.format("%s_union(%s), ",
-                                    aggStateType.getFunctionName(), col.getName()));
+                                    aggStateType.getFunctionName(), getIdentSql(col.getName())));
                             break;
                         }
                         default: {
@@ -287,7 +362,7 @@ public class InitMaterializationContextHook implements PlannerHook {
                     // use column name for key
                     Preconditions.checkState(col.isKey(),
                             String.format("%s must be key", col.getName()));
-                    keyColumnsStringBuilder.append(String.format("%s, ", col.getName()));
+                    keyColumnsStringBuilder.append(String.format("%s, ", getIdentSql(col.getName())));
                 }
             }
             Preconditions.checkState(keyColumnsStringBuilder.length() > 0,
@@ -307,7 +382,7 @@ public class InitMaterializationContextHook implements PlannerHook {
                     String.format(" from %s group by %s", baseTableName, keyColumnsStringBuilder));
         } else {
             for (Column col : columns) {
-                createMvSqlBuilder.append(String.format("%s, ", col.getName()));
+                createMvSqlBuilder.append(String.format("%s, ", getIdentSql(col.getName())));
             }
             removeLastTwoChars(createMvSqlBuilder);
             createMvSqlBuilder.append(String.format(" from %s", baseTableName));
@@ -320,5 +395,19 @@ public class InitMaterializationContextHook implements PlannerHook {
         if (stringBuilder.length() >= 2) {
             stringBuilder.delete(stringBuilder.length() - 2, stringBuilder.length());
         }
+    }
+
+    private static String getIdentSql(String ident) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('`');
+        for (char ch : ident.toCharArray()) {
+            if (ch == '`') {
+                sb.append("``");
+            } else {
+                sb.append(ch);
+            }
+        }
+        sb.append('`');
+        return sb.toString();
     }
 }

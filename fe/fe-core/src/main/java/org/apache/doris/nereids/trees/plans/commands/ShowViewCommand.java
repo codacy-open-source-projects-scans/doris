@@ -26,13 +26,13 @@ import org.apache.doris.catalog.View;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.util.Util;
+import org.apache.doris.info.TableNameInfo;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.plans.PlanType;
-import org.apache.doris.nereids.trees.plans.commands.info.TableNameInfo;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.PlanUtils;
@@ -126,6 +126,11 @@ public class ShowViewCommand extends ShowCommand {
     }
 
     @Override
+    public ShowResultSetMetaData getMetaData() {
+        return META_DATA;
+    }
+
+    @Override
     public ShowResultSet doRun(ConnectContext ctx, StmtExecutor executor) throws Exception {
         validate(ctx);
         List<List<String>> rows = Lists.newArrayList();
@@ -141,6 +146,6 @@ public class ShowViewCommand extends ShowCommand {
                 view.readUnlock();
             }
         }
-        return new ShowResultSet(META_DATA, rows);
+        return new ShowResultSet(getMetaData(), rows);
     }
 }

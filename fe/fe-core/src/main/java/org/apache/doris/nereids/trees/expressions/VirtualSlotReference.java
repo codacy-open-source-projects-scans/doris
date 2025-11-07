@@ -82,7 +82,7 @@ public class VirtualSlotReference extends SlotReference implements SlotNotFromCh
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return getName();
     }
 
@@ -112,7 +112,7 @@ public class VirtualSlotReference extends SlotReference implements SlotNotFromCh
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(realExpressions, originExpression, getExprId());
     }
 
@@ -152,6 +152,13 @@ public class VirtualSlotReference extends SlotReference implements SlotNotFromCh
 
     @Override
     public VirtualSlotReference withExprId(ExprId exprId) {
+        return new VirtualSlotReference(exprId, name.get(), dataType, nullable, qualifier,
+                originExpression, computeLongValueMethod);
+    }
+
+    public VirtualSlotReference withOriginExpressionAndComputeLongValueMethod(
+            Optional<GroupingScalarFunction> originExpression,
+            Function<GroupingSetShapes, List<Long>> computeLongValueMethod) {
         return new VirtualSlotReference(exprId, name.get(), dataType, nullable, qualifier,
                 originExpression, computeLongValueMethod);
     }

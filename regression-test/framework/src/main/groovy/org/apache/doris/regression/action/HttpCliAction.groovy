@@ -22,10 +22,13 @@ import groovy.transform.stc.ClosureParams
 import groovy.transform.stc.FromString
 import groovy.util.logging.Slf4j
 import org.apache.doris.regression.suite.SuiteContext
+import org.apache.http.client.methods.HttpDelete
 import org.apache.http.client.methods.HttpGet
 import org.apache.http.entity.StringEntity
 import org.apache.http.entity.ContentType
+import org.apache.http.impl.client.DefaultHttpClient
 import org.apache.http.impl.client.HttpClients
+import org.apache.http.impl.client.LaxRedirectStrategy
 import org.apache.http.util.EntityUtils
 import org.apache.http.client.methods.HttpPost
 import org.apache.tools.ant.taskdefs.condition.Http;
@@ -101,7 +104,10 @@ class HttpCliAction implements SuiteAction {
     @Override
     void run() {
         try {
-            def result = HttpClients.createDefault().withCloseable { client ->
+            def result = HttpClients.custom()
+                    .setRedirectStrategy(new LaxRedirectStrategy()) // allow redirect to fe master
+                    .build()
+                    .withCloseable { client -> 
                 uri = "http://$endpoint" + uri
                 log.info("url : " + uri)
                 log.info("body: " + body)
@@ -123,7 +129,23 @@ class HttpCliAction implements SuiteAction {
                             return new ActionResult(respCode, respJson)
                         }
                     }
-                } else {
+                } else if (op == "delete") {
+					HttpDelete httpDelete = new HttpDelete(uri)
+					for (final def header in headers.entrySet()) {
+						httpDelete.setHeader(header.getKey(), header.getValue())
+					}
+					client.execute(httpDelete).withCloseable { resp ->
+						resp.withCloseable {
+							String respJson = EntityUtils.toString(resp.getEntity())
+							def respCode = resp.getStatusLine().getStatusCode()
+							if (printResponse) {
+								log.info("respCode: ${respCode}, respJson: ${respJson}")
+							}
+							return new ActionResult(respCode, respJson)
+						}
+					}
+				}
+                else {
                     HttpPost httpPost = new HttpPost(uri)
                     for (final def header in headers.entrySet()) {
                         httpPost.setHeader(header.getKey(), header.getValue())

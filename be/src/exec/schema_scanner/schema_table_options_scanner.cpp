@@ -27,6 +27,8 @@
 #include "vec/data_types/data_type_factory.hpp"
 
 namespace doris {
+#include "common/compile_check_begin.h"
+
 std::vector<SchemaScanner::ColumnDesc> SchemaTableOptionsScanner::_s_tbls_columns = {
         {"TABLE_CATALOG", TYPE_VARCHAR, sizeof(StringRef), true},
         {"TABLE_SCHEMA", TYPE_VARCHAR, sizeof(StringRef), true},
@@ -37,6 +39,10 @@ std::vector<SchemaScanner::ColumnDesc> SchemaTableOptionsScanner::_s_tbls_column
         {"DISTRIBUTE_TYPE", TYPE_STRING, sizeof(StringRef), true},
         {"BUCKETS_NUM", TYPE_INT, sizeof(int32_t), true},
         {"PARTITION_NUM", TYPE_INT, sizeof(int32_t), true},
+        {"PARTITION_METHOD", TYPE_VARCHAR, sizeof(StringRef), true},
+        {"PARTITION_EXPRESSION", TYPE_VARCHAR, sizeof(StringRef), true},
+        {"PARTITION_KEY", TYPE_STRING, sizeof(StringRef), true},
+        {"RANGE", TYPE_STRING, sizeof(StringRef), true},
 };
 
 SchemaTableOptionsScanner::SchemaTableOptionsScanner()
@@ -87,13 +93,13 @@ Status SchemaTableOptionsScanner::get_onedb_info_from_fe(int64_t dbId) {
 
     TFetchSchemaTableDataResult result;
 
-    RETURN_IF_ERROR(ThriftRpcHelper::rpc<FrontendServiceClient>(
-            master_addr.hostname, master_addr.port,
-            [&request, &result](FrontendServiceConnection& client) {
-                client->fetchSchemaTableData(result, request);
-            },
-            _rpc_timeout_ms));
+    RETURN_IF_ERROR(SchemaHelper::fetch_schema_table_data(master_addr.hostname, master_addr.port,
+                                                          request, &result));
+    RETURN_IF_ERROR(fill_db_partitions(result));
+    return Status::OK();
+}
 
+Status SchemaTableOptionsScanner::fill_db_partitions(TFetchSchemaTableDataResult& result) {
     Status status(Status::create(result.status));
     if (!status.ok()) {
         LOG(WARNING) << "fetch table options from FE failed, errmsg=" << status;
@@ -103,14 +109,14 @@ Status SchemaTableOptionsScanner::get_onedb_info_from_fe(int64_t dbId) {
 
     _tableoptions_block = vectorized::Block::create_unique();
     for (int i = 0; i < _s_tbls_columns.size(); ++i) {
-        TypeDescriptor descriptor(_s_tbls_columns[i].type);
-        auto data_type = vectorized::DataTypeFactory::instance().create_data_type(descriptor, true);
+        auto data_type = vectorized::DataTypeFactory::instance().create_data_type(
+                _s_tbls_columns[i].type, true);
         _tableoptions_block->insert(vectorized::ColumnWithTypeAndName(
                 data_type->create_column(), data_type, _s_tbls_columns[i].name));
     }
     _tableoptions_block->reserve(_block_rows_limit);
     if (result_data.size() > 0) {
-        int col_size = result_data[0].column_value.size();
+        auto col_size = result_data[0].column_value.size();
         if (col_size != _s_tbls_columns.size()) {
             return Status::InternalError<false>("table options schema is not match for FE and BE");
         }
@@ -150,7 +156,7 @@ Status SchemaTableOptionsScanner::get_next_block_internal(vectorized::Block* blo
         if (_db_index < _db_result.db_ids.size()) {
             RETURN_IF_ERROR(get_onedb_info_from_fe(_db_result.db_ids[_db_index]));
             _row_idx = 0; // reset row index so that it start filling for next block.
-            _total_rows = _tableoptions_block->rows();
+            _total_rows = (int)_tableoptions_block->rows();
             _db_index++;
         }
     }

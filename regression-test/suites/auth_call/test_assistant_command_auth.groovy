@@ -26,20 +26,20 @@ suite("test_assistant_command_auth","p0,auth_call") {
     String tableName = 'test_assistant_command_auth_tb'
     String catalogName = 'test_assistant_command_auth_catalog'
 
-    //cloud-mode
-    if (isCloudMode()) {
-        def clusters = sql " SHOW CLUSTERS; "
-        assertTrue(!clusters.isEmpty())
-        def validCluster = clusters[0][0]
-        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
-    }
-
     try_sql("DROP USER ${user}")
     try_sql """drop database if exists ${dbName}"""
 
     sql """CREATE USER '${user}' IDENTIFIED BY '${pwd}'"""
     sql """grant select_priv on regression_test to ${user}"""
     sql """create database ${dbName}"""
+
+    //cloud-mode
+    if (isCloudMode()) {
+        def clusters = sql " SHOW CLUSTERS; "
+        assertTrue(!clusters.isEmpty())
+        def validCluster = clusters[0][0]
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
+    }
 
     sql """create table ${dbName}.${tableName} (
                 id BIGINT,
@@ -56,7 +56,9 @@ suite("test_assistant_command_auth","p0,auth_call") {
     logger.info("insert_res: " + insert_res)
 
     sql """create catalog if not exists ${catalogName} properties (
-            'type'='hms'
+            'type'='hms',
+            'hive.metastore.uris' = 'thrift://127.0.0.1:9083'
+        
         );"""
 
 

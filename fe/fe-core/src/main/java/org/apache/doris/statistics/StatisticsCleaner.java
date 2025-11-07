@@ -95,12 +95,11 @@ public class StatisticsCleaner extends MasterDaemon {
 
     private void clearStats(OlapTable statsTbl, boolean isTableColumnStats) {
         ExpiredStats expiredStats;
-        long offset = 0;
         do {
             expiredStats = new ExpiredStats();
-            offset = findExpiredStats(statsTbl, expiredStats, offset, isTableColumnStats);
+            findExpiredStats(statsTbl, expiredStats, 0, isTableColumnStats);
             deleteExpiredStats(expiredStats, statsTbl.getName(), isTableColumnStats);
-        } while (!expiredStats.isEmpty());
+        } while (expiredStats.isFull());
     }
 
     private void clearTableStats() {
@@ -116,19 +115,24 @@ public class StatisticsCleaner extends MasterDaemon {
                 // If ctlName, dbName and tblName exist, it means the table stats is created under new version.
                 // First try to find the table by the given names. If table exists, means the tableMeta is valid,
                 // it should be kept in memory.
+                boolean tableExist = false;
                 try {
-                    StatisticsUtil.findTable(stats.ctlName, stats.dbName, stats.tblName);
-                    continue;
+                    TableIf table = StatisticsUtil.findTable(stats.ctlName, stats.dbName, stats.tblName);
+                    // Tables may have identical names but different id, e.g. replace table.
+                    tableExist = table.getId() == id;
                 } catch (Exception e) {
                     LOG.debug("Table {}.{}.{} not found.", stats.ctlName, stats.dbName, stats.tblName);
                 }
-                // If we couldn't find table by names, try to find it in internal catalog. This is to support older
-                // version which the tableStats object doesn't store the names but only table id.
+                // If we couldn't find table by names, try to find it in internal catalog by id.
+                // This is to support older version which the tableStats object doesn't store the names
+                // but only table id.
                 // We may remove external table's tableStats here, but it's not a big problem.
                 // Because the stats in column_statistics table is still available,
-                // the only disadvantage is auto analyze may be triggered for this table.
-                // But it only happens once, the new table stats object will have all the catalog, db and table names.
-                if (tableExistInInternalCatalog(internalCatalog, id)) {
+                // the only disadvantage is auto analyze may be triggered for this table again.
+                // But it only happens once, the new table stats object will have all the catalog,
+                // db and table names.
+                // Also support REPLACE TABLE
+                if (tableExist || tableExistInInternalCatalog(internalCatalog, id)) {
                     continue;
                 }
                 LOG.info("Table {}.{}.{} with id {} not exist, remove its table stats record.",
@@ -136,7 +140,7 @@ public class StatisticsCleaner extends MasterDaemon {
                 analysisManager.removeTableStats(id);
                 Env.getCurrentEnv().getEditLog().logDeleteTableStats(new TableStatsDeletionLog(id));
             } catch (Exception e) {
-                LOG.info(e);
+                LOG.info("Fail to remove table stats for table {}", id, e);
             }
         }
     }
@@ -252,13 +256,18 @@ public class StatisticsCleaner extends MasterDaemon {
         }
     }
 
-    private long findExpiredStats(OlapTable statsTbl, ExpiredStats expiredStats,
+    protected long findExpiredStats(OlapTable statsTbl, ExpiredStats expiredStats,
                                   long offset, boolean isTableColumnStats) {
         long pos = offset;
-        while (pos < statsTbl.getRowCount() && !expiredStats.isFull()) {
+        while (!expiredStats.isFull()) {
             List<ResultRow> rows = StatisticsRepository.fetchStatsFullName(
                     StatisticConstants.FETCH_LIMIT, pos, isTableColumnStats);
             pos += StatisticConstants.FETCH_LIMIT;
+            if (rows.isEmpty()) {
+                LOG.info("Stats table {} has no more rows to fetch.", statsTbl.getName());
+                break;
+            }
+            LOG.info("Process {} rows in stats table {}", rows.size(), statsTbl.getName());
             for (ResultRow r : rows) {
                 try {
                     StatsId statsId = new StatsId(r);
@@ -315,11 +324,14 @@ public class StatisticsCleaner extends MasterDaemon {
                 }
             }
             this.yieldForOtherTask();
+            if (expiredStats.isFull()) {
+                LOG.info("expiredStats is full.");
+            }
         }
         return pos;
     }
 
-    private static class ExpiredStats {
+    protected static class ExpiredStats {
         Set<Long> expiredCatalog = new HashSet<>();
         Set<Long> expiredDatabase = new HashSet<>();
         Set<Long> expiredTable = new HashSet<>();

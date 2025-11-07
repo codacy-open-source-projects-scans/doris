@@ -20,16 +20,20 @@ package org.apache.doris.nereids.trees.expressions.literal;
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.exceptions.CastException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
+import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.DateTimeType;
 import org.apache.doris.nereids.types.DateTimeV2Type;
+import org.apache.doris.nereids.types.TimeV2Type;
 import org.apache.doris.nereids.types.coercion.DateLikeType;
 import org.apache.doris.nereids.util.DateUtils;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.math.BigInteger;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -43,10 +47,9 @@ import java.util.Objects;
  * date time literal.
  */
 public class DateTimeLiteral extends DateLiteral {
+    public static final DateTimeLiteral MIN_DATETIME = new DateTimeLiteral(0000, 1, 1, 0, 0, 0);
+    public static final DateTimeLiteral MAX_DATETIME = new DateTimeLiteral(9999, 12, 31, 23, 59, 59);
     protected static final int MAX_MICROSECOND = 999999;
-
-    private static final DateTimeLiteral MIN_DATETIME = new DateTimeLiteral(0000, 1, 1, 0, 0, 0);
-    private static final DateTimeLiteral MAX_DATETIME = new DateTimeLiteral(9999, 12, 31, 23, 59, 59);
 
     private static final Logger LOG = LogManager.getLogger(DateTimeLiteral.class);
 
@@ -246,7 +249,7 @@ public class DateTimeLiteral extends DateLiteral {
         }
     }
 
-    protected boolean checkRange() {
+    public boolean checkRange() {
         return checkRange(year, month, day) || hour > MAX_DATETIME.getHour() || minute > MAX_DATETIME.getMinute()
                 || second > MAX_DATETIME.getSecond() || microSecond > MAX_MICROSECOND;
     }
@@ -267,7 +270,7 @@ public class DateTimeLiteral extends DateLiteral {
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return "'" + getStringValue() + "'";
     }
 
@@ -326,6 +329,47 @@ public class DateTimeLiteral extends DateLiteral {
             return String.valueOf(format);
         }
         return String.format("%04d-%02d-%02d %02d:%02d:%02d", year, month, day, hour, minute, second);
+    }
+
+    @Override
+    protected String castValueToString() {
+        return getStringValue();
+    }
+
+    @Override
+    protected Expression uncheckedCastTo(DataType targetType) throws AnalysisException {
+        if (this.dataType.equals(targetType)) {
+            return this;
+        }
+        if (targetType.isIntegralType()) {
+            if (targetType.isBigIntType()) {
+                return new BigIntLiteral(getValue());
+            } else if (targetType.isLargeIntType()) {
+                return new LargeIntLiteral(new BigInteger(String.valueOf(getValue())));
+            } else {
+                throw new AnalysisException("DateTime can not cast to " + targetType);
+            }
+        } else if (targetType.isDateV2Type()) {
+            return new DateV2Literal(year, month, day);
+        } else if (targetType.isDateType()) {
+            return new DateLiteral(year, month, day);
+        } else if (targetType.isDateTimeV2Type()) {
+            // High scale datetime to low scale datetime may overflow.
+            try {
+                return new DateTimeV2Literal((DateTimeV2Type) targetType,
+                        year, month, day, hour, minute, second, microSecond);
+            } catch (AnalysisException e) {
+                throw new CastException(e.getMessage(), e);
+            }
+        } else if (targetType.isTimeType()) {
+            return new TimeV2Literal((int) hour, (int) minute, (int) second, (int) microSecond,
+                    ((TimeV2Type) targetType).getScale(), false);
+        } else if (targetType.isFloatType()) {
+            return new FloatLiteral(getValue());
+        } else if (targetType.isDoubleType()) {
+            return new DoubleLiteral(getValue());
+        }
+        return super.uncheckedCastTo(targetType);
     }
 
     @Override
@@ -395,9 +439,10 @@ public class DateTimeLiteral extends DateLiteral {
     }
 
     public static Expression fromJavaDateType(LocalDateTime dateTime) {
-        return isDateOutOfRange(dateTime)
-                ? new NullLiteral(DateTimeType.INSTANCE)
-                : new DateTimeLiteral(dateTime.getYear(), dateTime.getMonthValue(), dateTime.getDayOfMonth(),
+        if (isDateOutOfRange(dateTime)) {
+            throw new AnalysisException("datetime out of range: " + dateTime.toString());
+        }
+        return new DateTimeLiteral(dateTime.getYear(), dateTime.getMonthValue(), dateTime.getDayOfMonth(),
                         dateTime.getHour(), dateTime.getMinute(), dateTime.getSecond());
     }
 }

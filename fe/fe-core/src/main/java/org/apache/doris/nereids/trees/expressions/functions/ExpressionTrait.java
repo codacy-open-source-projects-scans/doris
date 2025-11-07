@@ -73,6 +73,11 @@ public interface ExpressionTrait extends TreeNode<Expression> {
         throw new UnboundException("sql");
     }
 
+    /**
+     * foldable() mainly use in fold expression. Udf and UniqueFunction are not foldable.
+     * But if want to check an expression contains non-idempotent, such as `rand()`, `uuid()`, etc.,
+     * you should use Expression::containsUniqueFunction instead.
+     */
     default boolean foldable() {
         return true;
     }
@@ -85,7 +90,7 @@ public interface ExpressionTrait extends TreeNode<Expression> {
     }
 
     /**
-     * Identify the expression is containing deterministic expr or not
+     * Identify the expression is containing non-deterministic expr or not
      */
     default boolean containsNondeterministic() {
         return anyMatch(expr -> !((ExpressionTrait) expr).isDeterministic());

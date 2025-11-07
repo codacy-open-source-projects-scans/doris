@@ -26,6 +26,7 @@ import org.apache.doris.resource.workloadgroup.QueueToken.TokenState;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.PriorityQueue;
 import java.util.Queue;
@@ -48,8 +49,6 @@ public class QueryQueue {
 
     private long wgId;
 
-    private long propVersion;
-
     private PriorityQueue<QueueToken> waitingQueryQueue;
     private Queue<QueueToken> runningQueryQueue;
 
@@ -60,10 +59,6 @@ public class QueryQueue {
         } finally {
             queueLock.unlock();
         }
-    }
-
-    long getPropVersion() {
-        return propVersion;
     }
 
     long getWgId() {
@@ -82,40 +77,58 @@ public class QueryQueue {
         return queueTimeout;
     }
 
-    public QueryQueue(long wgId, int maxConcurrency, int maxQueueSize, int queueTimeout, long propVersion) {
+    public QueryQueue(long wgId, int maxConcurrency, int maxQueueSize, int queueTimeout) {
         this.wgId = wgId;
         this.maxConcurrency = maxConcurrency;
         this.maxQueueSize = maxQueueSize;
         this.queueTimeout = queueTimeout;
-        this.propVersion = propVersion;
         this.waitingQueryQueue = new PriorityQueue<QueueToken>();
         this.runningQueryQueue = new LinkedList<QueueToken>();
     }
 
     public String debugString() {
-        return "wgId= " + wgId + ", version=" + this.propVersion + ",maxConcurrency=" + maxConcurrency
+        return "wgId= " + wgId + ",maxConcurrency=" + maxConcurrency
                 + ", maxQueueSize=" + maxQueueSize + ", queueTimeout=" + queueTimeout + ", currentRunningQueryNum="
                 + runningQueryQueue.size() + ", currentWaitingQueryNum=" + waitingQueryQueue.size();
     }
 
-    public QueueToken getToken() throws UserException {
+    public int usedSlotCount() {
+        int cnt = 0;
+        for (Iterator iterator = runningQueryQueue.iterator(); iterator.hasNext();) {
+            QueueToken queueToken = (QueueToken) iterator.next();
+            cnt += queueToken.getQuerySlotCount();
+        }
+        return cnt;
+    }
+
+    public QueueToken getToken(int querySlotCount) throws UserException {
+        if (maxConcurrency > 0 && (querySlotCount > maxConcurrency || querySlotCount < 1)) {
+            throw new UserException("query slot count " + querySlotCount
+                    + " should be smaller than workload group's max concurrency "
+                    + maxConcurrency + " and > 0");
+        }
         AdmissionControl admissionControl = Env.getCurrentEnv().getAdmissionControl();
         queueLock.lock();
         try {
             if (LOG.isDebugEnabled()) {
                 LOG.info(this.debugString());
             }
-            QueueToken queueToken = new QueueToken(queueTimeout, this);
+            QueueToken queueToken = new QueueToken(queueTimeout, querySlotCount, this);
 
             boolean isReachMaxCon = runningQueryQueue.size() >= maxConcurrency;
+            boolean hasFreeSlot = queueToken.getQuerySlotCount() <= maxConcurrency - usedSlotCount();
             boolean isResourceAvailable = admissionControl.checkResourceAvailable(queueToken);
-            if (!isReachMaxCon && isResourceAvailable) {
+            if (!isReachMaxCon && isResourceAvailable && hasFreeSlot) {
                 runningQueryQueue.offer(queueToken);
                 queueToken.complete();
                 return queueToken;
             } else if (waitingQueryQueue.size() >= maxQueueSize) {
-                throw new UserException("query waiting queue is full, queue length=" + maxQueueSize);
+                throw new UserException("query waiting queue is full, queue capacity=" + maxQueueSize
+                        + ", waiting num=" + waitingQueryQueue.size());
             } else {
+                if (!hasFreeSlot) {
+                    queueToken.setQueueMsg("NO_FREE_SLOT");
+                }
                 if (isReachMaxCon) {
                     queueToken.setQueueMsg("WAIT_IN_QUEUE");
                 }
@@ -145,12 +158,17 @@ public class QueryQueue {
         AdmissionControl admissionControl = Env.getCurrentEnv().getAdmissionControl();
         queueLock.lock();
         try {
-            runningQueryQueue.remove(releaseToken);
-            waitingQueryQueue.remove(releaseToken);
-            admissionControl.removeQueueToken(releaseToken);
+            if (releaseToken != null) {
+                runningQueryQueue.remove(releaseToken);
+                waitingQueryQueue.remove(releaseToken);
+                admissionControl.removeQueueToken(releaseToken);
+            }
             while (runningQueryQueue.size() < maxConcurrency) {
                 QueueToken queueToken = waitingQueryQueue.peek();
                 if (queueToken == null) {
+                    break;
+                }
+                if (queueToken.getQuerySlotCount() > maxConcurrency - usedSlotCount()) {
                     break;
                 }
                 if (admissionControl.checkResourceAvailable(queueToken)) {
@@ -176,7 +194,6 @@ public class QueryQueue {
             this.maxConcurrency = maxConcurrency;
             this.maxQueueSize = maxQueueSize;
             this.queueTimeout = queryWaitTimeout;
-            this.propVersion = version;
         } finally {
             if (LOG.isDebugEnabled()) {
                 LOG.debug(this.debugString());

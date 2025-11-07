@@ -28,9 +28,9 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.util.Util;
+import org.apache.doris.info.TableNameInfo;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.trees.plans.PlanType;
-import org.apache.doris.nereids.trees.plans.commands.info.TableNameInfo;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ShowResultSet;
@@ -81,6 +81,11 @@ public class ShowCreateMaterializedViewCommand extends ShowCommand {
     }
 
     @Override
+    public ShowResultSetMetaData getMetaData() {
+        return MATERIALIZED_VIEW_META_DATA;
+    }
+
+    @Override
     public ShowResultSet doRun(ConnectContext ctx, StmtExecutor executor) throws Exception {
         validate(ctx);
 
@@ -102,7 +107,7 @@ public class ShowCreateMaterializedViewCommand extends ShowCommand {
                 }
             }
         }
-        return new ShowResultSet(MATERIALIZED_VIEW_META_DATA, resultRowSet);
+        return new ShowResultSet(getMetaData(), resultRowSet);
     }
 }
 

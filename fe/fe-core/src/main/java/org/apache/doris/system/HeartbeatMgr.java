@@ -41,6 +41,7 @@ import org.apache.doris.thrift.TBrokerOperationStatus;
 import org.apache.doris.thrift.TBrokerOperationStatusCode;
 import org.apache.doris.thrift.TBrokerPingBrokerRequest;
 import org.apache.doris.thrift.TBrokerVersion;
+import org.apache.doris.thrift.TCloudClusterInfo;
 import org.apache.doris.thrift.TFrontendInfo;
 import org.apache.doris.thrift.TFrontendPingFrontendRequest;
 import org.apache.doris.thrift.TFrontendPingFrontendResult;
@@ -109,6 +110,9 @@ public class HeartbeatMgr extends MasterDaemon {
      */
     @Override
     protected void runAfterCatalogReady() {
+        if (Config.isCloudMode() && masterInfo.get() != null) {
+            masterInfo.get().setMetaServiceEndpoint(Config.meta_service_endpoint);
+        }
         // Get feInfos of previous iteration.
         List<TFrontendInfo> feInfos = Env.getCurrentEnv().getFrontendInfos();
         List<Future<HeartbeatResponse>> hbResponses = Lists.newArrayList();
@@ -238,6 +242,15 @@ public class HeartbeatMgr extends MasterDaemon {
 
         @Override
         public HeartbeatResponse call() {
+            HeartbeatResponse response = pingOnce();
+            // We ping twice here to avoid immediately failure due to connection reset.
+            if (response.getStatus() != HbStatus.OK) {
+                response = pingOnce();
+            }
+            return response;
+        }
+
+        private HeartbeatResponse pingOnce() {
             long backendId = backend.getId();
             HeartbeatService.Client client = null;
 
@@ -254,7 +267,11 @@ public class HeartbeatMgr extends MasterDaemon {
                 if (Config.isCloudMode()) {
                     String cloudUniqueId = backend.getTagMap().get(Tag.CLOUD_UNIQUE_ID);
                     copiedMasterInfo.setCloudUniqueId(cloudUniqueId);
-                    copiedMasterInfo.setTabletReportInactiveDurationMs(Config.rehash_tablet_after_be_dead_seconds);
+                    long reportInterval = Config.rehash_tablet_after_be_dead_seconds * 1000L;
+                    copiedMasterInfo.setTabletReportInactiveDurationMs(reportInterval);
+                    TCloudClusterInfo clusterInfo = new TCloudClusterInfo();
+                    clusterInfo.setIsStandby(backend.isInStandbyCluster());
+                    copiedMasterInfo.setCloudClusterInfo(clusterInfo);
                 }
                 THeartbeatResult result;
                 if (!FeConstants.runningUnitTest) {

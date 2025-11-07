@@ -25,6 +25,8 @@ import org.apache.doris.nereids.glue.LogicalPlanAdapter;
 import org.apache.doris.nereids.rules.exploration.mv.InitMaterializationContextHook;
 import org.apache.doris.nereids.trees.plans.Explainable;
 import org.apache.doris.nereids.trees.plans.PlanType;
+import org.apache.doris.nereids.trees.plans.commands.insert.InsertIntoTableCommand;
+import org.apache.doris.nereids.trees.plans.commands.insert.InsertOverwriteTableCommand;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.planner.ScanNode;
@@ -79,12 +81,21 @@ public class ExplainCommand extends Command implements NoForward {
         if (!(logicalPlan instanceof Explainable)) {
             throw new AnalysisException(logicalPlan.getClass().getSimpleName() + " cannot be explained");
         }
-        explainPlan = ((LogicalPlan) ((Explainable) logicalPlan).getExplainPlan(ctx));
+        Explainable explainable = (Explainable) logicalPlan;
+        if (explainable instanceof InsertIntoTableCommand
+                || explainable instanceof InsertOverwriteTableCommand
+                || explainable instanceof UpdateCommand) {
+            ctx.getStatementContext().setIsInsert(true);
+        }
+        explainPlan = ((LogicalPlan) explainable.getExplainPlan(ctx));
+        NereidsPlanner planner = explainable.getExplainPlanner(explainPlan, ctx.getStatementContext()).orElseGet(() ->
+            new NereidsPlanner(ctx.getStatementContext())
+        );
+
         LogicalPlanAdapter logicalPlanAdapter = new LogicalPlanAdapter(explainPlan, ctx.getStatementContext());
         ExplainOptions explainOptions = new ExplainOptions(level, showPlanProcess);
         logicalPlanAdapter.setIsExplain(explainOptions);
         executor.setParsedStmt(logicalPlanAdapter);
-        NereidsPlanner planner = new NereidsPlanner(ctx.getStatementContext());
         if (ctx.getSessionVariable().isEnableMaterializedViewRewrite()) {
             ctx.getStatementContext().addPlannerHook(InitMaterializationContextHook.INSTANCE);
         }
@@ -121,5 +132,13 @@ public class ExplainCommand extends Command implements NoForward {
     @Override
     public StmtType stmtType() {
         return StmtType.EXPLAIN;
+    }
+
+    @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("EXPLAIN ");
+        sb.append(logicalPlan.toDigest());
+        return sb.toString();
     }
 }

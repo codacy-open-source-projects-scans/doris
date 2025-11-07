@@ -67,8 +67,18 @@ public class ModifyTablePropertiesClause extends AlterTableClause {
         this.properties = properties;
     }
 
+    // for nereids
+    public ModifyTablePropertiesClause(Map<String, String> properties, String storagePolicy, boolean isBeingSynced,
+            boolean needTableStable, AlterOpType opType) {
+        super(opType);
+        this.properties = properties;
+        this.storagePolicy = storagePolicy;
+        this.isBeingSynced = isBeingSynced;
+        this.needTableStable = needTableStable;
+    }
+
     @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException {
+    public void analyze() throws AnalysisException {
         if (properties == null || properties.isEmpty()) {
             throw new AnalysisException("Properties is not set");
         }
@@ -286,9 +296,9 @@ public class ModifyTablePropertiesClause extends AlterTableClause {
                                 + " should be set to true or false");
             }
             OlapTable table = null;
-            if (tableName != null) {
-                table = (OlapTable) (Env.getCurrentInternalCatalog().getDbOrAnalysisException(tableName.getDb())
-                        .getTableOrAnalysisException(tableName.getTbl()));
+            if (tableNameInfo != null) {
+                table = (OlapTable) (Env.getCurrentInternalCatalog().getDbOrAnalysisException(tableNameInfo.getDb())
+                        .getTableOrAnalysisException(tableNameInfo.getTbl()));
             }
             if (table == null || !table.getEnableUniqueKeyMergeOnWrite()) {
                 throw new AnalysisException(
@@ -365,9 +375,10 @@ public class ModifyTablePropertiesClause extends AlterTableClause {
             this.needTableStable = false;
             this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
         } else if (properties.containsKey(PropertyAnalyzer.ENABLE_UNIQUE_KEY_SKIP_BITMAP_COLUMN)) {
-            // do nothing, will be analyzed when creating alter job
-        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_PAGE_SIZE)) {
-            throw new AnalysisException("You can not modify storage_page_size");
+            throw new AnalysisException("You can not modify property 'enable_unique_key_skip_bitmap_column'.");
+        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_PAGE_SIZE)
+                || properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_DICT_PAGE_SIZE)) {
+            throw new AnalysisException("You can not modify storage_page_size|storage_dict_page_size");
         } else {
             throw new AnalysisException("Unknown table property: " + properties.keySet());
         }
@@ -375,13 +386,13 @@ public class ModifyTablePropertiesClause extends AlterTableClause {
     }
 
     private void analyzeForMTMV() throws AnalysisException {
-        if (tableName != null) {
+        if (tableNameInfo != null) {
             // Skip external catalog.
-            if (!(InternalCatalog.INTERNAL_CATALOG_NAME.equals(tableName.getCtl()))) {
+            if (!(InternalCatalog.INTERNAL_CATALOG_NAME.equals(tableNameInfo.getCtl()))) {
                 return;
             }
-            Table table = Env.getCurrentInternalCatalog().getDbOrAnalysisException(tableName.getDb())
-                    .getTableOrAnalysisException(tableName.getTbl());
+            Table table = Env.getCurrentInternalCatalog().getDbOrAnalysisException(tableNameInfo.getDb())
+                    .getTableOrAnalysisException(tableNameInfo.getTbl());
             if (!(table instanceof MTMV)) {
                 return;
             }

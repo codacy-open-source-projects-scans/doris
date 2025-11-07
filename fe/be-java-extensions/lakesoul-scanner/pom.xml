@@ -53,6 +53,7 @@ under the License.
             <artifactId>lakesoul-io-java</artifactId>
             <version>${lakesoul.version}</version>
             <classifier>shaded</classifier>
+            <scope>provided</scope>
             <exclusions>
                 <exclusion>
                     <groupId>*</groupId>
@@ -66,6 +67,7 @@ under the License.
         <finalName>lakesoul-scanner-jar-with-dependencies</finalName>
         <sourceDirectory>src/main/java</sourceDirectory>
         <testSourceDirectory>src/test/java</testSourceDirectory>
+        <directory>${project.basedir}/target/</directory>
         <resources>
             <resource>
                 <directory>src/main/resources</directory>

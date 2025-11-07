@@ -18,6 +18,8 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("aggOnAggMV1") {
+    // this mv rewrite would not be rewritten in RBO phase, so set TRY_IN_RBO explicitly to make case stable
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
     sql "SET experimental_enable_nereids_planner=true"
     sql "SET enable_fallback_to_original_planner=false"
     sql """ DROP TABLE IF EXISTS aggOnAggMV1; """
@@ -34,17 +36,25 @@ suite ("aggOnAggMV1") {
         """
 
     sql """insert into aggOnAggMV1 values("2020-01-01",1,"a",1,1,1);"""
+    sql """insert into aggOnAggMV1 values("2020-01-01",1,"a",1,1,1);"""
+    sql """insert into aggOnAggMV1 values("2020-01-01",1,"a",1,1,1);"""
     sql """insert into aggOnAggMV1 values("2020-01-02",2,"b",2,2,2);"""
+    sql """insert into aggOnAggMV1 values("2020-01-02",2,"b",2,2,2);"""
+    sql """insert into aggOnAggMV1 values("2020-01-02",2,"b",2,2,2);"""
+    sql """insert into aggOnAggMV1 values("2020-01-03",3,"c",3,3,3);"""
+    sql """insert into aggOnAggMV1 values("2020-01-03",3,"c",3,3,3);"""
     sql """insert into aggOnAggMV1 values("2020-01-03",3,"c",3,3,3);"""
 
 
-    createMV("create materialized view aggOnAggMV1_mv as select deptno, sum(salary), max(commission) from aggOnAggMV1 group by deptno ;")
+    createMV("create materialized view aggOnAggMV1_mv as select deptno as a1, sum(salary), max(commission) from aggOnAggMV1 group by deptno ;")
 
     sleep(3000)
 
     sql """insert into aggOnAggMV1 values("2020-01-01",1,"a",1,1,1);"""
 
     sql "analyze table aggOnAggMV1 with sync;"
+    sql """alter table aggOnAggMV1 modify column time_col set stats ('row_count'='9');"""
+
     sql """set enable_stats=false;"""
 
     mv_rewrite_fail("select * from aggOnAggMV1 order by empid;", "aggOnAggMV1_mv")
@@ -54,7 +64,6 @@ suite ("aggOnAggMV1") {
     order_qt_select_mv "select sum(salary), deptno from aggOnAggMV1 group by deptno order by deptno;"
 
     sql """set enable_stats=true;"""
-    sql """alter table aggOnAggMV1 modify column time_col set stats ('row_count'='4');"""
     mv_rewrite_fail("select * from aggOnAggMV1 order by empid;", "aggOnAggMV1_mv")
 
     mv_rewrite_success("select sum(salary), deptno from aggOnAggMV1 group by deptno order by deptno;", "aggOnAggMV1_mv")

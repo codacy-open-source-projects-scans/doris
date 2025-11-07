@@ -32,17 +32,18 @@ import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.CountingDataOutputStream;
 import org.apache.doris.common.util.NetUtils;
 import org.apache.doris.metric.MetricRepo;
+import org.apache.doris.nereids.trees.plans.commands.info.ModifyBackendOp;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.resource.Tag;
-import org.apache.doris.thrift.TNodeInfo;
-import org.apache.doris.thrift.TPaloNodesInfo;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
@@ -70,12 +71,21 @@ public class SystemInfoService {
 
     public static final String DEFAULT_CLUSTER = "default_cluster";
 
-    public static final String NO_BACKEND_LOAD_AVAILABLE_MSG = "No backend load available.";
+    public static final String NO_BACKEND_LOAD_AVAILABLE_MSG =
+            "No backend available for load, please check the status of your backends.";
 
-    public static final String NO_SCAN_NODE_BACKEND_AVAILABLE_MSG = "There is no scanNode Backend available.";
+    public static final String NO_SCAN_NODE_BACKEND_AVAILABLE_MSG =
+            "No backend available as scan node, please check the status of your backends.";
 
-    public static final String NOT_USING_VALID_CLUSTER_MSG = "Not using valid cloud clusters, "
-            + "please use a cluster before issuing any queries";
+    public static final String NOT_USING_VALID_CLUSTER_MSG =
+            "Not using valid cloud clusters, please use a cluster before issuing any queries";
+
+    public static final String ERROR_E230 = "E-230";
+
+    public static final ImmutableSet<String> NEED_REPLAN_ERRORS = ImmutableSet.of(
+            NO_SCAN_NODE_BACKEND_AVAILABLE_MSG,
+            ERROR_E230
+    );
 
     protected volatile ImmutableMap<Long, Backend> idToBackendRef = ImmutableMap.of();
     protected volatile ImmutableMap<Long, AtomicLong> idToReportVersionRef = ImmutableMap.of();
@@ -160,16 +170,6 @@ public class SystemInfoService {
             }
         }
     };
-
-    public static TPaloNodesInfo createAliveNodesInfo() {
-        TPaloNodesInfo nodesInfo = new TPaloNodesInfo();
-        SystemInfoService systemInfoService = Env.getCurrentSystemInfo();
-        for (Long id : systemInfoService.getAllBackendByCurrentCluster(true)) {
-            Backend backend = systemInfoService.getBackend(id);
-            nodesInfo.addToNodes(new TNodeInfo(backend.getId(), 0, backend.getHost(), backend.getBrpcPort()));
-        }
-        return nodesInfo;
-    }
 
     // for deploy manager
     public void addBackends(List<HostInfo> hostInfos, boolean isFree)
@@ -310,6 +310,17 @@ public class SystemInfoService {
         return getAllClusterBackendsNoException().get(backendId);
     }
 
+    public List<Backend> getBackends(List<Long> backendIds) {
+        List<Backend> backends = Lists.newArrayList();
+        for (long backendId : backendIds) {
+            Backend backend = getBackend(backendId);
+            if (backend != null) {
+                backends.add(backend);
+            }
+        }
+        return backends;
+    }
+
     public boolean checkBackendScheduleAvailable(long backendId) {
         Backend backend = getAllClusterBackendsNoException().get(backendId);
         if (backend == null || !backend.isScheduleAvailable()) {
@@ -370,9 +381,14 @@ public class SystemInfoService {
 
     public List<Long> getAllBackendByCurrentCluster(boolean needAlive) {
         try {
-            return getBackendsByCurrentCluster()
-                .values().stream().filter(be -> !needAlive || be.isAlive())
-                .map(Backend::getId).collect(Collectors.toList());
+            ImmutableMap<Long, Backend> bes = getBackendsByCurrentCluster();
+            List<Long> beIds = new ArrayList<>(bes.size());
+            for (Backend be : bes.values()) {
+                if (!needAlive || be.isAlive()) {
+                    beIds.add(be.getId());
+                }
+            }
+            return beIds;
         } catch (AnalysisException e) {
             LOG.warn("failed to get backends by Current Cluster", e);
             return Lists.newArrayList();
@@ -394,6 +410,12 @@ public class SystemInfoService {
             }
             return backendIds;
         }
+    }
+
+    public List<Backend> getAllClusterBackends(boolean needAlive) {
+        return getAllClusterBackendsNoException().values().stream()
+                .filter(be -> !needAlive || be.isAlive())
+                .collect(Collectors.toList());
     }
 
     public List<Long> getDecommissionedBackendIds() {
@@ -468,7 +490,7 @@ public class SystemInfoService {
         long minBeTabletsNum = Long.MAX_VALUE;
         int minIndex = -1;
         for (int i = 0; i < beIds.size(); ++i) {
-            long tabletsNum = Env.getCurrentInvertedIndex().getTabletIdsByBackendId(beIds.get(i)).size();
+            long tabletsNum = Env.getCurrentInvertedIndex().getTabletSizeByBackendId(beIds.get(i));
             if (tabletsNum < minBeTabletsNum) {
                 minBeTabletsNum = tabletsNum;
                 minIndex = i;
@@ -567,12 +589,16 @@ public class SystemInfoService {
         StringBuilder sb = new StringBuilder(" Backends details: ");
         for (Tag tag : replicaAlloc.getAllocMap().keySet()) {
             sb.append("backends with tag ").append(tag).append(" is ");
-            sb.append(idToBackendRef.values().stream().filter(be -> be.getLocationTag() == tag)
+            sb.append(idToBackendRef.values().stream().filter(be -> be.getLocationTag().equals(tag))
                     .map(Backend::getDetailsForCreateReplica)
                     .collect(Collectors.toList()));
             sb.append(", ");
         }
         return sb.toString();
+    }
+
+    public List<Long> selectBackendIdsByPolicy(BeSelectionPolicy policy, int number) {
+        return selectBackendIdsByPolicy(policy, number, getAllClusterBackendsNoException().values().asList());
     }
 
     /**
@@ -581,11 +607,14 @@ public class SystemInfoService {
      * @param policy if policy is enableRoundRobin, will update its nextRoundRobinIndex
      * @param number number of backends which need to be selected. -1 means return as many as possible.
      * @return return #number of backend ids,
-     * or empty set if no backends match the policy, or the number of matched backends is less than "number";
+     *         or empty set if no backends match the policy, or the number of matched backends is less than "number";
      */
-    public List<Long> selectBackendIdsByPolicy(BeSelectionPolicy policy, int number) {
+    public List<Long> selectBackendIdsByPolicy(BeSelectionPolicy policy, int number,
+            List<Backend> backendList) {
         Preconditions.checkArgument(number >= -1);
-        List<Backend> candidates = policy.getCandidateBackends(getAllClusterBackendsNoException().values());
+
+        List<Backend> candidates = policy.getCandidateBackends(backendList);
+
         if (candidates.size() < number || candidates.isEmpty()) {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Not match policy: {}. candidates num: {}, expected: {}", policy, candidates.size(), number);
@@ -915,6 +944,20 @@ public class SystemInfoService {
         }
     }
 
+    public void modifyBackendHostName(String srcHost, int srcPort, String destHost) throws UserException {
+        Backend be = getBackendWithHeartbeatPort(srcHost, srcPort);
+        if (be == null) {
+            throw new DdlException("backend does not exists[" + NetUtils
+                    .getHostPortInAccessibleFormat(srcHost, srcPort) + "]");
+        }
+        if (be.getHost().equals(destHost)) {
+            // no need to modify
+            return;
+        }
+        be.setHost(destHost);
+        Env.getCurrentEnv().getEditLog().logModifyBackend(be);
+    }
+
     public void modifyBackendHost(ModifyBackendHostNameClause clause) throws UserException {
         Backend be = getBackendWithHeartbeatPort(clause.getHost(), clause.getPort());
         if (be == null) {
@@ -963,17 +1006,59 @@ public class SystemInfoService {
             }
 
             if (alterClause.isQueryDisabled() != null) {
-                if (!alterClause.isQueryDisabled().equals(be.isQueryDisabled())) {
-                    be.setQueryDisabled(alterClause.isQueryDisabled());
-                    shouldModify = true;
-                }
+                shouldModify = be.setQueryDisabled(alterClause.isQueryDisabled());
             }
 
             if (alterClause.isLoadDisabled() != null) {
-                if (!alterClause.isLoadDisabled().equals(be.isLoadDisabled())) {
-                    be.setLoadDisabled(alterClause.isLoadDisabled());
-                    shouldModify = true;
+                shouldModify = be.setLoadDisabled(alterClause.isLoadDisabled());
+            }
+
+            if (shouldModify) {
+                Env.getCurrentEnv().getEditLog().logModifyBackend(be);
+                LOG.info("finished to modify backend {} ", be);
+            }
+        }
+    }
+
+    public void modifyBackends(ModifyBackendOp op) throws UserException {
+        List<HostInfo> hostInfos = op.getHostInfos();
+        List<Backend> backends = Lists.newArrayList();
+        if (hostInfos.isEmpty()) {
+            List<String> ids = op.getIds();
+            for (String id : ids) {
+                long backendId = Long.parseLong(id);
+                Backend be = getBackend(backendId);
+                if (be == null) {
+                    throw new DdlException("backend does not exists[" + backendId + "]");
                 }
+                backends.add(be);
+            }
+        } else {
+            for (HostInfo hostInfo : hostInfos) {
+                Backend be = getBackendWithHeartbeatPort(hostInfo.getHost(), hostInfo.getPort());
+                if (be == null) {
+                    throw new DdlException(
+                          "backend does not exists[" + NetUtils
+                                  .getHostPortInAccessibleFormat(hostInfo.getHost(), hostInfo.getPort()) + "]");
+                }
+                backends.add(be);
+            }
+        }
+
+        for (Backend be : backends) {
+            boolean shouldModify = false;
+            Map<String, String> tagMap = op.getTagMap();
+            if (!tagMap.isEmpty()) {
+                be.setTagMap(tagMap);
+                shouldModify = true;
+            }
+
+            if (op.isQueryDisabled() != null) {
+                shouldModify = be.setQueryDisabled(op.isQueryDisabled());
+            }
+
+            if (op.isLoadDisabled() != null) {
+                shouldModify = be.setLoadDisabled(op.isLoadDisabled());
             }
 
             if (shouldModify) {
@@ -1026,6 +1111,16 @@ public class SystemInfoService {
         return idToBackendRef;
     }
 
+    public ImmutableList<Backend> getBackendListByComputeGroup(Set<String> cgSet) {
+        List<Backend> result = new ArrayList<>();
+        for (Backend be : idToBackendRef.values()) {
+            if (cgSet.contains(be.getLocationTag().value)) {
+                result.add(be);
+            }
+        }
+        return ImmutableList.copyOf(result);
+    }
+
     // Cloud and NonCloud get all bes
     public ImmutableMap<Long, Backend> getAllBackendsByAllCluster() throws AnalysisException {
         return idToBackendRef;
@@ -1044,14 +1139,12 @@ public class SystemInfoService {
         if (currentBackends.size() == 0) {
             return 1;
         }
-        int minPipelineExecutorSize = Integer.MAX_VALUE;
-        for (Backend be : currentBackends) {
-            int size = be.getPipelineExecutorSize();
-            if (size > 0) {
-                minPipelineExecutorSize = Math.min(minPipelineExecutorSize, size);
-            }
-        }
-        return minPipelineExecutorSize;
+
+        return currentBackends.stream()
+                .mapToInt(Backend::getPipelineExecutorSize)
+                .filter(size -> size > 0)
+                .min()
+                .orElse(1);
     }
 
     // CloudSystemInfoService override
@@ -1059,4 +1152,16 @@ public class SystemInfoService {
         return Env.getCurrentInvertedIndex().getTabletNumByBackendId(beId);
     }
 
+    // If the error msg contains certain keywords, we need to retry the query with re-plan.
+    public static boolean needRetryWithReplan(String errorMsg) {
+        if (Strings.isNullOrEmpty(errorMsg)) {
+            return false;
+        }
+        for (String keyword : NEED_REPLAN_ERRORS) {
+            if (errorMsg.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
 }

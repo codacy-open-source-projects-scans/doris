@@ -25,6 +25,7 @@
 #include "vec/data_types/data_type_factory.hpp"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 
 std::vector<SchemaScanner::ColumnDesc> SchemaFileCacheStatisticsScanner::_s_tbls_columns = {
         //   name,       type,          size
@@ -58,9 +59,8 @@ Status SchemaFileCacheStatisticsScanner::get_next_block_internal(vectorized::Blo
         _stats_block = vectorized::Block::create_unique();
 
         for (int i = 0; i < _s_tbls_columns.size(); ++i) {
-            TypeDescriptor descriptor(_s_tbls_columns[i].type);
-            auto data_type =
-                    vectorized::DataTypeFactory::instance().create_data_type(descriptor, true);
+            auto data_type = vectorized::DataTypeFactory::instance().create_data_type(
+                    _s_tbls_columns[i].type, true);
             _stats_block->insert(vectorized::ColumnWithTypeAndName(
                     data_type->create_column(), data_type, _s_tbls_columns[i].name));
         }
@@ -68,7 +68,7 @@ Status SchemaFileCacheStatisticsScanner::get_next_block_internal(vectorized::Blo
         _stats_block->reserve(_block_rows_limit);
 
         ExecEnv::GetInstance()->file_cache_factory()->get_cache_stats_block(_stats_block.get());
-        _total_rows = _stats_block->rows();
+        _total_rows = (int)_stats_block->rows();
     }
 
     if (_row_idx == _total_rows) {

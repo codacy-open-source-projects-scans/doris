@@ -27,7 +27,9 @@
 #include "http/http_channel.h"
 #include "http/http_request.h"
 #include "http/http_status.h"
+#include "io/cache/cached_remote_file_reader.h"
 #include "olap/rowset/rowset.h"
+#include "olap/rowset/segment_v2/page_io.h"
 #include "util/stack_util.h"
 
 namespace doris {
@@ -108,15 +110,6 @@ void register_suites() {
         sp->set_call_back("VOlapTableSink::close",
                           [](auto&&) { std::this_thread::sleep_for(std::chrono::seconds(5)); });
     });
-    // curl be_ip:http_port/api/injection_point/apply_suite?name=test_ttl_lru_evict'
-    suite_map.emplace("test_ttl_lru_evict", [] {
-        auto* sp = SyncPoint::get_instance();
-        sp->set_call_back("BlockFileCache::change_limit1", [](auto&& args) {
-            LOG(INFO) << "BlockFileCache::change_limit1";
-            auto* limit = try_any_cast<size_t*>(args[0]);
-            *limit = 1;
-        });
-    });
     suite_map.emplace("test_file_segment_cache_corruption", [] {
         auto* sp = SyncPoint::get_instance();
         sp->set_call_back("Segment::open:corruption", [](auto&& args) {
@@ -131,6 +124,26 @@ void register_suites() {
             LOG(INFO) << "injection Segment::open:corruption1";
             auto* arg0 = try_any_cast<Status*>(args[0]);
             *arg0 = Status::Corruption<false>("test_file_segment_cache_corruption injection error");
+        });
+    });
+    // curl "be_ip:http_port/api/injection_point/apply_suite/PageIO::read_and_decompress_page:crc_failure"
+    suite_map.emplace("PageIO::read_and_decompress_page:crc_failure", [] {
+        auto* sp = SyncPoint::get_instance();
+        sp->set_call_back("PageIO::read_and_decompress_page:crc_failure_inj", [](auto&& args) {
+            LOG(INFO) << "PageIO::read_and_decompress_page:crc_failure_inj";
+            if (auto ctx = std::any_cast<segment_v2::InjectionContext*>(args[0])) {
+                uint32_t* crc = ctx->crc;
+                segment_v2::PageReadOptions* opts = ctx->opts;
+                auto cached_file_reader =
+                        dynamic_cast<io::CachedRemoteFileReader*>(opts->file_reader);
+                if (cached_file_reader == nullptr) {
+                    return; // if not cachedreader, then do nothing
+                } else {
+                    memset(crc, 0, 32);
+                }
+            } else {
+                std::cerr << "Failed to cast std::any to InjectionContext*" << std::endl;
+            }
         });
     });
     // curl be_ip:http_port/api/injection_point/apply_suite?name=test_cloud_meta_mgr_commit_txn'

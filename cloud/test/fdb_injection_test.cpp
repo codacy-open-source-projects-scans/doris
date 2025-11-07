@@ -33,7 +33,7 @@
 #include "common/logging.h"
 #include "cpp/sync_point.h"
 #include "meta-service/meta_service.h"
-#include "meta-service/txn_kv.h"
+#include "meta-store/txn_kv.h"
 
 using namespace doris;
 
@@ -44,8 +44,10 @@ static std::unique_ptr<cloud::MetaServiceProxy> create_meta_service() {
     auto rate_limiter = std::make_shared<cloud::RateLimiter>();
     auto rc_mgr = std::make_shared<cloud::ResourceManager>(txn_kv);
     [&]() { ASSERT_EQ(rc_mgr->init(), 0); }();
+    auto snapshot_manager = std::make_shared<cloud::SnapshotManager>(txn_kv);
 
-    auto meta_service_impl = std::make_unique<cloud::MetaServiceImpl>(txn_kv, rc_mgr, rate_limiter);
+    auto meta_service_impl = std::make_unique<cloud::MetaServiceImpl>(txn_kv, rc_mgr, rate_limiter,
+                                                                      snapshot_manager);
     return std::make_unique<cloud::MetaServiceProxy>(std::move(meta_service_impl));
 }
 
@@ -71,6 +73,7 @@ int main(int argc, char** argv) {
     cloud::config::fdb_cluster_file_path = "fdb.cluster";
     cloud::config::write_schema_kv = true;
     cloud::config::enable_check_instance_id = false;
+    cloud::config::enable_loopback_address_for_ms = true;
 
     auto sp = SyncPoint::get_instance();
     sp->enable_processing();
@@ -92,6 +95,8 @@ int main(int argc, char** argv) {
                       [](auto&& args) { *try_any_cast<uint64_t*>(args[0]) = 0; });
     sp->set_call_back("put_schema_kv:schema_key_exists_return",
                       [](auto&& args) { *try_any_cast<bool*>(args.back()) = true; });
+    sp->set_call_back("resource_manager::set_safe_drop_time",
+                      [](auto&& args) { *try_any_cast<int64_t*>(args[0]) = -1; });
 
     meta_service = create_meta_service();
 

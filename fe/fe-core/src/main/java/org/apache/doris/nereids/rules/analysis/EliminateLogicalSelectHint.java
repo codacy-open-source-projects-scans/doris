@@ -82,7 +82,8 @@ public class EliminateLogicalSelectHint extends OneRewriteRuleFactory {
 
     private void extractLeading(SelectHintLeading selectHint, CascadesContext context,
                                     StatementContext statementContext, LogicalSelectHint<Plan> selectHintPlan) {
-        LeadingHint hint = new LeadingHint("Leading", selectHint.getParameters(), selectHint.toString());
+        LeadingHint hint = new LeadingHint("Leading", selectHint.getParameters(), selectHint.toString(),
+                selectHint.getStrToHint());
         if (context.getHintMap().get("Leading") != null) {
             hint.setStatus(Hint.HintStatus.SYNTAX_ERROR);
             context.getHintMap().get("Leading").setStatus(Hint.HintStatus.UNUSED);
@@ -112,8 +113,6 @@ public class EliminateLogicalSelectHint extends OneRewriteRuleFactory {
         } else {
             context.setLeadingJoin(true);
         }
-        assert (selectHint != null);
-        assert (context != null);
     }
 
     private void extractRule(SelectHintUseCboRule selectHint, StatementContext statementContext) {
@@ -125,9 +124,9 @@ public class EliminateLogicalSelectHint extends OneRewriteRuleFactory {
     }
 
     private void extractMv(SelectHintUseMv selectHint, StatementContext statementContext) {
-        boolean isAllMv = selectHint.getParameters().isEmpty();
-        UseMvHint useMvHint = new UseMvHint(selectHint.getHintName(), selectHint.getParameters(),
-                selectHint.isUseMv(), isAllMv);
+        boolean isAllMv = selectHint.getTables().isEmpty();
+        UseMvHint useMvHint = new UseMvHint(selectHint.getHintName(), selectHint.getTables(),
+                selectHint.isUseMv(), isAllMv, statementContext.getHints());
         for (Hint hint : statementContext.getHints()) {
             if (hint.getHintName().equals(selectHint.getHintName())) {
                 hint.setStatus(Hint.HintStatus.SYNTAX_ERROR);
@@ -135,9 +134,6 @@ public class EliminateLogicalSelectHint extends OneRewriteRuleFactory {
                 useMvHint.setStatus(Hint.HintStatus.SYNTAX_ERROR);
                 useMvHint.setErrorMessage("only one " + selectHint.getHintName() + " hint is allowed");
             }
-        }
-        if (!useMvHint.isSyntaxError()) {
-            ConnectContext.get().getSessionVariable().setEnableSyncMvCostBasedRewrite(false);
         }
         statementContext.addHint(useMvHint);
     }

@@ -17,8 +17,6 @@
 
 package org.apache.doris.datasource;
 
-import org.apache.doris.analysis.TableName;
-import org.apache.doris.common.info.SimpleTableInfo;
 import org.apache.doris.datasource.hive.HMSCachedClient;
 import org.apache.doris.datasource.hive.HiveDatabaseMetadata;
 import org.apache.doris.datasource.hive.HivePartitionStatistics;
@@ -26,9 +24,9 @@ import org.apache.doris.datasource.hive.HivePartitionWithStatistics;
 import org.apache.doris.datasource.hive.HiveTableMetadata;
 import org.apache.doris.datasource.hive.HiveUtil;
 import org.apache.doris.datasource.hive.event.MetastoreNotificationFetchException;
+import org.apache.doris.info.TableNameInfo;
 
 import com.google.common.collect.ImmutableList;
-import org.apache.hadoop.hive.common.ValidWriteIdList;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.CurrentNotificationEventId;
@@ -48,7 +46,7 @@ import java.util.stream.Collectors;
 
 public class TestHMSCachedClient implements HMSCachedClient {
 
-    public Map<SimpleTableInfo, List<Partition>> partitions = new ConcurrentHashMap<>();
+    public Map<NameMapping, List<Partition>> partitions = new ConcurrentHashMap<>();
     public Map<String, List<Table>> tables = new HashMap<>();
     public List<Database> dbs = new ArrayList<>();
 
@@ -202,12 +200,12 @@ public class TestHMSCachedClient implements HMSCachedClient {
     }
 
     @Override
-    public ValidWriteIdList getValidWriteIds(String fullTableName, long currentTransactionId) {
+    public Map<String, String> getValidWriteIds(String fullTableName, long currentTransactionId) {
         return null;
     }
 
     @Override
-    public void acquireSharedLock(String queryId, long txnId, String user, TableName tblName, List<String> partitionNames, long timeoutMs) {
+    public void acquireSharedLock(String queryId, long txnId, String user, TableNameInfo tblName, List<String> partitionNames, long timeoutMs) {
 
     }
 
@@ -232,7 +230,7 @@ public class TestHMSCachedClient implements HMSCachedClient {
     public void dropTable(String dbName, String tableName) {
         Table table = getTable(dbName, tableName);
         this.tables.get(dbName).remove(table);
-        this.partitions.remove(new SimpleTableInfo(dbName, tableName));
+        this.partitions.remove(NameMapping.createForTest(dbName, tableName));
     }
 
     @Override
@@ -248,8 +246,7 @@ public class TestHMSCachedClient implements HMSCachedClient {
 
         List<Table> tableList = getTableList(tbl.getDbName());
         tableList.add(HiveUtil.toHiveTable((HiveTableMetadata) tbl));
-        SimpleTableInfo key = new SimpleTableInfo(dbName, tbName);
-        partitions.put(key, new ArrayList<>());
+        partitions.put(NameMapping.createForTest(dbName, tbName), new ArrayList<>());
     }
 
     @Override
@@ -322,10 +319,10 @@ public class TestHMSCachedClient implements HMSCachedClient {
     }
 
     public List<Partition> getPartitionList(String dbName, String tableName) {
-        SimpleTableInfo key = new SimpleTableInfo(dbName, tableName);
-        List<Partition> partitionList = this.partitions.get(key);
+        NameMapping nameMapping = NameMapping.createForTest(dbName, tableName);
+        List<Partition> partitionList = this.partitions.get(NameMapping.createForTest(dbName, tableName));
         if (partitionList == null) {
-            throw new RuntimeException("can't found table: " + key);
+            throw new RuntimeException("can't found table: " + nameMapping.getFullLocalName());
         }
         return partitionList;
     }

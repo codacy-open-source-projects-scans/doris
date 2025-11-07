@@ -29,6 +29,7 @@
 #include "util/time.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 
 // Base of lru cache, allow prune stale entry and prune all entry.
 class LRUCachePolicy : public CachePolicy {
@@ -36,37 +37,38 @@ public:
     LRUCachePolicy(CacheType type, size_t capacity, LRUCacheType lru_cache_type,
                    uint32_t stale_sweep_time_s, uint32_t num_shards = DEFAULT_LRU_CACHE_NUM_SHARDS,
                    uint32_t element_count_capacity = DEFAULT_LRU_CACHE_ELEMENT_COUNT_CAPACITY,
-                   bool enable_prune = true)
+                   bool enable_prune = true, bool is_lru_k = DEFAULT_LRU_CACHE_IS_LRU_K)
             : CachePolicy(type, capacity, stale_sweep_time_s, enable_prune),
               _lru_cache_type(lru_cache_type) {
         if (check_capacity(capacity, num_shards)) {
             _cache = std::shared_ptr<ShardedLRUCache>(
                     new ShardedLRUCache(type_string(type), capacity, lru_cache_type, num_shards,
-                                        element_count_capacity));
+                                        element_count_capacity, is_lru_k));
         } else {
-            CHECK(ExecEnv::GetInstance()->get_dummy_lru_cache());
-            _cache = ExecEnv::GetInstance()->get_dummy_lru_cache();
+            _cache = std::make_shared<doris::DummyLRUCache>();
         }
         _init_mem_tracker(lru_cache_type_string(lru_cache_type));
+        CacheManager::instance()->register_cache(this);
     }
 
     LRUCachePolicy(CacheType type, size_t capacity, LRUCacheType lru_cache_type,
                    uint32_t stale_sweep_time_s, uint32_t num_shards,
                    uint32_t element_count_capacity,
                    CacheValueTimeExtractor cache_value_time_extractor,
-                   bool cache_value_check_timestamp, bool enable_prune = true)
+                   bool cache_value_check_timestamp, bool enable_prune = true,
+                   bool is_lru_k = DEFAULT_LRU_CACHE_IS_LRU_K)
             : CachePolicy(type, capacity, stale_sweep_time_s, enable_prune),
               _lru_cache_type(lru_cache_type) {
         if (check_capacity(capacity, num_shards)) {
             _cache = std::shared_ptr<ShardedLRUCache>(
                     new ShardedLRUCache(type_string(type), capacity, lru_cache_type, num_shards,
                                         cache_value_time_extractor, cache_value_check_timestamp,
-                                        element_count_capacity));
+                                        element_count_capacity, is_lru_k));
         } else {
-            CHECK(ExecEnv::GetInstance()->get_dummy_lru_cache());
-            _cache = ExecEnv::GetInstance()->get_dummy_lru_cache();
+            _cache = std::make_shared<doris::DummyLRUCache>();
         }
         _init_mem_tracker(lru_cache_type_string(lru_cache_type));
+        CacheManager::instance()->register_cache(this);
     }
 
     void reset_cache() { _cache.reset(); }
@@ -90,7 +92,8 @@ public:
         case LRUCacheType::NUMBER:
             return "number";
         default:
-            LOG(FATAL) << "not match type of lru cache:" << static_cast<int>(type);
+            throw Exception(
+                    Status::FatalError("not match type of lru cache:{}", static_cast<int>(type)));
         }
     }
 
@@ -128,6 +131,10 @@ public:
         return _cache->insert(key, value, charge, priority);
     }
 
+    void for_each_entry(const std::function<void(const LRUHandle*)>& visitor) {
+        _cache->for_each_entry(visitor);
+    }
+
     Cache::Handle* lookup(const CacheKey& key) { return _cache->lookup(key); }
 
     void release(Cache::Handle* handle) { _cache->release(handle); }
@@ -155,7 +162,7 @@ public:
         std::lock_guard<std::mutex> l(_lock);
         COUNTER_SET(_freed_entrys_counter, (int64_t)0);
         COUNTER_SET(_freed_memory_counter, (int64_t)0);
-        if (_stale_sweep_time_s <= 0 || _cache == ExecEnv::GetInstance()->get_dummy_lru_cache()) {
+        if (_stale_sweep_time_s <= 0 || std::dynamic_pointer_cast<doris::DummyLRUCache>(_cache)) {
             return;
         }
         if (exceed_prune_limit()) {
@@ -202,7 +209,7 @@ public:
         std::lock_guard<std::mutex> l(_lock);
         COUNTER_SET(_freed_entrys_counter, (int64_t)0);
         COUNTER_SET(_freed_memory_counter, (int64_t)0);
-        if (_cache == ExecEnv::GetInstance()->get_dummy_lru_cache()) {
+        if (std::dynamic_pointer_cast<doris::DummyLRUCache>(_cache)) {
             return;
         }
         if ((force && mem_consumption() != 0) || exceed_prune_limit()) {
@@ -238,13 +245,13 @@ public:
         }
     }
 
-    int64_t adjust_capacity_weighted(double adjust_weighted) override {
-        std::lock_guard<std::mutex> l(_lock);
-        auto capacity = static_cast<size_t>(_initial_capacity * adjust_weighted);
+    int64_t adjust_capacity_weighted_unlocked(double adjust_weighted) {
+        auto capacity =
+                static_cast<size_t>(static_cast<double>(_initial_capacity) * adjust_weighted);
         COUNTER_SET(_freed_entrys_counter, (int64_t)0);
         COUNTER_SET(_freed_memory_counter, (int64_t)0);
         COUNTER_SET(_cost_timer, (int64_t)0);
-        if (_cache == ExecEnv::GetInstance()->get_dummy_lru_cache()) {
+        if (std::dynamic_pointer_cast<doris::DummyLRUCache>(_cache)) {
             return 0;
         }
 
@@ -268,6 +275,25 @@ public:
                 _adjust_capacity_weighted_number_counter->value());
         return _freed_entrys_counter->value();
     }
+
+    int64_t adjust_capacity_weighted(double adjust_weighted) override {
+        std::lock_guard<std::mutex> l(_lock);
+        return adjust_capacity_weighted_unlocked(adjust_weighted);
+    }
+
+    int64_t reset_initial_capacity(double adjust_weighted) override {
+        DCHECK(adjust_weighted != 0.0); // otherwise initial_capacity will always to be 0.
+        std::lock_guard<std::mutex> l(_lock);
+        int64_t prune_num = adjust_capacity_weighted_unlocked(adjust_weighted);
+        size_t old_capacity = _initial_capacity;
+        _initial_capacity =
+                static_cast<size_t>(static_cast<double>(_initial_capacity) * adjust_weighted);
+        LOG(INFO) << fmt::format(
+                "[MemoryGC] {} reset initial capacity, new capacity {}, old capacity {}, prune num "
+                "{}",
+                type_string(_type), _initial_capacity, old_capacity, prune_num);
+        return prune_num;
+    };
 
 protected:
     void _init_mem_tracker(const std::string& type_name) {
@@ -295,4 +321,5 @@ protected:
     std::shared_ptr<MemTracker> _value_mem_tracker;
 };
 
+#include "common/compile_check_end.h"
 } // namespace doris

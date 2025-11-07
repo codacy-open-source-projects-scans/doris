@@ -21,14 +21,11 @@ import org.apache.doris.analysis.StatementBase;
 import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MysqlColType;
-import org.apache.doris.cloud.catalog.CloudEnv;
 import org.apache.doris.common.AuthenticationException;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.ConnectionException;
-import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
-import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.common.Pair;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.mysql.MysqlChannel;
 import org.apache.doris.mysql.MysqlCommand;
@@ -43,6 +40,7 @@ import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.plans.PlaceholderId;
 import org.apache.doris.nereids.trees.plans.commands.ExecuteCommand;
 import org.apache.doris.nereids.trees.plans.commands.PrepareCommand;
+import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
@@ -57,6 +55,7 @@ import java.nio.channels.AsynchronousCloseException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Process one mysql connection, receive one packet, process, send one packet.
@@ -83,7 +82,7 @@ public class MysqlConnectProcessor extends ConnectProcessor {
         handleStmtClose(stmtId);
     }
 
-    private void debugPacket() {
+    private String getPacket() {
         byte[] bytes = packetBuf.array();
         StringBuilder printB = new StringBuilder();
         for (byte b : bytes) {
@@ -95,12 +94,27 @@ public class MysqlConnectProcessor extends ConnectProcessor {
             }
             printB.append(" ");
         }
+        return printB.toString().substring(0, 200);
+    }
+
+    private void debugPacket() {
         if (LOG.isDebugEnabled()) {
-            LOG.debug("debug packet {}", printB.toString().substring(0, 200));
+            LOG.debug("debug packet {}", getPacket());
         }
     }
 
-    private void handleExecute(PrepareCommand prepareCommand, long stmtId, PreparedStatementContext prepCtx) {
+    private String getHexStr(ByteBuffer packetBuf) {
+        byte[] bytes = packetBuf.array();
+        StringBuilder hex = new StringBuilder();
+        for (int i = packetBuf.position(); i < packetBuf.limit(); ++i) {
+            hex.append(String.format("%02X ", bytes[i]));
+        }
+        return hex.toString();
+    }
+
+    @Override
+    protected void handleExecute(PrepareCommand prepareCommand, long stmtId, PreparedStatementContext prepCtx,
+            ByteBuffer packetBuf, TUniqueId queryId) {
         int paramCount = prepareCommand.placeholderCount();
         LOG.debug("execute prepared statement {}, paramCount {}", stmtId, paramCount);
         // null bitmap
@@ -108,6 +122,12 @@ public class MysqlConnectProcessor extends ConnectProcessor {
         try {
             StatementContext statementContext = prepCtx.statementContext;
             if (paramCount > 0) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("execute param buf: {}, array: {}", packetBuf, getHexStr(packetBuf));
+                }
+                if (!ctx.isProxy()) {
+                    ctx.setPrepareExecuteBuffer(packetBuf.duplicate());
+                }
                 byte[] nullbitmapData = new byte[(paramCount + 7) / 8];
                 packetBuf.get(nullbitmapData);
                 // new_params_bind_flag
@@ -146,9 +166,13 @@ public class MysqlConnectProcessor extends ConnectProcessor {
             }
             StatementBase stmt = new LogicalPlanAdapter(executeStmt, statementContext);
             stmt.setOrigStmt(prepareCommand.getOriginalStmt());
-            executor = new StmtExecutor(ctx, stmt);
+            executor = new StmtExecutor(ctx, stmt, true);
             ctx.setExecutor(executor);
-            executor.execute();
+            if (null != queryId) {
+                executor.execute(queryId);
+            } else {
+                executor.execute();
+            }
             if (ctx.getSessionVariable().isEnablePreparedStmtAuditLog()) {
                 stmtStr = executeStmt.toSql();
                 stmtStr = stmtStr + " /*originalSql = " + prepareCommand.getOriginalStmt().originStmt + "*/";
@@ -183,17 +207,15 @@ public class MysqlConnectProcessor extends ConnectProcessor {
         }
 
         ctx.setStartTime();
-        // nererids
+        // nereids
         PreparedStatementContext preparedStatementContext = ctx.getPreparedStementContext(String.valueOf(stmtId));
         if (preparedStatementContext == null) {
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("No such statement in context, stmtId:{}", stmtId);
-            }
+            LOG.warn("No such statement in context, stmtId:{}", stmtId);
             ctx.getState().setError(ErrorCode.ERR_UNKNOWN_COM_ERROR,
                     "msg: Not supported such prepared statement");
             return;
         }
-        handleExecute(preparedStatementContext.command, stmtId, preparedStatementContext);
+        handleExecute(preparedStatementContext.command, stmtId, preparedStatementContext, packetBuf, null);
     }
 
     // Process COM_QUERY statement,
@@ -270,6 +292,9 @@ public class MysqlConnectProcessor extends ConnectProcessor {
             default:
                 ctx.getState().setError(ErrorCode.ERR_UNKNOWN_COM_ERROR, "Unsupported command(" + command + ")");
                 LOG.warn("Unsupported command(" + command + ")");
+                if (command.equals(MysqlCommand.COM_SLEEP)) {
+                    LOG.warn("COM_SLEEP packet: [{}]", getPacket());
+                }
                 break;
         }
     }
@@ -323,53 +348,14 @@ public class MysqlConnectProcessor extends ConnectProcessor {
             return;
         }
         ctx.setCurrentUserIdentity(currentUserIdentity.get(0));
-        ctx.setQualifiedUser(userName);
 
         // Change default db if set.
         if (Strings.isNullOrEmpty(db)) {
             ctx.changeDefaultCatalog(InternalCatalog.INTERNAL_CATALOG_NAME);
         } else {
-            String catalogName = null;
-            String dbName = null;
-            String[] dbNames = db.split("\\.");
-            if (dbNames.length == 1) {
-                dbName = db;
-            } else if (dbNames.length == 2) {
-                catalogName = dbNames[0];
-                dbName = dbNames[1];
-            } else if (dbNames.length > 2) {
-                ctx.getState().setError(ErrorCode.ERR_BAD_DB_ERROR, "Only one dot can be in the name: " + db);
-                return;
-            }
-
-            if (Config.isCloudMode()) {
-                try {
-                    dbName = ((CloudEnv) Env.getCurrentEnv()).analyzeCloudCluster(dbName, ctx);
-                } catch (DdlException e) {
-                    ctx.getState().setError(e.getMysqlErrorCode(), e.getMessage());
-                    return;
-                }
-            }
-
-            // check catalog and db exists
-            if (catalogName != null) {
-                CatalogIf catalogIf = ctx.getEnv().getCatalogMgr().getCatalog(catalogName);
-                if (catalogIf == null) {
-                    ctx.getState().setError(ErrorCode.ERR_BAD_DB_ERROR, "No match catalog in doris: " + db);
-                    return;
-                }
-                if (catalogIf.getDbNullable(dbName) == null) {
-                    ctx.getState().setError(ErrorCode.ERR_BAD_DB_ERROR, "No match database in doris: " + db);
-                    return;
-                }
-            }
-            try {
-                if (catalogName != null) {
-                    ctx.getEnv().changeCatalog(ctx, catalogName);
-                }
-                Env.getCurrentEnv().changeDb(ctx, dbName);
-            } catch (DdlException e) {
-                ctx.getState().setError(e.getMysqlErrorCode(), e.getMessage());
+            Optional<Pair<ErrorCode, String>> res = ConnectContextUtil.initCatalogAndDb(ctx, db);
+            if (res.isPresent()) {
+                ctx.getState().setError(res.get().first, res.get().second);
                 return;
             }
         }

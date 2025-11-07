@@ -20,6 +20,8 @@ import org.apache.kafka.clients.producer.KafkaProducer
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.clients.producer.ProducerConfig
 
+import java.util.stream.Collectors;
+
 suite("test_routine_load_with_user","p0") {
     def kafkaCsvTpoics = [
                   "test_routine_load_with_user",
@@ -37,8 +39,33 @@ suite("test_routine_load_with_user","p0") {
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "${kafka_broker}".toString())
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringSerializer")
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringSerializer")
+        // add timeout config
+        props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, "10000")  
+        props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "10000")
+
+        // check conenction
+        def verifyKafkaConnection = { prod ->
+            try {
+                logger.info("=====try to connect Kafka========")
+                def partitions = prod.partitionsFor("__connection_verification_topic")
+                return partitions != null
+            } catch (Exception e) {
+                throw new Exception("Kafka connect fail: ${e.message}".toString())
+            }
+        }
         // Create kafka producer
         def producer = new KafkaProducer<>(props)
+        try {
+            logger.info("Kafka connecting: ${kafka_broker}")
+            if (!verifyKafkaConnection(producer)) {
+                throw new Exception("can't get any kafka info")
+            }
+        } catch (Exception e) {
+            logger.error("FATAL: " + e.getMessage())
+            producer.close()
+            throw e  
+        }
+        logger.info("Kafka connect success")
 
         for (String kafkaCsvTopic in kafkaCsvTpoics) {
             def txt = new File("""${context.file.parent}/data/${kafkaCsvTopic}.csv""").text
@@ -65,7 +92,20 @@ suite("test_routine_load_with_user","p0") {
         def clusters = sql " SHOW CLUSTERS; "
         assertTrue(!clusters.isEmpty())
         def validCluster = clusters[0][0]
-        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
+
+        try {
+            def storageVaults = (sql " SHOW STORAGE VAULT; ").stream().map(row -> row[0]).collect(Collectors.toSet())
+            logger.info("all vaults: ${storageVaults}")
+            for (String vault in storageVaults) {
+                sql """
+                    GRANT usage_priv ON storage vault ${vault} TO '${user}';
+                """
+            }
+        } catch (Exception e) {
+            // cloud instance may doesn't support storage vault
+            logger.info(e.getMessage())
+        }
     }
 
     connect(user, "${pwd}", context.config.jdbcUrl) {

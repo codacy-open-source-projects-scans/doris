@@ -29,8 +29,10 @@
 #include <utility>
 
 #include "common/exception.h"
+#include "common/logging.h"
 #include "common/status.h"
-#include "olap/rowset/segment_v2/inverted_index_reader.h"
+#include "olap/rowset/segment_v2/inverted_index_iterator.h" // IWYU pragma: keep
+#include "runtime/define_primitive_type.h"
 #include "udf/udf.h"
 #include "vec/core/block.h"
 #include "vec/core/column_numbers.h"
@@ -38,28 +40,30 @@
 #include "vec/core/columns_with_type_and_name.h"
 #include "vec/core/types.h"
 #include "vec/data_types/data_type.h"
+#include "vec/data_types/data_type_array.h"
+#include "vec/data_types/data_type_map.h"
 #include "vec/data_types/data_type_nullable.h"
-
-namespace doris::segment_v2 {
-struct FuncExprParams;
-} // namespace doris::segment_v2
+#include "vec/data_types/data_type_struct.h"
 
 namespace doris::vectorized {
 
 struct FunctionAttr {
     bool enable_decimal256 {false};
+    bool new_version_unix_timestamp {false};
 };
 
-#define RETURN_REAL_TYPE_FOR_DATEV2_FUNCTION(TYPE)                                       \
-    bool is_nullable = false;                                                            \
-    bool is_datev2 = false;                                                              \
-    for (auto it : arguments) {                                                          \
-        is_nullable = is_nullable || it.type->is_nullable();                             \
-        is_datev2 = is_datev2 || WhichDataType(remove_nullable(it.type)).is_date_v2() || \
-                    WhichDataType(remove_nullable(it.type)).is_date_time_v2();           \
-    }                                                                                    \
-    return is_nullable || !is_datev2 ? make_nullable(std::make_shared<TYPE>())           \
-                                     : std::make_shared<TYPE>();
+#define RETURN_REAL_TYPE_FOR_DATEV2_FUNCTION(TYPE)                                             \
+    bool is_nullable = false;                                                                  \
+    bool is_datev2 = false;                                                                    \
+    for (auto it : arguments) {                                                                \
+        is_nullable = is_nullable || it.type->is_nullable();                                   \
+        is_datev2 = is_datev2 || it.type->get_primitive_type() == TYPE_DATEV2 ||               \
+                    it.type->get_primitive_type() == TYPE_DATETIMEV2;                          \
+    }                                                                                          \
+    return is_nullable || !is_datev2                                                           \
+                   ? make_nullable(                                                            \
+                             std::make_shared<typename PrimitiveTypeTraits<TYPE>::DataType>()) \
+                   : std::make_shared<typename PrimitiveTypeTraits<TYPE>::DataType>();
 
 #define SET_NULLMAP_IF_FALSE(EXPR) \
     if (!EXPR) [[unlikely]] {      \
@@ -136,11 +140,7 @@ protected:
       */
     virtual bool use_default_implementation_for_nulls() const { return true; }
 
-    /** If function arguments has single low cardinality column and all other arguments are constants, call function on nested column.
-      * Otherwise, convert all low cardinality columns to ordinary columns.
-      * Returns ColumnLowCardinality if at least one argument is ColumnLowCardinality.
-      */
-    virtual bool use_default_implementation_for_low_cardinality_columns() const { return true; }
+    virtual bool skip_return_type_check() const { return false; }
 
     /** Some arguments could remain constant during this implementation.
       * Every argument required const must write here and no checks elsewhere.
@@ -186,17 +186,20 @@ public:
         return Status::OK();
     }
 
-    /// TODO: make const
-    virtual Status execute(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                           uint32_t result, size_t input_rows_count, bool dry_run = false) const {
-        return prepare(context, block, arguments, result)
-                ->execute(context, block, arguments, result, input_rows_count, dry_run);
+    Status execute(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
+                   uint32_t result, size_t input_rows_count, bool dry_run = false) const {
+        try {
+            return prepare(context, block, arguments, result)
+                    ->execute(context, block, arguments, result, input_rows_count, dry_run);
+        } catch (const Exception& e) {
+            return e.to_status();
+        }
     }
 
     virtual Status evaluate_inverted_index(
             const ColumnsWithTypeAndName& arguments,
             const std::vector<vectorized::IndexFieldNameAndTypePair>& data_type_with_names,
-            std::vector<segment_v2::InvertedIndexIterator*> iterators, uint32_t num_rows,
+            std::vector<segment_v2::IndexIterator*> iterators, uint32_t num_rows,
             segment_v2::InvertedIndexResultBitmap& bitmap_result) const {
         return Status::OK();
     }
@@ -212,6 +215,8 @@ public:
     virtual bool is_udf_function() const { return false; }
 
     virtual bool can_push_down_to_index() const { return false; }
+
+    virtual bool is_blockable() const { return false; }
 };
 
 using FunctionBasePtr = std::shared_ptr<IFunctionBase>;
@@ -225,6 +230,8 @@ public:
     virtual String get_name() const = 0;
 
     /// Override and return true if function could take different number of arguments.
+    ///TODO: this function is not actually used now. but in check_number_of_arguments we still need it because for many
+    /// functions we didn't set the correct number of arguments.
     virtual bool is_variadic() const = 0;
 
     /// For non-variadic functions, return number of arguments; otherwise return zero (that should be ignored).
@@ -265,21 +272,34 @@ class FunctionBuilderImpl : public IFunctionBuilder {
 public:
     FunctionBasePtr build(const ColumnsWithTypeAndName& arguments,
                           const DataTypePtr& return_type) const final {
+        if (skip_return_type_check()) {
+            return build_impl(arguments, return_type);
+        }
         const DataTypePtr& func_return_type = get_return_type(arguments);
+        if (func_return_type == nullptr) {
+            throw doris::Exception(
+                    ErrorCode::INTERNAL_ERROR,
+                    "function return type check failed, function_name={}, "
+                    "expect_return_type={}, real_return_type is nullptr, input_arguments={}",
+                    get_name(), return_type->get_name(), get_types_string(arguments));
+        }
+
         // check return types equal.
         if (!(return_type->equals(*func_return_type) ||
               // For null constant argument, `get_return_type` would return
               // Nullable<DataTypeNothing> when `use_default_implementation_for_nulls` is true.
               (return_type->is_nullable() && func_return_type->is_nullable() &&
-               is_nothing(((DataTypeNullable*)func_return_type.get())->get_nested_type())) ||
+               ((DataTypeNullable*)func_return_type.get())
+                               ->get_nested_type()
+                               ->get_primitive_type() == INVALID_TYPE) ||
               is_date_or_datetime_or_decimal(return_type, func_return_type) ||
-              is_array_nested_type_date_or_datetime_or_decimal(return_type, func_return_type))) {
-            LOG_WARNING(
+              is_nested_type_date_or_datetime_or_decimal(return_type, func_return_type))) {
+            throw doris::Exception(
+                    ErrorCode::INTERNAL_ERROR,
                     "function return type check failed, function_name={}, "
-                    "expect_return_type={}, real_return_type={}, input_arguments={}",
+                    "fe plan return type={},  be real return type={}, input_arguments={}",
                     get_name(), return_type->get_name(), func_return_type->get_name(),
                     get_types_string(arguments));
-            return nullptr;
         }
         return build_impl(arguments, return_type);
     }
@@ -327,13 +347,9 @@ protected:
       */
     virtual bool use_default_implementation_for_nulls() const { return true; }
 
-    virtual bool need_replace_null_data_to_default() const { return false; }
+    virtual bool skip_return_type_check() const { return false; }
 
-    /** If use_default_implementation_for_nulls() is true, than change arguments for get_return_type() and build_impl().
-      * If function arguments has low cardinality types, convert them to ordinary types.
-      * get_return_type returns ColumnLowCardinality if at least one argument type is ColumnLowCardinality.
-      */
-    virtual bool use_default_implementation_for_low_cardinality_columns() const { return true; }
+    virtual bool need_replace_null_data_to_default() const { return false; }
 
     /// return a real function object to execute. called in build(...).
     virtual FunctionBasePtr build_impl(const ColumnsWithTypeAndName& arguments,
@@ -342,13 +358,10 @@ protected:
     virtual DataTypes get_variadic_argument_types_impl() const { return {}; }
 
 private:
-    DataTypePtr get_return_type_without_low_cardinality(
-            const ColumnsWithTypeAndName& arguments) const;
-
     bool is_date_or_datetime_or_decimal(const DataTypePtr& return_type,
                                         const DataTypePtr& func_return_type) const;
-    bool is_array_nested_type_date_or_datetime_or_decimal(
-            const DataTypePtr& return_type, const DataTypePtr& func_return_type) const;
+    bool is_nested_type_date_or_datetime_or_decimal(const DataTypePtr& return_type,
+                                                    const DataTypePtr& func_return_type) const;
 };
 
 /// Previous function interface.
@@ -366,9 +379,9 @@ public:
     /// Override this functions to change default implementation behavior. See details in IMyFunction.
     bool use_default_implementation_for_nulls() const override { return true; }
 
-    bool need_replace_null_data_to_default() const override { return false; }
+    bool skip_return_type_check() const override { return false; }
 
-    bool use_default_implementation_for_low_cardinality_columns() const override { return true; }
+    bool need_replace_null_data_to_default() const override { return false; }
 
     /// all constancy check should use this function to do automatically
     ColumnNumbers get_arguments_that_are_always_constant() const override { return {}; }
@@ -419,55 +432,6 @@ protected:
     }
 };
 
-/// Wrappers over IFunction. If we (default)use DefaultFunction as wrapper, all function execution will go through this.
-
-class DefaultExecutable final : public PreparedFunctionImpl {
-public:
-    explicit DefaultExecutable(std::shared_ptr<IFunction> function_)
-            : function(std::move(function_)) {}
-
-    String get_name() const override { return function->get_name(); }
-
-protected:
-    Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        uint32_t result, size_t input_rows_count) const final {
-        return function->execute_impl(context, block, arguments, result, input_rows_count);
-    }
-
-    Status evaluate_inverted_index(
-            const ColumnsWithTypeAndName& arguments,
-            const std::vector<vectorized::IndexFieldNameAndTypePair>& data_type_with_names,
-            std::vector<segment_v2::InvertedIndexIterator*> iterators, uint32_t num_rows,
-            segment_v2::InvertedIndexResultBitmap& bitmap_result) const {
-        return function->evaluate_inverted_index(arguments, data_type_with_names, iterators,
-                                                 num_rows, bitmap_result);
-    }
-
-    Status execute_impl_dry_run(FunctionContext* context, Block& block,
-                                const ColumnNumbers& arguments, uint32_t result,
-                                size_t input_rows_count) const final {
-        return function->execute_impl_dry_run(context, block, arguments, result, input_rows_count);
-    }
-    bool use_default_implementation_for_nulls() const final {
-        return function->use_default_implementation_for_nulls();
-    }
-    bool need_replace_null_data_to_default() const final {
-        return function->need_replace_null_data_to_default();
-    }
-    bool use_default_implementation_for_constants() const final {
-        return function->use_default_implementation_for_constants();
-    }
-    bool use_default_implementation_for_low_cardinality_columns() const final {
-        return function->use_default_implementation_for_low_cardinality_columns();
-    }
-    ColumnNumbers get_arguments_that_are_always_constant() const final {
-        return function->get_arguments_that_are_always_constant();
-    }
-
-private:
-    std::shared_ptr<IFunction> function;
-};
-
 /*
  * when we register a function which didn't specify its base(i.e. inherited from IFunction), actually we use this as a wrapper.
  * it saves real implementation as `function`. 
@@ -489,7 +453,7 @@ public:
     PreparedFunctionPtr prepare(FunctionContext* context, const Block& /*sample_block*/,
                                 const ColumnNumbers& /*arguments*/,
                                 uint32_t /*result*/) const override {
-        return std::make_shared<DefaultExecutable>(function);
+        return function;
     }
 
     Status open(FunctionContext* context, FunctionContext::FunctionStateScope scope) override {
@@ -503,7 +467,7 @@ public:
     Status evaluate_inverted_index(
             const ColumnsWithTypeAndName& args,
             const std::vector<vectorized::IndexFieldNameAndTypePair>& data_type_with_names,
-            std::vector<segment_v2::InvertedIndexIterator*> iterators, uint32_t num_rows,
+            std::vector<segment_v2::IndexIterator*> iterators, uint32_t num_rows,
             segment_v2::InvertedIndexResultBitmap& bitmap_result) const override {
         return function->evaluate_inverted_index(args, data_type_with_names, iterators, num_rows,
                                                  bitmap_result);
@@ -514,6 +478,8 @@ public:
     }
 
     bool can_push_down_to_index() const override { return function->can_push_down_to_index(); }
+
+    bool is_blockable() const override { return function->is_blockable(); }
 
 private:
     std::shared_ptr<IFunction> function;
@@ -527,7 +493,7 @@ public:
             : function(std::move(function_)) {}
 
     void check_number_of_arguments(size_t number_of_arguments) const override {
-        return function->check_number_of_arguments(number_of_arguments);
+        function->check_number_of_arguments(number_of_arguments);
     }
 
     String get_name() const override { return function->get_name(); }
@@ -550,11 +516,10 @@ protected:
         return function->use_default_implementation_for_nulls();
     }
 
+    bool skip_return_type_check() const override { return function->skip_return_type_check(); }
+
     bool need_replace_null_data_to_default() const override {
         return function->need_replace_null_data_to_default();
-    }
-    bool use_default_implementation_for_low_cardinality_columns() const override {
-        return function->use_default_implementation_for_low_cardinality_columns();
     }
 
     FunctionBasePtr build_impl(const ColumnsWithTypeAndName& arguments,
@@ -581,56 +546,5 @@ using FunctionPtr = std::shared_ptr<IFunction>;
   */
 ColumnPtr wrap_in_nullable(const ColumnPtr& src, const Block& block, const ColumnNumbers& args,
                            uint32_t result, size_t input_rows_count);
-
-#define NUMERIC_TYPE_TO_COLUMN_TYPE(M) \
-    M(UInt8, ColumnUInt8)              \
-    M(Int8, ColumnInt8)                \
-    M(Int16, ColumnInt16)              \
-    M(Int32, ColumnInt32)              \
-    M(Int64, ColumnInt64)              \
-    M(Int128, ColumnInt128)            \
-    M(Float32, ColumnFloat32)          \
-    M(Float64, ColumnFloat64)
-
-#define DECIMAL_TYPE_TO_COLUMN_TYPE(M)           \
-    M(Decimal32, ColumnDecimal<Decimal32>)       \
-    M(Decimal64, ColumnDecimal<Decimal64>)       \
-    M(Decimal128V2, ColumnDecimal<Decimal128V2>) \
-    M(Decimal128V3, ColumnDecimal<Decimal128V3>) \
-    M(Decimal256, ColumnDecimal<Decimal256>)
-
-#define STRING_TYPE_TO_COLUMN_TYPE(M) \
-    M(String, ColumnString)           \
-    M(JSONB, ColumnString)
-
-#define TIME_TYPE_TO_COLUMN_TYPE(M) \
-    M(Date, ColumnInt64)            \
-    M(DateTime, ColumnInt64)        \
-    M(DateV2, ColumnUInt32)         \
-    M(DateTimeV2, ColumnUInt64)
-
-#define IP_TYPE_TO_COLUMN_TYPE(M) \
-    M(IPv4, ColumnIPv4)           \
-    M(IPv6, ColumnIPv6)
-
-#define COMPLEX_TYPE_TO_COLUMN_TYPE(M) \
-    M(Array, ColumnArray)              \
-    M(Map, ColumnMap)                  \
-    M(Struct, ColumnStruct)            \
-    M(VARIANT, ColumnObject)           \
-    M(BitMap, ColumnBitmap)            \
-    M(HLL, ColumnHLL)                  \
-    M(QuantileState, ColumnQuantileState)
-
-#define TYPE_TO_BASIC_COLUMN_TYPE(M) \
-    NUMERIC_TYPE_TO_COLUMN_TYPE(M)   \
-    DECIMAL_TYPE_TO_COLUMN_TYPE(M)   \
-    STRING_TYPE_TO_COLUMN_TYPE(M)    \
-    TIME_TYPE_TO_COLUMN_TYPE(M)      \
-    IP_TYPE_TO_COLUMN_TYPE(M)
-
-#define TYPE_TO_COLUMN_TYPE(M)   \
-    TYPE_TO_BASIC_COLUMN_TYPE(M) \
-    COMPLEX_TYPE_TO_COLUMN_TYPE(M)
 
 } // namespace doris::vectorized

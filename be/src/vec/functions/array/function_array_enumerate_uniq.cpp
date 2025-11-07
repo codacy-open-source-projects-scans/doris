@@ -28,22 +28,22 @@
 #include <utility>
 
 #include "common/status.h"
+#include "runtime/define_primitive_type.h"
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_array.h"
 #include "vec/columns/column_nullable.h"
 #include "vec/columns/column_vector.h"
-#include "vec/columns/columns_number.h"
 #include "vec/common/arena.h"
 #include "vec/common/assert_cast.h"
 #include "vec/common/columns_hashing.h"
 #include "vec/common/hash_table/hash.h"
 #include "vec/common/hash_table/hash_map_context.h"
-#include "vec/common/hash_table/hash_table_allocator.h"
 #include "vec/common/pod_array_fwd.h"
 #include "vec/common/string_ref.h"
 #include "vec/common/uint128.h"
 #include "vec/core/block.h"
+#include "vec/core/call_on_type_index.h"
 #include "vec/core/column_numbers.h"
 #include "vec/core/column_with_type_and_name.h"
 #include "vec/core/types.h"
@@ -62,6 +62,7 @@ template <typename, typename>
 struct DefaultHash;
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 class FunctionArrayEnumerateUniq : public IFunction {
 private:
@@ -80,7 +81,6 @@ public:
             throw doris::Exception(
                     ErrorCode::INVALID_ARGUMENT,
                     "Incorrect number of arguments for array_enumerate_uniq function");
-            __builtin_unreachable();
         }
         bool is_nested_nullable = false;
         for (size_t i = 0; i < arguments.size(); ++i) {
@@ -128,7 +128,7 @@ public:
                     block.get_by_position(arguments[i]).column->convert_to_full_column_if_const());
             ColumnPtr& cur_column = src_columns[i];
             const ColumnArray* array =
-                    check_and_get_column<ColumnArray>(remove_nullable(cur_column->get_ptr()));
+                    check_and_get_column<ColumnArray>(remove_nullable(cur_column->get_ptr()).get());
             if (!array) {
                 return Status::RuntimeError(
                         fmt::format("Illegal column {}, of first argument of function {}",
@@ -151,7 +151,7 @@ public:
         const NullMapType* null_map = nullptr;
         if (arguments.size() == 1 && data_columns[0]->is_nullable()) {
             const ColumnNullable* nullable = check_and_get_column<ColumnNullable>(*data_columns[0]);
-            data_columns[0] = nullable->get_nested_column_ptr();
+            data_columns[0] = nullable->get_nested_column_ptr().get();
             null_map = &nullable->get_null_map_column().get_data();
         }
 
@@ -167,43 +167,20 @@ public:
             }
             auto nested_type =
                     assert_cast<const DataTypeArray&>(*src_column_type).get_nested_type();
-            WhichDataType which(remove_nullable(nested_type));
-            if (which.is_uint8()) {
-                _execute_number<ColumnUInt8>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_int8()) {
-                _execute_number<ColumnInt8>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_int16()) {
-                _execute_number<ColumnInt16>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_int32()) {
-                _execute_number<ColumnInt32>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_int64()) {
-                _execute_number<ColumnInt64>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_int128()) {
-                _execute_number<ColumnInt128>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_float32()) {
-                _execute_number<ColumnFloat32>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_float64()) {
-                _execute_number<ColumnFloat64>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_date()) {
-                _execute_number<ColumnDate>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_date_time()) {
-                _execute_number<ColumnDateTime>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_date_v2()) {
-                _execute_number<ColumnDateV2>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_decimal32()) {
-                _execute_number<ColumnDecimal32>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_decimal64()) {
-                _execute_number<ColumnDecimal64>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_decimal128v3()) {
-                _execute_number<ColumnDecimal128V3>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_decimal256()) {
-                _execute_number<ColumnDecimal256>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_date_time_v2()) {
-                _execute_number<ColumnDateTimeV2>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_decimal128v2()) {
-                _execute_number<ColumnDecimal128V2>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_string()) {
+
+            auto call = [&](const auto& type) -> bool {
+                using DispatchType = std::decay_t<decltype(type)>;
+                _execute_number<typename DispatchType::ColumnType>(data_columns, *offsets, null_map,
+                                                                   dst_values);
+                return true;
+            };
+
+            if (is_string_type(nested_type->get_primitive_type())) {
                 _execute_string(data_columns, *offsets, null_map, dst_values);
+            } else if (!dispatch_switch_scalar(nested_type->get_primitive_type(), call)) {
+                return Status::RuntimeError(fmt::format(
+                        "execute failed or unsupported types for function {}({})", get_name(),
+                        block.get_by_position(arguments[0]).type->get_name()));
             }
         } else {
             _execute_by_hash<MethodSerialized<PHHashMap<StringRef, Int64>>, false>(
@@ -219,7 +196,8 @@ public:
         if (arguments.size() == 1 && block.get_by_position(arguments[0]).column->is_nullable()) {
             auto left_column =
                     block.get_by_position(arguments[0]).column->convert_to_full_column_if_const();
-            const ColumnNullable* nullable = check_and_get_column<ColumnNullable>(left_column);
+            const ColumnNullable* nullable =
+                    check_and_get_column<ColumnNullable>(left_column.get());
             res_column = ColumnNullable::create(
                     res_column, nullable->get_null_map_column().clone_resized(nullable->size()));
         }
@@ -234,7 +212,7 @@ private:
                           [[maybe_unused]] const NullMap* null_map,
                           ColumnInt64::Container& dst_values) const {
         HashTableContext ctx;
-        ctx.init_serialized_keys(columns, columns[0]->size(),
+        ctx.init_serialized_keys(columns, static_cast<uint32_t>(columns[0]->size()),
                                  null_map ? null_map->data() : nullptr);
 
         using KeyGetter = typename HashTableContext::State;
@@ -295,5 +273,5 @@ private:
 void register_function_array_enumerate_uniq(SimpleFunctionFactory& factory) {
     factory.register_function<FunctionArrayEnumerateUniq>();
 }
-
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

@@ -33,16 +33,11 @@
 #include "runtime/load_stream_mgr.h"
 #include "util/debug_util.h"
 #include "util/time.h"
+#include "vec/runtime/vdata_stream_mgr.h"
 #include "vec/sink/delta_writer_v2_pool.h"
 #include "vec/sink/load_stream_map_pool.h"
 
 namespace doris {
-
-ExecEnv::ExecEnv() = default;
-
-ExecEnv::~ExecEnv() {
-    destroy();
-}
 
 #ifdef BE_TEST
 void ExecEnv::set_inverted_index_searcher_cache(
@@ -57,15 +52,22 @@ void ExecEnv::set_write_cooldown_meta_executors() {
 }
 #endif // BE_TEST
 
-Result<BaseTabletSPtr> ExecEnv::get_tablet(int64_t tablet_id) {
+Result<BaseTabletSPtr> ExecEnv::get_tablet(int64_t tablet_id, SyncRowsetStats* sync_stats,
+                                           bool force_use_cache) {
     auto storage_engine = GetInstance()->_storage_engine.get();
     return storage_engine != nullptr
-                   ? storage_engine->get_tablet(tablet_id)
+                   ? storage_engine->get_tablet(tablet_id, sync_stats)
                    : ResultError(Status::InternalError("failed to get tablet {}", tablet_id));
 }
 
 const std::string& ExecEnv::token() const {
     return _cluster_info->token;
+}
+
+void ExecEnv::clear_stream_mgr() {
+    if (_vstream_mgr) {
+        SAFE_DELETE(_vstream_mgr);
+    }
 }
 
 std::vector<TFrontendInfo> ExecEnv::get_frontends() {
@@ -175,6 +177,13 @@ void ExecEnv::wait_for_all_tasks_done() {
         sleep(1);
         ++wait_seconds_passed;
     }
+    // This is a conservative strategy.
+    // Because a query might still have fragments running on other BE nodes.
+    // In other words, the query hasn't truly terminated.
+    // If the current BE is shut down at this point,
+    // the FE will detect the downtime of a related BE and cancel the entire query,
+    // defeating the purpose of a graceful stop.
+    sleep(config::grace_shutdown_post_delay_seconds);
 }
 
 bool ExecEnv::check_auth_token(const std::string& auth_token) {

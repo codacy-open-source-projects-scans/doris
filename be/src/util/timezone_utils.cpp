@@ -35,12 +35,14 @@
 #include <memory>
 #include <string>
 
+#include "common/exception.h"
 #include "common/logging.h"
 #include "common/status.h"
 
 using boost::algorithm::to_lower_copy;
 
 namespace fs = std::filesystem;
+#include "common/compile_check_begin.h"
 
 namespace doris {
 
@@ -59,7 +61,7 @@ static const char* tzdir = "/usr/share/zoneinfo"; // default value, may change b
 void TimezoneUtils::clear_timezone_caches() {
     lower_zone_cache_->clear();
 }
-int TimezoneUtils::cache_size() {
+size_t TimezoneUtils::cache_size() {
     return lower_zone_cache_->size();
 }
 
@@ -83,22 +85,28 @@ void TimezoneUtils::load_timezones_to_cache() {
 
     const auto root_path = fs::path {base_str};
     if (!exists(root_path)) {
-        LOG(FATAL) << "Cannot find system tzfile. Doris exiting!";
-        __builtin_unreachable();
+        throw Exception(Status::FatalError("Cannot find system tzfile. Doris exiting!"));
     }
 
     std::set<std::string> ignore_paths = {"posix", "right"}; // duplications. ignore them.
 
     for (fs::recursive_directory_iterator it {base_str}; it != end(it); it++) {
         const auto& dir_entry = *it;
-        if (dir_entry.is_regular_file() ||
-            (dir_entry.is_symlink() && is_regular_file(read_symlink(dir_entry)))) {
-            auto tz_name = dir_entry.path().string().substr(base_str.length());
-            if (!parse_save_name_tz(tz_name)) {
-                LOG(WARNING) << "Meet illegal tzdata file: " << tz_name << ". skipped";
+        try {
+            if (dir_entry.is_regular_file() ||
+                (dir_entry.is_symlink() && is_regular_file(read_symlink(dir_entry)))) {
+                auto tz_name = dir_entry.path().string().substr(base_str.length());
+                if (!parse_save_name_tz(tz_name)) {
+                    LOG(WARNING) << "Meet illegal tzdata file: " << tz_name << ". skipped";
+                }
+            } else if (dir_entry.is_directory() &&
+                       ignore_paths.contains(dir_entry.path().filename())) {
+                it.disable_recursion_pending();
             }
-        } else if (dir_entry.is_directory() && ignore_paths.contains(dir_entry.path().filename())) {
-            it.disable_recursion_pending();
+        } catch (const fs::filesystem_error& e) {
+            // maybe symlink loop or to nowhere...
+            LOG(WARNING) << "filesystem error when loading timezone file from " << dir_entry.path()
+                         << ": " << e.what();
         }
     }
     // some special cases. Z = Zulu. CST = Asia/Shanghai
@@ -178,4 +186,5 @@ bool TimezoneUtils::parse_tz_offset_string(const std::string& timezone, cctz::ti
     return false;
 }
 
+#include "common/compile_check_end.h"
 } // namespace doris

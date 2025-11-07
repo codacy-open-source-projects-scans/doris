@@ -18,6 +18,8 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("aggOnAggMV5") {
+    // this mv rewrite would not be rewritten in RBO phase, so set TRY_IN_RBO explicitly to make case stable
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
     sql "SET experimental_enable_nereids_planner=true"
     sql "SET enable_fallback_to_original_planner=false"
     sql """ DROP TABLE IF EXISTS aggOnAggMV5; """
@@ -36,14 +38,19 @@ suite ("aggOnAggMV5") {
     sql """alter table aggOnAggMV5 modify column time_col set stats ('row_count'='4');"""
 
     sql """insert into aggOnAggMV5 values("2020-01-01",1,"a",1,1,1);"""
+    sql """insert into aggOnAggMV5 values("2020-01-01",1,"a",1,1,1);"""
+    sql """insert into aggOnAggMV5 values("2020-01-02",2,"b",2,2,2);"""
     sql """insert into aggOnAggMV5 values("2020-01-02",2,"b",2,2,2);"""
     sql """insert into aggOnAggMV5 values("2020-01-03",3,"c",3,3,3);"""
+    sql """insert into aggOnAggMV5 values("2020-01-03",3,"c",3,3,3);"""
 
-    createMV("create materialized view aggOnAggMV5_mv as select deptno, commission, sum(salary) from aggOnAggMV5 group by deptno, commission;")
+    createMV("create materialized view aggOnAggMV5_mv as select deptno as a1, commission as a2, sum(salary) from aggOnAggMV5 group by deptno, commission;")
 
     sql """insert into aggOnAggMV5 values("2020-01-01",1,"a",1,1,1);"""
 
     sql "analyze table aggOnAggMV5 with sync;"
+    sql """alter table aggOnAggMV5 modify column commission set stats ('row_count'='8');"""
+
 
     mv_rewrite_fail("select * from aggOnAggMV5 order by empid;", "aggOnAggMV5_mv")
     

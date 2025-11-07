@@ -46,8 +46,6 @@ dataPath = "${DORIS_HOME}/regression-test/data"
 pluginPath = "${DORIS_HOME}/regression-test/plugins"
 realDataPath = "${DORIS_HOME}/regression-test/realdata"
 trinoPluginsPath = "/tmp/trino_connector"
-// sf1DataPath can be url like "https://doris-community-test-1308700295.cos.ap-hongkong.myqcloud.com" or local path like "/data"
-//sf1DataPath = "https://doris-community-test-1308700295.cos.ap-hongkong.myqcloud.com"
 
 // will test <group>/<suite>.groovy
 // empty group will test all group
@@ -105,7 +103,6 @@ mariadb_10_port=3326
 // To enable jdbc test, you need first start hive container.
 // See `docker/thirdparties/start-thirdparties-docker.sh`
 enableHiveTest=true
-enablePaimonTest=enable_deprecated_case
 
 // port of hive2 docker
 hive2HmsPort=9083
@@ -124,11 +121,24 @@ hive3PgPort=5732
 // See `docker/thirdparties/start-thirdparties-docker.sh`
 enableKafkaTest=true
 kafka_port=19193
+// refactor params
+enableRefactorParamsTest=true
 
 // iceberg test config
 iceberg_rest_uri_port=18181
+iceberg_rest_uri_port_s3=19181
+iceberg_rest_uri_port_oss=19182
+iceberg_rest_uri_port_cos=19183
+iceberg_rest_uri_port_obs=19184
+iceberg_rest_uri_port_gcs=19185
+iceberg_rest_uri_port_hdfs=19186
+iceberg_rest_hdfs_port=20020
 iceberg_minio_port=19001
 enableIcebergTest=true
+
+// polaris rest catalog config
+polaris_rest_uri_port=20181
+polaris_minio_port=20001
 
 enableEsTest=true
 es_5_port=59200
@@ -138,7 +148,8 @@ es_8_port=39200
 
 cacheDataPath = "/data/regression/"
 
-s3Source="aliyun"
+s3Source = "aliyun"
+s3Endpoint = "oss-cn-hongkong-internal.aliyuncs.com"
 
 // for multi cloud test case, eg. paimon_base_filesystem
 aliYunAk="***********"
@@ -170,7 +181,11 @@ enableTrinoConnectorTest = true
 enableKerberosTest = true
 kerberosHmsPort=9883
 kerberosHdfsPort=8820
+enableNonCatalogKerberosTest = true
 
 
 // LakeSoul catalog test config
 enableLakesoulTest = true
+
+// AWS iam role config
+

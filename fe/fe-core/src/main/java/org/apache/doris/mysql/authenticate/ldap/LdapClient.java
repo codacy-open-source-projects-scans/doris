@@ -72,6 +72,7 @@ public class LdapClient {
             contextSource.setPassword(ldapPassword);
             contextSource.afterPropertiesSet();
             ldapTemplateNoPool = new LdapTemplate(contextSource);
+            ldapTemplateNoPool.setIgnorePartialResultException(true);
         }
 
         private void setLdapTemplatePool(String ldapPassword) {
@@ -100,6 +101,7 @@ public class LdapClient {
 
             TransactionAwareContextSourceProxy proxy = new TransactionAwareContextSourceProxy(poolingContextSource);
             ldapTemplatePool = new LdapTemplate(proxy);
+            ldapTemplatePool.setIgnorePartialResultException(true);
         }
 
         public boolean checkUpdate(String ldapPassword) {
@@ -110,7 +112,7 @@ public class LdapClient {
     private void init() {
         LdapInfo ldapInfo = Env.getCurrentEnv().getAuth().getLdapInfo();
         if (ldapInfo == null || !ldapInfo.isValid()) {
-            LOG.error("info is null, maybe no ldap admin password is set.");
+            LOG.error("LDAP info is null or invalid, LDAP admin password may not be set");
             ErrorReport.report(ErrorCode.ERROR_LDAP_CONFIGURATION_ERR);
             throw new RuntimeException("ldapTemplate is not initialized");
         }
@@ -145,6 +147,7 @@ public class LdapClient {
                     .filter(getUserFilter(LdapConfig.ldap_user_filter, userName)), password);
             return true;
         } catch (Exception e) {
+            LOG.info("ldap client checkPassword failed, userName: {}", userName, e);
             return false;
         }
     }
@@ -160,18 +163,18 @@ public class LdapClient {
             return groups;
         }
         List<String> groupDns;
-
-        // Support Open Directory implementations
-        // If no group filter is configured, it defaults to querying groups based on the attribute 'member'
-        // for standard LDAP implementations
         if (!LdapConfig.ldap_group_filter.isEmpty()) {
+            // Support Open Directory implementations
+            String filter = LdapConfig.ldap_group_filter.replace("{login}", userName);
             groupDns = getDn(org.springframework.ldap.query.LdapQueryBuilder.query()
-                .base(LdapConfig.ldap_group_basedn)
-                .filter(getGroupFilter(LdapConfig.ldap_group_filter, userName)));
+                    .attributes("dn")
+                    .base(LdapConfig.ldap_group_basedn)
+                    .filter(filter));
         } else {
+            // Standard LDAP using member attribute
             groupDns = getDn(org.springframework.ldap.query.LdapQueryBuilder.query()
-                .base(LdapConfig.ldap_group_basedn)
-                .where("member").is(userDn));
+                    .base(LdapConfig.ldap_group_basedn)
+                    .where("member").is(userDn));
         }
 
         if (groupDns == null) {
@@ -206,11 +209,12 @@ public class LdapClient {
     private List<String> getDn(LdapQuery query) {
         init();
         try {
-            return clientInfo.getLdapTemplatePool().search(query, new AbstractContextMapper<String>() {
-                protected String doMapFromContext(DirContextOperations ctx) {
-                    return ctx.getNameInNamespace();
-                }
-            });
+            return clientInfo.getLdapTemplatePool().search(query,
+                    new AbstractContextMapper<String>() {
+                        protected String doMapFromContext(DirContextOperations ctx) {
+                            return ctx.getNameInNamespace();
+                        }
+                    });
         } catch (Exception e) {
             LOG.error("Get user dn fail.", e);
             ErrorReport.report(ErrorCode.ERROR_LDAP_CONFIGURATION_ERR);
@@ -220,9 +224,5 @@ public class LdapClient {
 
     private String getUserFilter(String userFilter, String userName) {
         return userFilter.replaceAll("\\{login}", userName);
-    }
-
-    private String getGroupFilter(String groupFilter, String userName) {
-        return groupFilter.replaceAll("\\{login}", userName);
     }
 }

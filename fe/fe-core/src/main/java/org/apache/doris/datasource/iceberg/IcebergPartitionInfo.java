@@ -29,18 +29,24 @@ public class IcebergPartitionInfo {
     private final Map<String, IcebergPartition> nameToIcebergPartition;
     private final Map<String, Set<String>> nameToIcebergPartitionNames;
 
-    public IcebergPartitionInfo() {
+    private static final IcebergPartitionInfo EMPTY = new IcebergPartitionInfo();
+
+    private IcebergPartitionInfo() {
         this.nameToPartitionItem = Maps.newHashMap();
         this.nameToIcebergPartition = Maps.newHashMap();
         this.nameToIcebergPartitionNames = Maps.newHashMap();
     }
 
     public IcebergPartitionInfo(Map<String, PartitionItem> nameToPartitionItem,
-                               Map<String, IcebergPartition> nameToIcebergPartition,
+                                Map<String, IcebergPartition> nameToIcebergPartition,
                                 Map<String, Set<String>> nameToIcebergPartitionNames) {
         this.nameToPartitionItem = nameToPartitionItem;
         this.nameToIcebergPartition = nameToIcebergPartition;
         this.nameToIcebergPartitionNames = nameToIcebergPartitionNames;
+    }
+
+    static IcebergPartitionInfo empty() {
+        return EMPTY;
     }
 
     public Map<String, PartitionItem> getNameToPartitionItem() {
@@ -56,11 +62,15 @@ public class IcebergPartitionInfo {
         if (icebergPartitionNames == null) {
             return nameToIcebergPartition.get(partitionName).getLastSnapshotId();
         }
-        long latestSnapshotId = 0;
+        long latestSnapshotId = -1;
         long latestUpdateTime = -1;
         for (String name : icebergPartitionNames) {
             IcebergPartition partition = nameToIcebergPartition.get(name);
             long lastUpdateTime = partition.getLastUpdateTime();
+            // Skip partitions with invalid update time (<= 0 means unknown/invalid)
+            if (lastUpdateTime <= 0) {
+                continue;
+            }
             if (latestUpdateTime < lastUpdateTime) {
                 latestUpdateTime = lastUpdateTime;
                 latestSnapshotId = partition.getLastSnapshotId();

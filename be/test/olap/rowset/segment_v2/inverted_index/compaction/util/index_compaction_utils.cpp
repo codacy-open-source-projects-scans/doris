@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <vector>
 
@@ -32,13 +33,12 @@
 #include "olap/rowset/beta_rowset.h"
 #include "olap/rowset/beta_rowset_writer.h"
 #include "olap/rowset/rowset_factory.h"
+#include "olap/rowset/segment_v2/index_file_reader.h"
 #include "olap/rowset/segment_v2/inverted_index/query/query_factory.h"
-#include "olap/rowset/segment_v2/inverted_index_file_reader.h"
 #include "olap/storage_engine.h"
 
 namespace doris {
 
-static int64_t inc_id = 1000;
 const static std::string expected_output =
         "Max Docs: 2000\n"
         "Num Docs: 2000\n"
@@ -76,8 +76,18 @@ class IndexCompactionUtils {
         std::string url;
         int num;
     };
+    struct WikiDataRow {
+        std::string title;
+        std::string content;
+        std::string redirect;
+        std::string space;
+    };
 
-    static std::vector<DataRow> read_data(const std::string file_name) {
+    template <typename T>
+    static std::vector<T> read_data(const std::string& file_name);
+
+    template <>
+    std::vector<DataRow> read_data<DataRow>(const std::string& file_name) {
         std::ifstream file(file_name);
         EXPECT_TRUE(file.is_open());
 
@@ -103,15 +113,47 @@ class IndexCompactionUtils {
         return data;
     }
 
+    template <>
+    std::vector<WikiDataRow> read_data<WikiDataRow>(const std::string& file_name) {
+        std::ifstream file(file_name);
+        EXPECT_TRUE(file.is_open());
+
+        std::vector<WikiDataRow> data;
+        std::string line;
+
+        while (std::getline(file, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            // catch parse exception and continue
+            try {
+                nlohmann::json j = nlohmann::json::parse(line);
+                WikiDataRow row;
+                row.title = j.value("title", "null");
+                row.content = j.value("content", "null");
+                row.redirect = j.value("redirect", "null");
+                row.space = j.value("space", "null");
+
+                data.emplace_back(std::move(row));
+            } catch (const std::exception& e) {
+                std::cout << "parse json error: " << e.what() << std::endl;
+                continue;
+            }
+        }
+
+        file.close();
+        return data;
+    }
+
     static bool query_bkd(const TabletIndex* index,
-                          std::shared_ptr<InvertedIndexFileReader>& inverted_index_file_reader,
+                          std::shared_ptr<IndexFileReader>& index_file_reader,
                           const std::vector<int>& query_data,
                           const std::vector<int>& query_result) {
-        const auto& idx_reader = BkdIndexReader::create_shared(index, inverted_index_file_reader);
+        const auto& idx_reader = BkdIndexReader::create_shared(index, index_file_reader);
         const auto& index_searcher_builder = std::make_unique<BKDIndexSearcherBuilder>();
-        auto dir = inverted_index_file_reader->open(index);
+        auto dir = index_file_reader->open(index);
         EXPECT_TRUE(dir.has_value());
-        auto searcher_result = index_searcher_builder->get_index_searcher(dir.value().release());
+        auto searcher_result = index_searcher_builder->get_index_searcher(dir.value().get());
         EXPECT_TRUE(searcher_result.has_value());
         auto bkd_searcher = std::get_if<BKDIndexSearcherPtr>(&searcher_result.value());
         EXPECT_TRUE(bkd_searcher != nullptr);
@@ -120,14 +162,20 @@ class IndexCompactionUtils {
         idx_reader->_value_key_coder = get_key_coder(idx_reader->_type_info->type());
 
         for (int i = 0; i < query_data.size(); i++) {
-            vectorized::Field param_value = int32_t(query_data[i]);
+            vectorized::Field param_value =
+                    vectorized::Field::create_field<TYPE_INT>(int32_t(query_data[i]));
             std::unique_ptr<segment_v2::InvertedIndexQueryParamFactory> query_param = nullptr;
             EXPECT_TRUE(segment_v2::InvertedIndexQueryParamFactory::create_query_value(
                                 PrimitiveType::TYPE_INT, &param_value, query_param)
                                 .ok());
             auto result = std::make_shared<roaring::Roaring>();
+            OlapReaderStatistics stats;
+
+            IndexQueryContextPtr context = std::make_shared<IndexQueryContext>();
+            context->stats = &stats;
+
             EXPECT_TRUE(idx_reader
-                                ->invoke_bkd_query(query_param->get_value(),
+                                ->invoke_bkd_query(context, query_param->get_value(),
                                                    InvertedIndexQueryType::EQUAL_QUERY,
                                                    *bkd_searcher, result)
                                 .ok());
@@ -137,29 +185,36 @@ class IndexCompactionUtils {
     }
 
     static bool query_string(const TabletIndex* index,
-                             std::shared_ptr<InvertedIndexFileReader>& inverted_index_file_reader,
+                             std::shared_ptr<IndexFileReader>& index_file_reader,
                              const std::string& column_name,
                              const std::vector<std::string>& query_data,
                              const std::vector<int>& query_result) {
         const auto& idx_reader =
-                StringTypeInvertedIndexReader::create_shared(index, inverted_index_file_reader);
+                StringTypeInvertedIndexReader::create_shared(index, index_file_reader);
         const auto& index_searcher_builder = std::make_unique<FulltextIndexSearcherBuilder>();
-        auto dir = inverted_index_file_reader->open(index);
+        auto dir = index_file_reader->open(index);
         EXPECT_TRUE(dir.has_value());
-        auto searcher_result = index_searcher_builder->get_index_searcher(dir.value().release());
+        auto searcher_result = index_searcher_builder->get_index_searcher(dir.value().get());
         EXPECT_TRUE(searcher_result.has_value());
         auto string_searcher = std::get_if<FulltextIndexSearcherPtr>(&searcher_result.value());
         EXPECT_TRUE(string_searcher != nullptr);
         std::wstring column_name_ws = StringUtil::string_to_wstring(column_name);
 
         for (int i = 0; i < query_data.size(); i++) {
-            TQueryOptions queryOptions;
+            OlapReaderStatistics stats;
+            RuntimeState runtime_state;
+            io::IOContext io_ctx;
+
+            IndexQueryContextPtr context = std::make_shared<IndexQueryContext>();
+            context->io_ctx = &io_ctx;
+            context->stats = &stats;
+            context->runtime_state = &runtime_state;
             auto query = QueryFactory::create(InvertedIndexQueryType::EQUAL_QUERY, *string_searcher,
-                                              queryOptions, nullptr);
+                                              context);
             EXPECT_TRUE(query != nullptr);
             InvertedIndexQueryInfo query_info;
             query_info.field_name = column_name_ws;
-            query_info.terms.emplace_back(query_data[i]);
+            query_info.term_infos.emplace_back(query_data[i], 0);
             query->add(query_info);
             auto result = std::make_shared<roaring::Roaring>();
             query->search(*result);
@@ -169,29 +224,35 @@ class IndexCompactionUtils {
     }
 
     static bool query_fulltext(const TabletIndex* index,
-                               std::shared_ptr<InvertedIndexFileReader>& inverted_index_file_reader,
+                               std::shared_ptr<IndexFileReader>& index_file_reader,
                                const std::string& column_name,
                                const std::vector<std::string>& query_data,
                                const std::vector<int>& query_result) {
-        const auto& idx_reader =
-                FullTextIndexReader::create_shared(index, inverted_index_file_reader);
+        const auto& idx_reader = FullTextIndexReader::create_shared(index, index_file_reader);
         const auto& index_searcher_builder = std::make_unique<FulltextIndexSearcherBuilder>();
-        auto dir = inverted_index_file_reader->open(index);
+        auto dir = index_file_reader->open(index);
         EXPECT_TRUE(dir.has_value());
-        auto searcher_result = index_searcher_builder->get_index_searcher(dir.value().release());
+        auto searcher_result = index_searcher_builder->get_index_searcher(dir.value().get());
         EXPECT_TRUE(searcher_result.has_value());
         auto string_searcher = std::get_if<FulltextIndexSearcherPtr>(&searcher_result.value());
         EXPECT_TRUE(string_searcher != nullptr);
         std::wstring column_name_ws = StringUtil::string_to_wstring(column_name);
 
         for (int i = 0; i < query_data.size(); i++) {
-            TQueryOptions queryOptions;
+            OlapReaderStatistics stats;
+            RuntimeState runtime_state;
+            io::IOContext io_ctx;
+
+            IndexQueryContextPtr context = std::make_shared<IndexQueryContext>();
+            context->io_ctx = &io_ctx;
+            context->stats = &stats;
+            context->runtime_state = &runtime_state;
             auto query = QueryFactory::create(InvertedIndexQueryType::MATCH_ANY_QUERY,
-                                              *string_searcher, queryOptions, nullptr);
+                                              *string_searcher, context);
             EXPECT_TRUE(query != nullptr);
             InvertedIndexQueryInfo query_info;
             query_info.field_name = column_name_ws;
-            query_info.terms.emplace_back(query_data[i]);
+            query_info.term_infos.emplace_back(query_data[i], 0);
             query->add(query_info);
             auto result = std::make_shared<roaring::Roaring>();
             query->search(*result);
@@ -201,7 +262,7 @@ class IndexCompactionUtils {
     }
 
     static void check_terms_stats(lucene::store::Directory* dir, std::ostream& os = std::cout) {
-        IndexReader* r = IndexReader::open(dir);
+        lucene::index::IndexReader* r = lucene::index::IndexReader::open(dir);
 
         os << "Max Docs: " << r->maxDoc() << "\n";
         os << "Num Docs: " << r->numDocs() << "\n";
@@ -233,85 +294,82 @@ class IndexCompactionUtils {
         r->close();
         _CLLDELETE(r);
     }
-    static Status check_idx_file_correctness(lucene::store::Directory* index_reader,
-                                             lucene::store::Directory* tmp_index_reader) {
-        lucene::index::IndexReader* idx_reader = lucene::index::IndexReader::open(index_reader);
-        lucene::index::IndexReader* tmp_idx_reader =
-                lucene::index::IndexReader::open(tmp_index_reader);
-
+    static Status check_idx_file_correctness_impl(lucene::index::IndexReader* idx_reader,
+                                                  lucene::index::IndexReader* normal_idx_reader) {
         // compare numDocs
-        if (idx_reader->numDocs() != tmp_idx_reader->numDocs()) {
+        if (idx_reader->numDocs() != normal_idx_reader->numDocs()) {
             return Status::InternalError(
                     "index compaction correctness check failed, numDocs not equal, idx_numDocs={}, "
-                    "tmp_idx_numDocs={}",
-                    idx_reader->numDocs(), tmp_idx_reader->numDocs());
+                    "normal_idx_numDocs={}",
+                    idx_reader->numDocs(), normal_idx_reader->numDocs());
         }
 
         lucene::index::TermEnum* term_enum = idx_reader->terms();
-        lucene::index::TermEnum* tmp_term_enum = tmp_idx_reader->terms();
+        lucene::index::TermEnum* normal_term_enum = normal_idx_reader->terms();
         lucene::index::TermDocs* term_docs = nullptr;
-        lucene::index::TermDocs* tmp_term_docs = nullptr;
+        lucene::index::TermDocs* normal_term_docs = nullptr;
 
         // iterate TermEnum
-        while (term_enum->next() && tmp_term_enum->next()) {
+        while (term_enum->next() && normal_term_enum->next()) {
             std::string token = lucene_wcstoutf8string(term_enum->term(false)->text(),
                                                        term_enum->term(false)->textLength());
             std::string field = lucene_wcstoutf8string(
                     term_enum->term(false)->field(), lenOfString(term_enum->term(false)->field()));
-            std::string tmp_token = lucene_wcstoutf8string(
-                    tmp_term_enum->term(false)->text(), tmp_term_enum->term(false)->textLength());
-            std::string tmp_field =
-                    lucene_wcstoutf8string(tmp_term_enum->term(false)->field(),
-                                           lenOfString(tmp_term_enum->term(false)->field()));
+            std::string normal_token =
+                    lucene_wcstoutf8string(normal_term_enum->term(false)->text(),
+                                           normal_term_enum->term(false)->textLength());
+            std::string normal_field =
+                    lucene_wcstoutf8string(normal_term_enum->term(false)->field(),
+                                           lenOfString(normal_term_enum->term(false)->field()));
             // compare token and field
-            if (field != tmp_field) {
+            if (field != normal_field) {
                 return Status::InternalError(
                         "index compaction correctness check failed, fields not equal, field={}, "
-                        "tmp_field={}",
+                        "normal_field={}",
                         field, field);
             }
-            if (token != tmp_token) {
+            if (token != normal_token) {
                 return Status::InternalError(
                         "index compaction correctness check failed, tokens not equal, token={}, "
-                        "tmp_token={}",
-                        token, tmp_token);
+                        "normal_token={}",
+                        token, normal_token);
             }
 
             // get term's docId and freq
             term_docs = idx_reader->termDocs(term_enum->term(false));
-            tmp_term_docs = tmp_idx_reader->termDocs(tmp_term_enum->term(false));
+            normal_term_docs = normal_idx_reader->termDocs(normal_term_enum->term(false));
 
             // compare term's docId and freq
-            while (term_docs->next() && tmp_term_docs->next()) {
-                if (term_docs->doc() != tmp_term_docs->doc() ||
-                    term_docs->freq() != tmp_term_docs->freq()) {
+            while (term_docs->next() && normal_term_docs->next()) {
+                if (term_docs->doc() != normal_term_docs->doc() ||
+                    term_docs->freq() != normal_term_docs->freq()) {
                     return Status::InternalError(
                             "index compaction correctness check failed, docId or freq not equal, "
-                            "docId={}, tmp_docId={}, freq={}, tmp_freq={}",
-                            term_docs->doc(), tmp_term_docs->doc(), term_docs->freq(),
-                            tmp_term_docs->freq());
+                            "docId={}, normal_docId={}, freq={}, normal_freq={}",
+                            term_docs->doc(), normal_term_docs->doc(), term_docs->freq(),
+                            normal_term_docs->freq());
                 }
             }
 
             // check if there are remaining docs
-            if (term_docs->next() || tmp_term_docs->next()) {
+            if (term_docs->next() || normal_term_docs->next()) {
                 return Status::InternalError(
                         "index compaction correctness check failed, number of docs not equal for "
-                        "term={}, tmp_term={}",
-                        token, tmp_token);
+                        "term={}, normal_term={}",
+                        token, normal_token);
             }
             if (term_docs) {
                 term_docs->close();
                 _CLLDELETE(term_docs);
             }
-            if (tmp_term_docs) {
-                tmp_term_docs->close();
-                _CLLDELETE(tmp_term_docs);
+            if (normal_term_docs) {
+                normal_term_docs->close();
+                _CLLDELETE(normal_term_docs);
             }
         }
 
         // check if there are remaining terms
-        if (term_enum->next() || tmp_term_enum->next()) {
+        if (term_enum->next() || normal_term_enum->next()) {
             return Status::InternalError(
                     "index compaction correctness check failed, number of terms not equal");
         }
@@ -319,42 +377,79 @@ class IndexCompactionUtils {
             term_enum->close();
             _CLLDELETE(term_enum);
         }
-        if (tmp_term_enum) {
-            tmp_term_enum->close();
-            _CLLDELETE(tmp_term_enum);
+        if (normal_term_enum) {
+            normal_term_enum->close();
+            _CLLDELETE(normal_term_enum);
         }
         if (idx_reader) {
             idx_reader->close();
             _CLLDELETE(idx_reader);
         }
-        if (tmp_idx_reader) {
-            tmp_idx_reader->close();
-            _CLLDELETE(tmp_idx_reader);
+        if (normal_idx_reader) {
+            normal_idx_reader->close();
+            _CLLDELETE(normal_idx_reader);
         }
         return Status::OK();
+    }
+
+    static Status check_idx_file_correctness(lucene::store::Directory* index_reader,
+                                             lucene::store::Directory* normal_index_reader) {
+        lucene::index::IndexReader* idx_reader = lucene::index::IndexReader::open(index_reader);
+        lucene::index::IndexReader* normal_idx_reader =
+                lucene::index::IndexReader::open(normal_index_reader);
+
+        return check_idx_file_correctness_impl(idx_reader, normal_idx_reader);
+    }
+
+    static Status check_idx_file_correctness(
+            const std::vector<std::unique_ptr<DorisCompoundReader, DirectoryDeleter>>&
+                    index_readers,
+            const std::vector<std::unique_ptr<DorisCompoundReader, DirectoryDeleter>>&
+                    normal_index_readers) {
+        ValueArray<lucene::index::IndexReader*> readers(index_readers.size());
+        for (int i = 0; i < index_readers.size(); i++) {
+            lucene::index::IndexReader* idx_reader =
+                    lucene::index::IndexReader::open(index_readers[i].get());
+            readers[i] = idx_reader;
+        }
+        ValueArray<lucene::index::IndexReader*> normal_readers(normal_index_readers.size());
+        for (int i = 0; i < normal_index_readers.size(); i++) {
+            lucene::index::IndexReader* normal_idx_reader =
+                    lucene::index::IndexReader::open(normal_index_readers[i].get());
+            normal_readers[i] = normal_idx_reader;
+        }
+
+        auto* idx_reader = new lucene::index::MultiReader(&readers, true);
+        auto* normal_idx_reader = new lucene::index::MultiReader(&normal_readers, true);
+
+        return check_idx_file_correctness_impl(idx_reader, normal_idx_reader);
     }
 
     static Status do_compaction(
             const std::vector<RowsetSharedPtr>& rowsets, StorageEngine* engine_ref,
             const TabletSharedPtr& tablet, bool is_index_compaction, RowsetSharedPtr& rowset_ptr,
             const std::function<void(const BaseCompaction&, const RowsetWriterContext&)>
-                    custom_check = nullptr) {
+                    custom_check = nullptr,
+            int64_t max_rows_per_segment = 100000) {
         config::inverted_index_compaction_enable = is_index_compaction;
+        // control max rows in one block
+        config::compaction_batch_size = max_rows_per_segment;
         // only base compaction can handle delete predicate
         BaseCompaction compaction(*engine_ref, tablet);
         compaction._input_rowsets = std::move(rowsets);
-        compaction.build_basic_info();
+        RETURN_IF_ERROR(compaction.build_basic_info());
 
         std::vector<RowsetReaderSharedPtr> input_rs_readers;
         create_input_rowsets_readers(compaction, input_rs_readers);
 
         RowsetWriterContext ctx;
+        ctx.max_rows_per_segment = max_rows_per_segment;
         RETURN_IF_ERROR(compaction.construct_output_rowset_writer(ctx));
 
         compaction._stats.rowid_conversion = compaction._rowid_conversion.get();
         RETURN_IF_ERROR(Merger::vertical_merge_rowsets(
                 tablet, compaction.compaction_type(), *(compaction._cur_tablet_schema),
-                input_rs_readers, compaction._output_rs_writer.get(), 100000, 5,
+                input_rs_readers, compaction._output_rs_writer.get(), max_rows_per_segment - 1, 5,
                 &compaction._stats));
 
         const auto& dst_writer =
@@ -370,6 +465,7 @@ class IndexCompactionUtils {
         if (custom_check) {
             custom_check(compaction, ctx);
         }
+        std::cout << "finish compaction" << std::endl;
 
         rowset_ptr = std::move(compaction._output_rowset);
         return Status::OK();
@@ -386,7 +482,7 @@ class IndexCompactionUtils {
     }
 
     static void check_idx_file_writer_closed(BaseBetaRowsetWriter* writer, bool closed) {
-        for (const auto& [seg_id, idx_file_writer] : writer->inverted_index_file_writers()) {
+        for (const auto& [seg_id, idx_file_writer] : writer->index_file_writers()) {
             EXPECT_EQ(idx_file_writer->_closed, closed);
         }
     }
@@ -409,36 +505,41 @@ class IndexCompactionUtils {
     }
 
     static RowsetSharedPtr create_delete_predicate_rowset(const TabletSchemaSPtr& schema,
-                                                          std::string pred, int64_t version) {
+                                                          std::string pred, int64_t& inc_id) {
         DeletePredicatePB del_pred;
         del_pred.add_sub_predicates(pred);
         del_pred.set_version(1);
         RowsetMetaSharedPtr rsm(new RowsetMeta());
-        init_rs_meta(rsm, version, version);
+        init_rs_meta(rsm, inc_id, inc_id);
         RowsetId id;
-        id.init(version);
+        id.init(inc_id);
         rsm->set_rowset_id(id);
         rsm->set_delete_predicate(std::move(del_pred));
         rsm->set_tablet_schema(schema);
+        inc_id++;
         return std::make_shared<BetaRowset>(schema, rsm, "");
     }
 
     static void construct_column(ColumnPB* column_pb, TabletIndexPB* tablet_index, int64_t index_id,
                                  const std::string& index_name, int32_t col_unique_id,
                                  const std::string& column_type, const std::string& column_name,
-                                 bool parser = false) {
+                                 const std::map<std::string, std::string>& properties =
+                                         std::map<std::string, std::string>(),
+                                 bool is_key = false) {
         column_pb->set_unique_id(col_unique_id);
         column_pb->set_name(column_name);
         column_pb->set_type(column_type);
-        column_pb->set_is_key(false);
+        column_pb->set_is_key(is_key);
         column_pb->set_is_nullable(true);
         tablet_index->set_index_id(index_id);
         tablet_index->set_index_name(index_name);
         tablet_index->set_index_type(IndexType::INVERTED);
         tablet_index->add_col_unique_id(col_unique_id);
-        if (parser) {
-            auto* properties = tablet_index->mutable_properties();
-            (*properties)[INVERTED_INDEX_PARSER_KEY] = INVERTED_INDEX_PARSER_UNICODE;
+        if (!properties.empty()) {
+            auto* pros = tablet_index->mutable_properties();
+            for (const auto& [key, value] : properties) {
+                (*pros)[key] = value;
+            }
         }
     }
 
@@ -485,18 +586,18 @@ class IndexCompactionUtils {
         EXPECT_TRUE(seg_path.has_value());
         const auto& index_file_path_prefix =
                 InvertedIndexDescriptor::get_index_file_path_prefix(seg_path.value());
-        auto inverted_index_file_reader = std::make_shared<InvertedIndexFileReader>(
+        auto index_file_reader = std::make_shared<IndexFileReader>(
                 fs, std::string(index_file_path_prefix),
                 tablet_schema->get_inverted_index_storage_format(), index_info);
-        EXPECT_TRUE(inverted_index_file_reader->init().ok());
-        const auto& dirs = inverted_index_file_reader->get_all_directories();
+        EXPECT_TRUE(index_file_reader->init().ok());
+        const auto& dirs = index_file_reader->get_all_directories();
         EXPECT_TRUE(dirs.has_value());
         EXPECT_EQ(dirs.value().size(), 4);
 
         for (const auto& [col_uid, query_data] : query_map) {
             const auto& column = tablet_schema->column_by_uid(col_uid);
-            const auto* index = tablet_schema->inverted_index(column);
-            EXPECT_TRUE(index != nullptr);
+            auto indexs = tablet_schema->inverted_indexs(column);
+            EXPECT_FALSE(indexs.empty());
 
             if (col_uid == 0 || col_uid == 3) {
                 // BKD index
@@ -504,24 +605,25 @@ class IndexCompactionUtils {
                 for (const auto& data : query_data.first) {
                     query_data_int.push_back(std::stoi(data));
                 }
-                EXPECT_TRUE(query_bkd(index, inverted_index_file_reader, query_data_int,
-                                      query_data.second));
+                EXPECT_TRUE(
+                        query_bkd(indexs[0], index_file_reader, query_data_int, query_data.second));
             } else if (col_uid == 1) {
                 // String index
-                EXPECT_TRUE(query_string(index, inverted_index_file_reader, std::to_string(col_uid),
+                EXPECT_TRUE(query_string(indexs[0], index_file_reader, std::to_string(col_uid),
                                          query_data.first, query_data.second));
             } else if (col_uid == 2) {
                 // Fulltext index
-                EXPECT_TRUE(query_fulltext(index, inverted_index_file_reader,
-                                           std::to_string(col_uid), query_data.first,
-                                           query_data.second));
+                EXPECT_TRUE(query_fulltext(indexs[0], index_file_reader, std::to_string(col_uid),
+                                           query_data.first, query_data.second));
             }
         }
     }
 
     static RowsetWriterContext rowset_writer_context(const std::unique_ptr<DataDir>& data_dir,
                                                      const TabletSchemaSPtr& schema,
-                                                     const std::string& tablet_path) {
+                                                     const std::string& tablet_path,
+                                                     int64_t& inc_id,
+                                                     int64_t max_rows_per_segment = 200) {
         RowsetWriterContext context;
         RowsetId rowset_id;
         rowset_id.init(inc_id);
@@ -532,23 +634,28 @@ class IndexCompactionUtils {
         context.tablet_schema = schema;
         context.tablet_path = tablet_path;
         context.version = Version(inc_id, inc_id);
-        context.max_rows_per_segment = 200;
+        context.max_rows_per_segment = max_rows_per_segment;
         inc_id++;
         return context;
     }
 
+    template <typename T>
     static void build_rowsets(const std::unique_ptr<DataDir>& data_dir,
                               const TabletSchemaSPtr& schema, const TabletSharedPtr& tablet,
                               StorageEngine* engine_ref, std::vector<RowsetSharedPtr>& rowsets,
-                              const std::vector<std::string>& data_files,
-                              const std::function<void(const int32_t&)> custom_check = nullptr) {
-        std::vector<std::vector<DataRow>> data;
-        for (auto file : data_files) {
-            data.emplace_back(read_data(file));
+                              const std::vector<std::string>& data_files, int64_t& inc_id,
+                              const std::function<void(const int32_t&)> custom_check = nullptr,
+                              const bool& is_performance = false,
+                              int64_t max_rows_per_segment = 200) {
+        std::vector<std::vector<T>> data;
+        for (const auto& file : data_files) {
+            data.emplace_back(read_data<T>(file));
         }
         for (int i = 0; i < data.size(); i++) {
             const auto& res = RowsetFactory::create_rowset_writer(
-                    *engine_ref, rowset_writer_context(data_dir, schema, tablet->tablet_path()),
+                    *engine_ref,
+                    rowset_writer_context(data_dir, schema, tablet->tablet_path(), inc_id,
+                                          max_rows_per_segment),
                     false);
             EXPECT_TRUE(res.has_value()) << res.error();
             const auto& rowset_writer = res.value();
@@ -556,24 +663,64 @@ class IndexCompactionUtils {
             vectorized::Block block = schema->create_block();
             auto columns = block.mutate_columns();
             for (const auto& row : data[i]) {
-                vectorized::Field key = int32_t(row.key);
-                vectorized::Field v1(row.word);
-                vectorized::Field v2(row.url);
-                vectorized::Field v3 = int32_t(row.num);
-                columns[0]->insert(key);
-                columns[1]->insert(v1);
-                columns[2]->insert(v2);
-                columns[3]->insert(v3);
+                if constexpr (std::is_same_v<T, DataRow>) {
+                    vectorized::Field key =
+                            vectorized::Field::create_field<TYPE_INT>(int32_t(row.key));
+                    vectorized::Field v1 = vectorized::Field::create_field<TYPE_STRING>(row.word);
+                    vectorized::Field v2 = vectorized::Field::create_field<TYPE_STRING>(row.url);
+                    vectorized::Field v3 =
+                            vectorized::Field::create_field<TYPE_INT>(int32_t(row.num));
+                    columns[0]->insert(key);
+                    columns[1]->insert(v1);
+                    columns[2]->insert(v2);
+                    columns[3]->insert(v3);
+                } else if constexpr (std::is_same_v<T, WikiDataRow>) {
+                    vectorized::Field title =
+                            vectorized::Field::create_field<TYPE_STRING>(row.title);
+                    vectorized::Field content =
+                            vectorized::Field::create_field<TYPE_STRING>(row.content);
+                    vectorized::Field redirect =
+                            vectorized::Field::create_field<TYPE_STRING>(row.redirect);
+                    vectorized::Field space =
+                            vectorized::Field::create_field<TYPE_STRING>(row.space);
+                    columns[0]->insert(title);
+                    if (is_performance) {
+                        columns[1]->insert(content);
+                        columns[2]->insert(redirect);
+                        columns[3]->insert(space);
+                        if (schema->keys_type() == UNIQUE_KEYS) {
+                            uint8_t num = 0;
+                            columns[4]->insert_data((const char*)&num, sizeof(num));
+                        }
+                    } else {
+                        for (int j = 1; j < 35; j++) {
+                            columns[j]->insert(content);
+                        }
+                        columns[35]->insert(redirect);
+                        columns[36]->insert(space);
+                        if (schema->keys_type() == UNIQUE_KEYS) {
+                            uint8_t num = 0;
+                            columns[37]->insert_data((const char*)&num, sizeof(num));
+                        }
+                    }
+                }
             }
-            EXPECT_TRUE(rowset_writer->add_block(&block).ok());
-            EXPECT_TRUE(rowset_writer->flush().ok());
+
+            Status st = rowset_writer->add_block(&block);
+            EXPECT_TRUE(st.ok()) << st.to_string();
+            st = rowset_writer->flush();
+            EXPECT_TRUE(st.ok()) << st.to_string();
             const auto& dst_writer = dynamic_cast<BaseBetaRowsetWriter*>(rowset_writer.get());
 
             check_idx_file_writer_closed(dst_writer, true);
 
-            EXPECT_TRUE(rowset_writer->build(rowsets[i]).ok());
-            EXPECT_TRUE(tablet->add_rowset(rowsets[i]).ok());
-            EXPECT_TRUE(rowsets[i]->num_segments() == 5);
+            st = rowset_writer->build(rowsets[i]);
+            EXPECT_TRUE(st.ok()) << st.to_string();
+            st = tablet->add_rowset(rowsets[i]);
+            EXPECT_TRUE(st.ok()) << st.to_string();
+            EXPECT_TRUE(rowsets[i]->num_segments() ==
+                        (rowsets[i]->num_rows() / max_rows_per_segment))
+                    << rowsets[i]->num_segments();
 
             // check rowset meta and file
             for (int seg_id = 0; seg_id < rowsets[i]->num_segments(); seg_id++) {
@@ -583,18 +730,20 @@ class IndexCompactionUtils {
                 const auto& file_name = fmt::format("{}/{}_{}.idx", rowsets[i]->tablet_path(),
                                                     rowsets[i]->rowset_id().to_string(), seg_id);
                 int64_t file_size = 0;
-                EXPECT_TRUE(fs->file_size(file_name, &file_size).ok());
+                Status st = fs->file_size(file_name, &file_size);
+                EXPECT_TRUE(st.ok()) << st.to_string();
                 EXPECT_EQ(index_info.index_size(), file_size);
 
                 const auto& seg_path = rowsets[i]->segment_path(seg_id);
                 EXPECT_TRUE(seg_path.has_value());
                 const auto& index_file_path_prefix =
                         InvertedIndexDescriptor::get_index_file_path_prefix(seg_path.value());
-                auto inverted_index_file_reader = std::make_shared<InvertedIndexFileReader>(
+                auto index_file_reader = std::make_shared<IndexFileReader>(
                         fs, std::string(index_file_path_prefix),
                         schema->get_inverted_index_storage_format(), index_info);
-                EXPECT_TRUE(inverted_index_file_reader->init().ok());
-                const auto& dirs = inverted_index_file_reader->get_all_directories();
+                st = index_file_reader->init();
+                EXPECT_TRUE(st.ok()) << st.to_string();
+                const auto& dirs = index_file_reader->get_all_directories();
                 EXPECT_TRUE(dirs.has_value());
                 if (custom_check) {
                     custom_check(dirs.value().size());
@@ -603,18 +752,18 @@ class IndexCompactionUtils {
         }
     }
 
-    static std::shared_ptr<InvertedIndexFileReader> init_index_file_reader(
+    static std::shared_ptr<IndexFileReader> init_index_file_reader(
             const RowsetSharedPtr& output_rowset, const std::string& seg_path,
             const InvertedIndexStorageFormatPB& index_storage_format) {
         const auto& index_file_path_prefix =
                 InvertedIndexDescriptor::get_index_file_path_prefix(seg_path);
-        auto inverted_index_file_reader_index = std::make_shared<InvertedIndexFileReader>(
+        auto index_file_reader = std::make_shared<IndexFileReader>(
                 output_rowset->_rowset_meta->fs(), std::string(index_file_path_prefix),
                 index_storage_format);
-        auto st = inverted_index_file_reader_index->init();
+        auto st = index_file_reader->init();
         EXPECT_TRUE(st.ok()) << st.to_string();
 
-        return inverted_index_file_reader_index;
+        return index_file_reader;
     }
 };
 

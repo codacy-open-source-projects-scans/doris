@@ -71,6 +71,7 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -168,6 +169,10 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
 
     @Override
     public PhysicalProperties visitPhysicalOlapScan(PhysicalOlapScan olapScan, PlanContext context) {
+        // make sure only one fragment when use point query
+        if (context.getStatementContext().isShortCircuitQuery() && olapScan.getSelectedTabletIds().size() == 1) {
+            return PhysicalProperties.GATHER;
+        }
         return new PhysicalProperties(olapScan.getDistributionSpec());
     }
 
@@ -314,17 +319,18 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
         return new PhysicalProperties(leftOutputProperty.getDistributionSpec());
     }
 
-    @Override
-    public PhysicalProperties visitPhysicalProject(PhysicalProject<? extends Plan> project, PlanContext context) {
-        // TODO: order spec do not process since we do not use it.
-        Preconditions.checkState(childrenOutputProperties.size() == 1);
-        PhysicalProperties childProperties = childrenOutputProperties.get(0);
+    /**
+     * Derive output properties for physical project.
+     */
+    public static PhysicalProperties computeProjectOutputProperties(
+            List<NamedExpression> projects,
+            PhysicalProperties childProperties) {
         DistributionSpec childDistributionSpec = childProperties.getDistributionSpec();
         OrderSpec childOrderSpec = childProperties.getOrderSpec();
         if (childDistributionSpec instanceof DistributionSpecHash) {
             Map<ExprId, ExprId> projections = Maps.newHashMap();
             Set<ExprId> obstructions = Sets.newHashSet();
-            for (NamedExpression namedExpression : project.getProjects()) {
+            for (NamedExpression namedExpression : projects) {
                 if (namedExpression instanceof Alias) {
                     Alias alias = (Alias) namedExpression;
                     Expression child = alias.child();
@@ -340,20 +346,40 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
                                         .map(NamedExpression::getExprId)
                                         .collect(Collectors.toSet()));
                     }
+                } else {
+                    // namedExpression is slot
+                    projections.put(namedExpression.getExprId(), namedExpression.getExprId());
                 }
             }
-            if (projections.entrySet().stream().allMatch(kv -> kv.getKey().equals(kv.getValue()))) {
-                return childrenOutputProperties.get(0);
-            }
+
             DistributionSpecHash childDistributionSpecHash = (DistributionSpecHash) childDistributionSpec;
+            boolean canUseChildProperties = true;
+            for (ExprId exprId : childDistributionSpecHash.getOrderedShuffledColumns()) {
+                if (!projections.containsKey(exprId) || !projections.get(exprId).equals(exprId)) {
+                    canUseChildProperties = false;
+                    break;
+                }
+            }
+
+            if (canUseChildProperties) {
+                return childProperties;
+            }
             DistributionSpec defaultAnySpec = childDistributionSpecHash.getShuffleType() == ShuffleType.NATURAL
                     ? DistributionSpecStorageAny.INSTANCE : DistributionSpecAny.INSTANCE;
             DistributionSpec outputDistributionSpec = childDistributionSpecHash.project(
                     projections, obstructions, defaultAnySpec);
             return new PhysicalProperties(outputDistributionSpec, childOrderSpec);
         } else {
-            return childrenOutputProperties.get(0);
+            return childProperties;
         }
+    }
+
+    @Override
+    public PhysicalProperties visitPhysicalProject(PhysicalProject<? extends Plan> project, PlanContext context) {
+        // TODO: order spec do not process since we do not use it.
+        Preconditions.checkState(childrenOutputProperties.size() == 1);
+        PhysicalProperties childProperties = childrenOutputProperties.get(0);
+        return computeProjectOutputProperties(project.getProjects(), childProperties);
     }
 
     @Override
@@ -367,27 +393,19 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
             if (!groupingSets.isEmpty()) {
                 Set<Expression> intersectGroupingKeys = Utils.fastToImmutableSet(groupingSets.get(0));
                 for (int i = 1; i < groupingSets.size() && !intersectGroupingKeys.isEmpty(); i++) {
-                    intersectGroupingKeys = Sets.intersection(
-                            intersectGroupingKeys, Utils.fastToImmutableSet(groupingSets.get(i))
-                    );
+                    intersectGroupingKeys = Sets.intersection(intersectGroupingKeys,
+                            Utils.fastToImmutableSet(groupingSets.get(i))).immutableCopy();
                 }
                 List<ExprId> orderedShuffledColumns = distributionSpecHash.getOrderedShuffledColumns();
-                if (!intersectGroupingKeys.isEmpty() && intersectGroupingKeys.size()
-                        >= Sets.newHashSet(orderedShuffledColumns).size()) {
-                    boolean hashColumnsChanged = false;
-                    for (Expression intersectGroupingKey : intersectGroupingKeys) {
-                        if (!(intersectGroupingKey instanceof SlotReference)) {
-                            hashColumnsChanged = true;
-                            break;
-                        }
-                        if (!(orderedShuffledColumns.contains(((SlotReference) intersectGroupingKey).getExprId()))) {
-                            hashColumnsChanged = true;
-                            break;
-                        }
+                Set<ExprId> intersectGroupingKeysId = new HashSet<>();
+                for (Expression key : intersectGroupingKeys) {
+                    if (!(key instanceof SlotReference)) {
+                        break;
                     }
-                    if (!hashColumnsChanged) {
-                        return childrenOutputProperties.get(0);
-                    }
+                    intersectGroupingKeysId.add(((SlotReference) key).getExprId());
+                }
+                if (intersectGroupingKeysId.containsAll(orderedShuffledColumns)) {
+                    return childrenOutputProperties.get(0);
                 }
             }
             output = PhysicalProperties.createAnyFromHash((DistributionSpecHash) childDistributionSpec);
@@ -511,32 +529,42 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
                     return new PhysicalProperties(
                             DistributionSpecHash.merge(rightHashSpec, leftHashSpec, outputShuffleType)
                     );
-                } else {
+                } else if (shuffleSide == ShuffleSide.RIGHT || shuffleSide == ShuffleSide.NONE) {
                     return new PhysicalProperties(
                             DistributionSpecHash.merge(leftHashSpec, rightHashSpec, outputShuffleType)
                     );
+                } else if (shuffleSide == ShuffleSide.BOTH) {
+                    return new PhysicalProperties(
+                            DistributionSpecHash.merge(leftHashSpec, rightHashSpec, outputShuffleType)
+                                    .withShuffleTypeAndForbidColocateJoin(leftHashSpec.getShuffleType())
+                    );
+                } else {
+                    throw new AnalysisException("unknown shuffle side " + shuffleSide);
                 }
             case LEFT_SEMI_JOIN:
             case LEFT_ANTI_JOIN:
             case NULL_AWARE_LEFT_ANTI_JOIN:
             case LEFT_OUTER_JOIN:
-                if (shuffleSide == ShuffleSide.LEFT) {
+                if (shuffleSide == ShuffleSide.LEFT || shuffleSide == ShuffleSide.BOTH) {
                     return new PhysicalProperties(
                             leftHashSpec.withShuffleTypeAndForbidColocateJoin(outputShuffleType)
                     );
-                } else {
+                } else if (shuffleSide == ShuffleSide.RIGHT || shuffleSide == ShuffleSide.NONE) {
                     return new PhysicalProperties(leftHashSpec);
+                } else {
+                    throw new AnalysisException("unknown shuffle side " + shuffleSide);
                 }
             case RIGHT_SEMI_JOIN:
             case RIGHT_ANTI_JOIN:
             case RIGHT_OUTER_JOIN:
-                if (JoinUtils.couldColocateJoin(leftHashSpec, rightHashSpec, hashJoin.getHashJoinConjuncts())) {
+                if (shuffleSide == ShuffleSide.RIGHT || shuffleSide == ShuffleSide.BOTH) {
+                    return new PhysicalProperties(
+                            rightHashSpec.withShuffleTypeAndForbidColocateJoin(outputShuffleType)
+                    );
+                } else if (shuffleSide == ShuffleSide.LEFT || shuffleSide == ShuffleSide.NONE) {
                     return new PhysicalProperties(rightHashSpec);
                 } else {
-                    // retain left shuffle type, since coordinator use left most node to schedule fragment
-                    // forbid colocate join, since right table already shuffle
-                    return new PhysicalProperties(rightHashSpec.withShuffleTypeAndForbidColocateJoin(
-                            leftHashSpec.getShuffleType()));
+                    throw new AnalysisException("unknown shuffle side " + shuffleSide);
                 }
             case FULL_OUTER_JOIN:
                 return PhysicalProperties.createAnyFromHash(leftHashSpec, rightHashSpec);
@@ -615,7 +643,7 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
         return new DistributionSpecHash(anotherSideOrderedExprIds, oneSideSpec.getShuffleType());
     }
 
-    private boolean isSameHashValue(DataType originType, DataType castType) {
+    private static boolean isSameHashValue(DataType originType, DataType castType) {
         if (originType.isStringLikeType() && (castType.isVarcharType() || castType.isStringType())
                 && (castType.width() >= originType.width() || castType.width() < 0)) {
             return true;

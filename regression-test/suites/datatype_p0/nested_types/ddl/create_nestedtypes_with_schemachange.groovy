@@ -16,9 +16,9 @@
 // under the License.
 
 suite("create_nestedtypes_with_schemachange", "p0") {
-
     def create_nested_table_and_schema_change = {testTablex, nested_type, column_name, error ->
         // create basic type
+        sql "set default_variant_max_subcolumns_count = 0" 
         sql "DROP TABLE IF EXISTS $testTablex"
         sql """ CREATE TABLE $testTablex (
                      col0 BIGINT NOT NULL,  col2 int NOT NULL, col3 array<int> NULL, col4 map<int, int> NULL, col5 struct<f1: int> NULL
@@ -45,7 +45,7 @@ suite("create_nestedtypes_with_schemachange", "p0") {
             }
         }
         // desc table
-        qt_sql "DESC $testTablex"
+        qt_master_sql "DESC $testTablex"
     }
 
     // array
@@ -102,7 +102,7 @@ suite("create_nestedtypes_with_schemachange", "p0") {
             }
         }
         // desc table
-        qt_sql "DESC $testTablex"
+        qt_master_sql "DESC $testTablex"
         qt_sql_after "select * from $testTablex"
     }
 

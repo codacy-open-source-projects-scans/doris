@@ -45,6 +45,7 @@
 #include "runtime/descriptors.h"
 #include "runtime/task_execution_context.h"
 #include "runtime/thread_context.h"
+#include "runtime/workload_group/workload_group.h"
 #include "util/runtime_profile.h"
 #include "util/stopwatch.hpp"
 #include "vec/core/block.h"
@@ -71,17 +72,17 @@ class VDataStreamRecvr;
 class VDataStreamRecvr : public HasTaskExecutionCtx {
 public:
     class SenderQueue;
-    VDataStreamRecvr(VDataStreamMgr* stream_mgr, pipeline::ExchangeLocalState* parent,
-                     RuntimeState* state, const RowDescriptor& row_desc,
-                     const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id,
-                     int num_senders, bool is_merging, RuntimeProfile* profile);
+    VDataStreamRecvr(VDataStreamMgr* stream_mgr, RuntimeProfile::HighWaterMarkCounter* counter,
+                     RuntimeState* state, const TUniqueId& fragment_instance_id,
+                     PlanNodeId dest_node_id, int num_senders, bool is_merging,
+                     RuntimeProfile* profile, size_t data_queue_capacity);
 
     ~VDataStreamRecvr() override;
 
-    Status create_merger(const VExprContextSPtrs& ordering_expr,
-                         const std::vector<bool>& is_asc_order,
-                         const std::vector<bool>& nulls_first, size_t batch_size, int64_t limit,
-                         size_t offset);
+    MOCK_FUNCTION Status create_merger(const VExprContextSPtrs& ordering_expr,
+                                       const std::vector<bool>& is_asc_order,
+                                       const std::vector<bool>& nulls_first, size_t batch_size,
+                                       int64_t limit, size_t offset);
 
     std::vector<SenderQueue*> sender_queues() const { return _sender_queues; }
 
@@ -90,12 +91,12 @@ public:
                      const int64_t wait_for_worker, const uint64_t time_to_find_recvr);
 
     void add_block(Block* block, int sender_id, bool use_move);
+    std::string debug_string();
 
-    Status get_next(Block* block, bool* eos);
+    MOCK_FUNCTION Status get_next(Block* block, bool* eos);
 
     const TUniqueId& fragment_instance_id() const { return _fragment_instance_id; }
     PlanNodeId dest_node_id() const { return _dest_node_id; }
-    const RowDescriptor& row_desc() const { return _row_desc; }
 
     // Indicate that a particular sender is done. Delegated to the appropriate
     // sender queue. Called from DataStreamMgr.
@@ -103,7 +104,7 @@ public:
 
     void cancel_stream(Status exec_status);
 
-    void close();
+    MOCK_FUNCTION void close();
 
     // When the source reaches eos = true
     void set_sink_dep_always_ready() const;
@@ -111,11 +112,13 @@ public:
     // Careful: stream sender will call this function for a local receiver,
     // accessing members of receiver that are allocated by Object pool
     // in this function is not safe.
-    bool exceeds_limit(size_t block_byte_size);
+    MOCK_FUNCTION bool exceeds_limit(size_t block_byte_size);
     bool queue_exceeds_limit(size_t byte_size) const;
     bool is_closed() const { return _is_closed; }
 
     std::shared_ptr<pipeline::Dependency> get_local_channel_dependency(int sender_id);
+
+    void set_low_memory_mode() { _sender_queue_mem_limit = 1012 * 1024; }
 
 private:
     friend struct BlockSupplierSortCursorImpl;
@@ -123,9 +126,11 @@ private:
     // DataStreamMgr instance used to create this recvr. (Not owned)
     VDataStreamMgr* _mgr = nullptr;
 
-    pipeline::ExchangeLocalState* _parent = nullptr;
+    RuntimeProfile::HighWaterMarkCounter* _memory_used_counter = nullptr;
 
-    QueryThreadContext _query_thread_context;
+    std::shared_ptr<ResourceContext> _resource_ctx;
+
+    std::shared_ptr<QueryContext> _query_context;
 
     // Fragment and node id of the destination exchange node this receiver is used by.
     TUniqueId _fragment_instance_id;
@@ -142,7 +147,8 @@ private:
     std::unique_ptr<MemTracker> _mem_tracker;
     // Managed by object pool
     std::vector<SenderQueue*> _sender_queues;
-    size_t _sender_queue_mem_limit;
+
+    std::atomic<size_t> _sender_queue_mem_limit;
 
     std::unique_ptr<VSortedRunMerger> _merger;
 
@@ -169,20 +175,17 @@ private:
 
 class VDataStreamRecvr::SenderQueue {
 public:
-    SenderQueue(VDataStreamRecvr* parent_recvr, int num_senders, RuntimeProfile* profile,
+    SenderQueue(VDataStreamRecvr* parent_recvr, int num_senders,
                 std::shared_ptr<pipeline::Dependency> local_channel_dependency);
 
     ~SenderQueue();
-
-    std::shared_ptr<pipeline::Dependency> local_channel_dependency() {
-        return _local_channel_dependency;
-    }
 
     Status get_batch(Block* next_block, bool* eos);
 
     Status add_block(std::unique_ptr<PBlock> pblock, int be_number, int64_t packet_seq,
                      ::google::protobuf::Closure** done, const int64_t wait_for_worker,
                      const uint64_t time_to_find_recvr);
+    std::string debug_string();
 
     void add_block(Block* block, bool use_move);
 
@@ -196,15 +199,15 @@ public:
         _source_dependency = dependency;
     }
 
+protected:
     void add_blocks_memory_usage(int64_t size);
 
     void sub_blocks_memory_usage(int64_t size);
 
     bool exceeds_limit();
-
-protected:
     friend class pipeline::ExchangeLocalState;
-    void try_set_dep_ready_without_lock();
+
+    void set_source_ready(std::lock_guard<std::mutex>&);
 
     // To record information about several variables in the event of a DCHECK failure.
     //  DCHECK(_is_cancelled || !_block_queue.empty() || _num_remaining_senders == 0)
@@ -268,7 +271,8 @@ protected:
                 DCHECK(_pblock);
                 SCOPED_RAW_TIMER(&_deserialize_time);
                 _block = Block::create_unique();
-                RETURN_IF_ERROR_OR_CATCH_EXCEPTION(_block->deserialize(*_pblock));
+                RETURN_IF_ERROR_OR_CATCH_EXCEPTION(
+                        _block->deserialize(*_pblock, &_decompress_bytes, &_decompress_time));
             }
             block.swap(_block);
             _block.reset();
@@ -277,6 +281,8 @@ protected:
 
         size_t block_byte_size() const { return _block_byte_size; }
         int64_t deserialize_time() const { return _deserialize_time; }
+        int64_t decompress_time() const { return _decompress_time; }
+        size_t decompress_bytes() const { return _decompress_bytes; }
         BlockItem() = default;
         BlockItem(BlockUPtr&& block, size_t block_byte_size)
                 : _block(std::move(block)), _block_byte_size(block_byte_size) {}
@@ -289,6 +295,8 @@ protected:
         std::unique_ptr<PBlock> _pblock;
         size_t _block_byte_size = 0;
         int64_t _deserialize_time = 0;
+        int64_t _decompress_time = 0;
+        size_t _decompress_bytes = 0;
     };
 
     std::list<BlockItem> _block_queue;

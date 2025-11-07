@@ -19,6 +19,7 @@ suite("test_hudi_incremental", "p2,external,hudi,external_remote,external_remote
     String enabled = context.config.otherConfigs.get("enableExternalHudiTest")
     if (enabled == null || !enabled.equalsIgnoreCase("true")) {
         logger.info("disable hudi test")
+        return
     }
 
     String catalog_name = "test_hudi_incremental"
@@ -38,6 +39,8 @@ suite("test_hudi_incremental", "p2,external,hudi,external_remote,external_remote
         timestamps.eachWithIndex { timestamp, index ->
             def query_name = "qt_incremental_${index + 1}_end"
             "${query_name}" """ select count(user_id) from ${table_name}@incr('beginTime' = '${timestamp}'); """
+            query_name = "qt_incremental_${index + 1}_latest"
+            "${query_name}" """ select count(user_id) from ${table_name}@incr('beginTime' = '${timestamp}', 'endTime' = 'latest'); """
             query_name = "qt_incremental_earliest_${index + 1}"
             "${query_name}" """ select count(user_id) from ${table_name}@incr('beginTime' = 'earliest', 'endTime' = '${timestamp}'); """
             if (index > 0) {
@@ -103,17 +106,18 @@ suite("test_hudi_incremental", "p2,external,hudi,external_remote,external_remote
         "20241114152334111",
     ]
 
-    test_hudi_incremental_querys("user_activity_log_cow_non_partition", timestamps_cow_non_partition)
-    test_hudi_incremental_querys("user_activity_log_cow_partition", timestamps_cow_partition)
-    test_hudi_incremental_querys("user_activity_log_mor_non_partition", timestamps_mor_non_partition)
-    test_hudi_incremental_querys("user_activity_log_mor_partition", timestamps_mor_partition)
     sql """set force_jni_scanner=true;"""
-    // don't support incremental query for cow table by jni reader
+    // TODO: @suxiaogang223 don't support incremental query for cow table by jni reader
     // test_hudi_incremental_querys("user_activity_log_cow_non_partition", timestamps_cow_non_partition)
     // test_hudi_incremental_querys("user_activity_log_cow_partition", timestamps_cow_partition)
     test_hudi_incremental_querys("user_activity_log_mor_non_partition", timestamps_mor_non_partition)
     test_hudi_incremental_querys("user_activity_log_mor_partition", timestamps_mor_partition)
-    // sql """set force_jni_scanner=false;"""
+
+    sql """set force_jni_scanner=false;"""
+    test_hudi_incremental_querys("user_activity_log_cow_non_partition", timestamps_cow_non_partition)
+    test_hudi_incremental_querys("user_activity_log_cow_partition", timestamps_cow_partition)
+    test_hudi_incremental_querys("user_activity_log_mor_non_partition", timestamps_mor_non_partition)
+    test_hudi_incremental_querys("user_activity_log_mor_partition", timestamps_mor_partition)
 
     sql """drop catalog if exists ${catalog_name};"""
 }

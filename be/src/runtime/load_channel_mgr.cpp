@@ -126,8 +126,10 @@ Status LoadChannelMgr::_get_load_channel(std::shared_ptr<LoadChannel>& channel, 
                 return Status::OK();
             }
         }
-        return Status::InternalError("fail to add batch in load channel. unknown load_id={}",
-                                     load_id.to_string());
+        return Status::InternalError<false>(
+                "Fail to add batch in load channel: unknown load_id={}. "
+                "This may be due to a BE restart. Please retry the load.",
+                load_id.to_string());
     }
     channel = it->second;
     return Status::OK();
@@ -150,7 +152,11 @@ Status LoadChannelMgr::add_batch(const PTabletWriterAddBlockRequest& request,
         // If this is a high priority load task, do not handle this.
         // because this may block for a while, which may lead to rpc timeout.
         SCOPED_TIMER(channel->get_handle_mem_limit_timer());
-        ExecEnv::GetInstance()->memtable_memory_limiter()->handle_memtable_flush();
+        ExecEnv::GetInstance()->memtable_memory_limiter()->handle_memtable_flush(
+                [channel]() { return channel->is_cancelled(); });
+        if (channel->is_cancelled()) {
+            return Status::Cancelled("LoadChannel has been cancelled: {}.", load_id.to_string());
+        }
     }
 
     // 3. add batch to load channel

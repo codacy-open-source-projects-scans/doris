@@ -30,6 +30,8 @@
 #include "vec/common/string_ref.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
+
 class RuntimeState;
 
 namespace vectorized {
@@ -145,7 +147,7 @@ std::string SchemaColumnsScanner::_to_mysql_data_type_string(TColumnDesc& desc) 
     case TPrimitiveType::HLL: {
         return "hll";
     }
-    case TPrimitiveType::OBJECT: {
+    case TPrimitiveType::BITMAP: {
         return "bitmap";
     }
     case TPrimitiveType::JSONB: {
@@ -239,7 +241,7 @@ std::string SchemaColumnsScanner::_type_to_string(TColumnDesc& desc) {
     case TPrimitiveType::HLL: {
         return "hll";
     }
-    case TPrimitiveType::OBJECT: {
+    case TPrimitiveType::BITMAP: {
         return "bitmap";
     }
     case TPrimitiveType::JSONB: {
@@ -411,7 +413,7 @@ Status SchemaColumnsScanner::_fill_block_impl(vectorized::Block* block) {
     {
         std::vector<StringRef> strs(columns_num);
         int offset_index = 0;
-        int cur_table_index = _table_index - _desc_result.tables_offset.size();
+        int cur_table_index = int(_table_index - _desc_result.tables_offset.size());
 
         for (int i = 0; i < columns_num; ++i) {
             while (_desc_result.tables_offset[offset_index] <= i) {
@@ -609,14 +611,14 @@ Status SchemaColumnsScanner::_fill_block_impl(vectorized::Block* block) {
     // EXTRA
     {
         StringRef str = StringRef("", 0);
-        std::vector<void*> datas(columns_num, &str);
-        RETURN_IF_ERROR(fill_dest_column_for_range(block, 17, datas));
+        std::vector<void*> filled_values(columns_num, &str);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 17, filled_values));
     }
     // PRIVILEGES
     {
         StringRef str = StringRef("", 0);
-        std::vector<void*> datas(columns_num, &str);
-        RETURN_IF_ERROR(fill_dest_column_for_range(block, 18, datas));
+        std::vector<void*> filled_values(columns_num, &str);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 18, filled_values));
     }
     // COLUMN_COMMENT
     {

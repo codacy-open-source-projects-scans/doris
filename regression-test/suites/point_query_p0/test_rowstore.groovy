@@ -281,7 +281,7 @@ suite("test_rowstore", "p0,nonConcurrent") {
                "storage_format" = "V2"
                )
     """
-    sql "select /*+ SET_VAR(enable_nereids_planner=true)*/ * from table_with_column_group where k1 = 1"
+    sql "select /*+ SET_VAR(enable_nereids_planner=true, enable_short_circuit_query_access_column_store=true)*/ * from table_with_column_group where k1 = 1"
 
     sql """DROP TABLE IF EXISTS rs_query"""
     sql "set enable_decimal256 = true"
@@ -289,7 +289,7 @@ suite("test_rowstore", "p0,nonConcurrent") {
               CREATE TABLE IF NOT EXISTS rs_query (
                 `k1` int(11) NULL COMMENT "",
                 `v1` text NULL COMMENT "",
-                `v2` DECIMAL(50, 18) NULL COMMENT ""
+                `v2` DECIMALv3(50, 18) NULL COMMENT ""
               ) ENGINE=OLAP
               UNIQUE KEY(`k1`)
               DISTRIBUTED BY HASH(`k1`) BUCKETS 1

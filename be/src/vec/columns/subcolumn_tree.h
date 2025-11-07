@@ -26,13 +26,11 @@
 #include "vec/columns/column.h"
 #include "vec/common/arena.h"
 #include "vec/common/string_ref.h"
-#include "vec/data_types/data_type.h"
 #include "vec/json/path_in_data.h"
 namespace doris::vectorized {
-/// Tree that represents paths in document
-/// with additional data in nodes.
-
-template <typename NodeData>
+// Tree that represents paths in document with additional data in nodes.
+// IsShared mean this object shared above multiple tasks, need swtich to subcolumns_tree_tracker
+template <typename NodeData, bool IsShared>
 class SubcolumnsTree {
 public:
     struct Node {
@@ -72,13 +70,16 @@ public:
             kind = Kind::SCALAR;
         }
 
-        void add_child(std::string_view key, std::shared_ptr<Node> next_node, Arena& strings_pool) {
+        void add_child(std::string_view key, std::shared_ptr<Node> next_node,
+                       Arena& input_strings_pool) {
             next_node->parent = this;
             StringRef key_ref;
-            {
+            if constexpr (IsShared) {
                 SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(
                         ExecEnv::GetInstance()->subcolumns_tree_tracker());
-                key_ref = {strings_pool.insert(key.data(), key.length()), key.length()};
+                key_ref = {input_strings_pool.insert(key.data(), key.length()), key.length()};
+            } else {
+                key_ref = {input_strings_pool.insert(key.data(), key.length()), key.length()};
             }
             children[key_ref] = std::move(next_node);
         }
@@ -206,6 +207,8 @@ public:
     /// Find node that matches the path exactly.
     const Node* find_exact(const PathInData& path) const { return find_impl(path, true); }
 
+    Node* find_exact(const PathInData& path) { return find_impl(path, true); }
+
     static const Node* find_leaf(const Node* node, const NodePredicate& predicate) {
         if (!node) {
             return nullptr;
@@ -227,6 +230,15 @@ public:
     /// Find leaf by path.
     const Node* find_leaf(const PathInData& path) const {
         const auto* candidate = find_exact(path);
+        if (!candidate || !candidate->is_scalar()) {
+            return nullptr;
+        }
+        return candidate;
+    }
+
+    /// Find leaf by path.
+    Node* find_leaf(const PathInData& path) {
+        auto* candidate = find_exact(path);
         if (!candidate || !candidate->is_scalar()) {
             return nullptr;
         }
@@ -256,7 +268,7 @@ public:
             /// for the last rows.
             /// If there are no leaves, skip current node and find
             /// the next node up to the current.
-            leaf = SubcolumnsTree<NodeData>::find_leaf(node_nested, pred);
+            leaf = SubcolumnsTree<NodeData, IsShared>::find_leaf(node_nested, pred);
 
             if (leaf) {
                 break;
@@ -284,7 +296,7 @@ public:
     const Nodes& get_leaves() const { return leaves; }
     const Node* get_root() const { return root.get(); }
     const NodePtr& get_root_ptr() const { return root; }
-    Node* get_mutable_root() { return root.get(); }
+    Node* get_mutable_root() const { return root.get(); }
 
     static void get_leaves_of_node(const Node* node, std::vector<const Node*>& nodes,
                                    vectorized::PathsInData& paths) {
@@ -308,24 +320,35 @@ public:
     const_iterator end() const { return leaves.end(); }
 
     ~SubcolumnsTree() {
-        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->subcolumns_tree_tracker());
-        strings_pool.reset();
+        if constexpr (IsShared) {
+            SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(
+                    ExecEnv::GetInstance()->subcolumns_tree_tracker());
+            strings_pool.reset();
+        } else {
+            strings_pool.reset();
+        }
     }
 
     SubcolumnsTree() {
-        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(ExecEnv::GetInstance()->subcolumns_tree_tracker());
-        SCOPED_SKIP_MEMORY_CHECK();
-        strings_pool = std::make_shared<Arena>();
+        if constexpr (IsShared) {
+            SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(
+                    ExecEnv::GetInstance()->subcolumns_tree_tracker());
+            SCOPED_SKIP_MEMORY_CHECK();
+            strings_pool = std::make_shared<Arena>();
+        } else {
+            SCOPED_SKIP_MEMORY_CHECK();
+            strings_pool = std::make_shared<Arena>();
+        }
     }
 
 private:
-    const Node* find_impl(const PathInData& path, bool find_exact) const {
+    Node* find_impl(const PathInData& path, bool find_exact) const {
         if (!root) {
             return nullptr;
         }
 
         const auto& parts = path.get_parts();
-        const Node* current_node = root.get();
+        Node* current_node = root.get();
 
         for (const auto& part : parts) {
             auto it = current_node->children.find(StringRef {part.key.data(), part.key.size()});
@@ -338,6 +361,7 @@ private:
 
         return current_node;
     }
+
     std::shared_ptr<Arena> strings_pool;
     NodePtr root;
     Nodes leaves;

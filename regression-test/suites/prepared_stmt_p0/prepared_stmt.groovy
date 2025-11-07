@@ -19,12 +19,21 @@ import java.math.BigDecimal;
 import com.mysql.cj.MysqlType;
 
 suite("test_prepared_stmt", "nonConcurrent") {
+    def config_row = sql """ ADMIN SHOW FRONTEND CONFIG LIKE 'enable_decimal_conversion'; """
+    String old_value = config_row[0][1]
+    sql """
+        admin set frontend config("enable_decimal_conversion" = "true");
+    """
+    sql """ ADMIN SET FRONTEND CONFIG ("prepared_stmt_start_id" = "-1"); """
+
     def tableName = "tbl_prepared_stmt"
     def user = context.config.jdbcUser
     def password = context.config.jdbcPassword
     // def url = context.config.jdbcUrl + "&useServerPrepStmts=true&useCursorFetch=true"
     String url = getServerPrepareJdbcUrl(context.config.jdbcUrl, "regression_test_prepared_stmt_p0")
+    logger.info("jdbc prepare statement url: ${url}")
     def result1 = connect(user, password, url) {
+
         sql """DROP TABLE IF EXISTS ${tableName} """
         sql """
              CREATE TABLE IF NOT EXISTS ${tableName} (
@@ -60,8 +69,19 @@ suite("test_prepared_stmt", "nonConcurrent") {
         qt_sql """select * from  ${tableName} order by 1, 2, 3"""
         sql "set global max_prepared_stmt_count = 10000"
         sql "set enable_fallback_to_original_planner = false"
+        sql """set global enable_server_side_prepared_statement = true"""
 
-        def stmt_read = prepareStatement "select * from ${tableName} where k1 = ? order by k1"
+        int count = 65536;
+        StringBuilder sb = new StringBuilder();
+        sb.append("?");
+        for (int i = 1; i < count; i++) {
+            sb.append(", ?");
+        }
+        String sqlWithTooManyPlaceholder = sb.toString();
+        def stmt_read = prepareStatement "select * from ${tableName} where k1 in (${sqlWithTooManyPlaceholder})"
+        assertEquals(com.mysql.cj.jdbc.ClientPreparedStatement, stmt_read.class)
+
+        stmt_read = prepareStatement "select * from ${tableName} where k1 = ? order by k1"
         assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
         stmt_read.setInt(1, 1231)
         qe_select0 stmt_read
@@ -89,6 +109,7 @@ suite("test_prepared_stmt", "nonConcurrent") {
         stmt_read2.close()
 
         sql "DROP TABLE IF EXISTS mytable1"
+        sql "DROP TABLE IF EXISTS mytable2"
         sql """
           CREATE TABLE mytable1
           (
@@ -247,5 +268,142 @@ suite("test_prepared_stmt", "nonConcurrent") {
         result = stmt_read.execute()
         logger.info("connection_id: ${result}")
         // qe_select16 stmt_read
+
+        // test prepared with between, test placeholder equal
+        sql """insert into mytable2 values(3,1,'user1',10);"""
+        stmt_read = prepareStatement "SELECT COUNT() from mytable2 WHERE siteid between ? and ?"
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        stmt_read.setInt(1, 0)
+        stmt_read.setInt(2, 3)
+        qe_select17 stmt_read
+
+
+        // test array1
+        stmt_read = prepareStatement """SELECT 1, [1, 2, 3], null, ["1"], null, null, [1.111]"""
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        qe_select18 stmt_read
+
+        // test array2
+        stmt_read = prepareStatement "SELECT 1, [1, 2, 3], null"
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        qe_select18_1 stmt_read
+
+        // test array3
+        stmt_read = prepareStatement """SELECT 1, [1, null, 3], null, [null], null, null, [null, null]"""
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        qe_select18_2 stmt_read
+
+        // test map
+        stmt_read = prepareStatement """SELECT 1, {"a" : 1}, null"""
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        qe_select19 stmt_read
+
+        // test struct
+        stmt_read = prepareStatement """SELECT 1, struct('a', 1, 'doris', 'aaaaa', 1.32), null"""
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        qe_select20 stmt_read
+
+        // test nested array
+        stmt_read = prepareStatement("""SELECT 1, [[1, 2], [3, 4]], null""")
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        qe_select21 stmt_read
+
+        // test nested map
+        stmt_read = prepareStatement("""SELECT 1, {"a": {"b": 2}}, null""")
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        qe_select22 stmt_read
+
+        // test struct with array
+        stmt_read = prepareStatement("""SELECT 1, struct('name', 'doris', 'values', [1, 2, 3]), null""")
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        qe_select23 stmt_read
+
+        stmt_read = prepareStatement("""SELECT 1, null, [{'id': '1', 'name' : 'doris'}, {'id': '2', 'name': 'apache'}, null], null""")
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read.class)
+        qe_select24 stmt_read
+
+        // test date_trunc
+        stmt_read = prepareStatement "select date_trunc (? , ?)"
+        stmt_read.setString(1, "2025-08-15 11:22:33")
+        stmt_read.setString(2, "DAY")
+        qe_select25 stmt_read
+
+        sql """drop table if exists table_20_undef_partitions2_keys3_properties4_distributed_by54"""
+        sql """ CREATE TABLE IF NOT EXISTS `table_20_undef_partitions2_keys3_properties4_distributed_by54` (
+              `col_int_undef_signed` int NULL,
+              `col_int_undef_signed2` int NULL,
+              `pk` int NULL
+            ) ENGINE=OLAP
+            DUPLICATE KEY(`col_int_undef_signed`, `col_int_undef_signed2`, `pk`)
+            DISTRIBUTED BY HASH(`pk`) BUCKETS 10
+            PROPERTIES (
+            "replication_allocation" = "tag.location.default: 1",
+            "min_load_replica_num" = "-1",
+            "is_being_synced" = "false",
+            "storage_medium" = "hdd",
+            "storage_format" = "V2",
+            "inverted_index_storage_format" = "V2",
+            "light_schema_change" = "true",
+            "disable_auto_compaction" = "false",
+            "enable_single_replica_compaction" = "false",
+            "group_commit_interval_ms" = "10000",
+            "group_commit_data_bytes" = "134217728"
+            ); 
+        """
+        sql """insert into table_20_undef_partitions2_keys3_properties4_distributed_by54 values (1, 1, 1), (2, 2, 2)"""
+        stmt_read = prepareStatement "select min ( pk - ? ) pk , pk as pk from table_20_undef_partitions2_keys3_properties4_distributed_by54 tbl_alias1 group by pk having ( pk >= pk ) or ( round ( sign ( sign ( pk ) ) ) - ? < ? ) order by pk "
+        stmt_read.setString(1, "1")
+        stmt_read.setString(2, "2")
+        stmt_read.setString(3, "3")
+        qe_select26 stmt_read
     }
+
+    // test stmtId overflow
+    def result2 = connect(user, password, url) {
+        // def stmt_read1 = prepareStatement "select 1"
+        // assertEquals(com.mysql.cj.jdbc.ClientPreparedStatement, stmt_read1.class)
+        // qe_overflow_1 stmt_read1
+        // stmt_read1.close()
+        // int max
+        sql """admin set frontend config("prepared_stmt_start_id" = "2147483647");"""
+        def stmt_read2 = prepareStatement "select 2"
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read2.class)
+        qe_overflow_2 stmt_read2
+        qe_overflow_2 stmt_read2
+        stmt_read2.close()
+        // int max + 1
+        sql """admin set frontend config("prepared_stmt_start_id" = "2147483648");"""
+        def stmt_read3 = prepareStatement "select 3"
+        // overflow throw NumberFormatExceptio and fallback to ClientPreparedStatement
+        assertEquals(com.mysql.cj.jdbc.ClientPreparedStatement, stmt_read3.class)
+        qe_overflow_3 stmt_read3
+        qe_overflow_3 stmt_read3
+        stmt_read3.close()
+        // int min
+        sql """admin set frontend config("prepared_stmt_start_id" = "2147483646");"""
+        def stmt_read4 = prepareStatement "select 4"
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read4.class)
+        qe_overflow_4 stmt_read4
+        qe_overflow_4 stmt_read4
+        stmt_read4.close()
+
+        sql """admin set frontend config("prepared_stmt_start_id" = "123");"""
+        def stmt_read5 = prepareStatement "select 5"
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read5.class)
+        qe_overflow_5 stmt_read5
+        qe_overflow_5 stmt_read5
+        stmt_read5.close()
+
+        // set back
+        sql """admin set frontend config("prepared_stmt_start_id" = "-1");"""
+        def stmt_read6 = prepareStatement "select 6"
+        assertEquals(com.mysql.cj.jdbc.ServerPreparedStatement, stmt_read6.class)
+        qe_overflow_6 stmt_read6
+        qe_overflow_6 stmt_read6
+        qe_overflow_6 stmt_read6
+        stmt_read6.close()
+    }
+
+    // restore enable_decimal_conversion to old_value
+    sql """ ADMIN SET FRONTEND CONFIG ("enable_decimal_conversion" = "${old_value}"); """
 }

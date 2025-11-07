@@ -26,6 +26,8 @@
 #include "vec/data_types/data_type_factory.hpp"
 
 namespace doris {
+#include "common/compile_check_begin.h"
+
 std::vector<SchemaScanner::ColumnDesc> SchemaRoutinesScanner::_s_tbls_columns = {
         {"SPECIFIC_NAME", TYPE_VARCHAR, sizeof(StringRef), true},
         {"ROUTINE_CATALOG", TYPE_VARCHAR, sizeof(StringRef), true},
@@ -87,14 +89,14 @@ Status SchemaRoutinesScanner::get_block_from_fe() {
     std::vector<TRow> result_data = result.data_batch;
     _routines_block = vectorized::Block::create_unique();
     for (int i = 0; i < _s_tbls_columns.size(); ++i) {
-        TypeDescriptor descriptor(_s_tbls_columns[i].type);
-        auto data_type = vectorized::DataTypeFactory::instance().create_data_type(descriptor, true);
+        auto data_type = vectorized::DataTypeFactory::instance().create_data_type(
+                _s_tbls_columns[i].type, true);
         _routines_block->insert(vectorized::ColumnWithTypeAndName(
                 data_type->create_column(), data_type, _s_tbls_columns[i].name));
     }
     _routines_block->reserve(_block_rows_limit);
     if (result_data.size() > 0) {
-        int col_size = result_data[0].column_value.size();
+        auto col_size = result_data[0].column_value.size();
         if (col_size != _s_tbls_columns.size()) {
             return Status::InternalError<false>("routine table schema is not match for FE and BE");
         }
@@ -121,7 +123,7 @@ Status SchemaRoutinesScanner::get_next_block_internal(vectorized::Block* block, 
 
     if (_routines_block == nullptr) {
         RETURN_IF_ERROR(get_block_from_fe());
-        _total_rows = _routines_block->rows();
+        _total_rows = (int)_routines_block->rows();
     }
 
     if (_row_idx == _total_rows) {

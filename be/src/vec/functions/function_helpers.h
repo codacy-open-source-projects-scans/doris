@@ -20,10 +20,8 @@
 
 #pragma once
 
-#include <stddef.h>
-
+#include <cstddef>
 #include <tuple>
-#include <type_traits>
 
 #include "vec/columns/column.h"
 #include "vec/columns/column_const.h"
@@ -53,11 +51,15 @@ const Type* check_and_get_data_type(const IDataType* data_type) {
 
 template <typename Type>
 const ColumnConst* check_and_get_column_const(const IColumn* column) {
-    if (!column || !is_column_const(*column)) return {};
+    if (!column || !is_column_const(*column)) {
+        return nullptr;
+    }
 
-    const ColumnConst* res = assert_cast<const ColumnConst*, TypeCheckOnRelease::DISABLE>(column);
+    const auto* res = assert_cast<const ColumnConst*, TypeCheckOnRelease::DISABLE>(column);
 
-    if (!check_column<Type>(&res->get_data_column())) return {};
+    if (!is_column<Type>(&res->get_data_column())) {
+        return nullptr;
+    }
 
     return res;
 }
@@ -66,7 +68,9 @@ template <typename Type>
 const Type* check_and_get_column_constData(const IColumn* column) {
     const ColumnConst* res = check_and_get_column_const<Type>(column);
 
-    if (!res) return {};
+    if (!res) {
+        return nullptr;
+    }
 
     return static_cast<const Type*>(&res->get_data_column());
 }
@@ -80,16 +84,16 @@ bool check_column_const(const IColumn* column) {
 const ColumnConst* check_and_get_column_const_string_or_fixedstring(const IColumn* column);
 
 /// Transform anything to Field.
-template <typename T>
-    requires(!IsDecimalNumber<T>)
-Field to_field(const T& x) {
-    return Field(NearestFieldType<T>(x));
+template <PrimitiveType T>
+    requires(!is_decimal(T))
+Field to_field(const typename PrimitiveTypeTraits<T>::ColumnItemType& x) {
+    return Field::create_field<T>(typename PrimitiveTypeTraits<T>::NearestFieldType(x));
 }
 
-template <typename T>
-    requires IsDecimalNumber<T>
-Field to_field(const T& x, UInt32 scale) {
-    return Field(NearestFieldType<T>(x, scale));
+template <PrimitiveType T>
+    requires(is_decimal(T))
+Field to_field(const typename PrimitiveTypeTraits<T>::ColumnItemType& x, UInt32 scale) {
+    return Field::create_field<T>(typename PrimitiveTypeTraits<T>::NearestFieldType(x, scale));
 }
 
 Columns convert_const_tuple_to_constant_elements(const ColumnConst& column);

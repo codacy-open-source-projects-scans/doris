@@ -29,7 +29,6 @@
 #include "common/exception.h"
 #include "common/status.h"
 #include "util/runtime_profile.h"
-#include "vec/common/hash_table/hash_table_allocator.h"
 #include "vec/core/types.h"
 #include "vec/io/io_helper.h"
 
@@ -46,6 +45,7 @@
   *  Another example: for an approximate calculation of the number of unique visitors, there is a hash table for UniquesHashSet.
   *  It has the concept of "degree". At each overflow, cells with keys that do not divide by the corresponding power of the two are deleted.
   */
+#include "common/compile_check_begin.h"
 struct HashTableNoState {
     /// Serialization, in binary and text form.
     void write(doris::vectorized::BufferWritable&) const {}
@@ -197,12 +197,10 @@ struct HashTableCell {
     void set_mapped(const value_type& /*value*/) {}
 
     /// Serialization, in binary and text form.
-    void write(doris::vectorized::BufferWritable& wb) const {
-        doris::vectorized::write_binary(key, wb);
-    }
+    void write(doris::vectorized::BufferWritable& wb) const { wb.write_binary(key); }
 
     /// Deserialization, in binary and text form.
-    void read(doris::vectorized::BufferReadable& rb) { doris::vectorized::read_binary(key, rb); }
+    void read(doris::vectorized::BufferReadable& rb) { rb.read_binary(key); }
 };
 
 template <typename Key, typename Hash, typename State>
@@ -342,14 +340,15 @@ public:
                                    ? fill_capacity
                                    : fill_capacity + 1);
 
-        size_degree_ = num_elems <= 1 ? initial_size_degree
-                                      : (initial_size_degree > fill_capacity ? initial_size_degree
-                                                                             : fill_capacity);
+        size_degree_ =
+                uint8_t(num_elems <= 1 ? initial_size_degree
+                                       : (initial_size_degree > fill_capacity ? initial_size_degree
+                                                                              : fill_capacity));
         increase_size_degree(0);
     }
 
     void set_buf_size(size_t buf_size_) {
-        size_degree_ = static_cast<size_t>(log2(buf_size_ - 1) + 1);
+        size_degree_ = static_cast<uint8_t>(log2(buf_size_ - 1) + 1);
         increase_size_degree(0);
     }
 };
@@ -785,6 +784,18 @@ public:
         }
     }
 
+    size_t estimate_memory(size_t num_elem) const {
+        if (!add_elem_size_overflow(num_elem)) {
+            return 0;
+        }
+
+        auto new_size = num_elem + grower.buf_size();
+        Grower new_grower = grower;
+        new_grower.set(new_size);
+
+        return new_grower.buf_size() * sizeof(Cell);
+    }
+
     /// Insert a value. In the case of any more complex values, it is better to use the `emplace` function.
     std::pair<LookupResult, bool> ALWAYS_INLINE insert(const value_type& x) {
         std::pair<LookupResult, bool> res;
@@ -910,6 +921,7 @@ public:
     }
 
     ConstLookupResult ALWAYS_INLINE find(Key x) const {
+        // to call a non-const function without making any modifications, using const_cast is acceptable.
         return const_cast<std::decay_t<decltype(*this)>*>(this)->find(x);
     }
 
@@ -937,7 +949,7 @@ public:
 
     void write(doris::vectorized::BufferWritable& wb) const {
         Cell::State::write(wb);
-        doris::vectorized::write_var_uint(m_size, wb);
+        wb.write_var_uint(m_size);
 
         if (this->get_has_zero()) this->zero_value()->write(wb);
 
@@ -953,7 +965,7 @@ public:
         m_size = 0;
 
         doris::vectorized::UInt64 new_size = 0;
-        doris::vectorized::read_var_uint(new_size, rb);
+        rb.read_var_uint(new_size);
 
         free();
         Grower new_grower = grower;
@@ -1067,3 +1079,4 @@ private:
         }
     }
 };
+#include "common/compile_check_end.h"

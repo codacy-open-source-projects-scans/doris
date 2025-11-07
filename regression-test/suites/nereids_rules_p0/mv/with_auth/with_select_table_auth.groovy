@@ -112,7 +112,7 @@ suite("with_select_table_auth","p0,auth") {
     sql """analyze table lineitem with sync"""
     sql """analyze table orders with sync"""
 
-    sql """alter table orders modify column o_comment set stats ('row_count'='18');"""
+    sql """alter table orders modify column O_COMMENT set stats ('row_count'='18');"""
     sql """alter table lineitem modify column l_comment set stats ('row_count'='5');"""
 
     sql """grant select_priv on ${db}.orders to ${user_name}"""
@@ -137,6 +137,7 @@ suite("with_select_table_auth","p0,auth") {
 
     connect(user_name, "${pwd}", context.config.jdbcUrl) {
         sql "use ${db}"
+        sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
         mv_rewrite_success(
             """
             select t1.l_partkey, t1.l_suppkey, o_orderdate,

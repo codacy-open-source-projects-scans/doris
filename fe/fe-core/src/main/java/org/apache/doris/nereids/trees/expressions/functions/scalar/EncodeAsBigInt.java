@@ -33,8 +33,8 @@ import java.util.List;
 /**
  * ScalarFunction 'EncodeAsBigInt'.
  */
-public class EncodeAsBigInt extends ScalarFunction
-        implements ExplicitlyCastableSignature, PropagateNullable, EncodeStrToInteger {
+public class EncodeAsBigInt extends EncodeString
+        implements ExplicitlyCastableSignature, PropagateNullable {
 
     public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
             FunctionSignature.ret(BigIntType.INSTANCE).args(VarcharType.SYSTEM_DEFAULT)
@@ -47,13 +47,18 @@ public class EncodeAsBigInt extends ScalarFunction
         super("encode_as_bigint", arg0);
     }
 
+    /** constructor for withChildren and reuse signature */
+    private EncodeAsBigInt(ScalarFunctionParams functionParams) {
+        super(functionParams);
+    }
+
     /**
      * withChildren.
      */
     @Override
     public EncodeAsBigInt withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new EncodeAsBigInt(children.get(0));
+        return new EncodeAsBigInt(getFunctionParams(children));
 
     }
 

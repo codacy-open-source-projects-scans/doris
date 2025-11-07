@@ -29,7 +29,7 @@ suite("test_index_bkd_writer_fault_injection", "nonConcurrent") {
             `hobbies` text NULL,
             `score` int(11) NULL,
             index index_name (name) using inverted,
-            index index_hobbies (hobbies) using inverted properties("parser"="english"),
+            index index_hobbies (hobbies) using inverted properties("support_phrase" = "true", "parser" = "english", "lower_case" = "true"),
             index index_score (score) using inverted
         ) ENGINE=OLAP
         DUPLICATE KEY(`id`)
@@ -39,13 +39,13 @@ suite("test_index_bkd_writer_fault_injection", "nonConcurrent") {
     """
 
     try {
-        GetDebugPoint().enableDebugPointForAllBEs("InvertedIndexColumnWriterImpl::add_value_bkd_writer_add_throw_error")
-        logger.info("trigger_full_compaction_on_tablets with fault injection: InvertedIndexColumnWriterImpl::add_value_bkd_writer_add_throw_error")
+        GetDebugPoint().enableDebugPointForAllBEs("InvertedIndexColumnWriter::add_value_bkd_writer_add_throw_error")
+        logger.info("trigger_full_compaction_on_tablets with fault injection: InvertedIndexColumnWriter::add_value_bkd_writer_add_throw_error")
         sql """ INSERT INTO ${tableName} VALUES (1, "andy", "andy love apple", 100); """
     } catch (Exception e) {
         logger.info("error message: ${e.getMessage()}")
         assert e.getMessage().contains("packedValue should be length=xxx")
     } finally {
-        GetDebugPoint().disableDebugPointForAllBEs("InvertedIndexColumnWriterImpl::add_value_bkd_writer_add_throw_error")
+        GetDebugPoint().disableDebugPointForAllBEs("InvertedIndexColumnWriter::add_value_bkd_writer_add_throw_error")
     }
 }

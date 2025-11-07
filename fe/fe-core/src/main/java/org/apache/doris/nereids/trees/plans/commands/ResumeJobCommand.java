@@ -18,8 +18,9 @@
 package org.apache.doris.nereids.trees.plans.commands;
 
 import org.apache.doris.analysis.StmtType;
+import org.apache.doris.job.base.AbstractJob;
 import org.apache.doris.job.common.JobStatus;
-import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.job.extensions.insert.streaming.StreamingInsertJob;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.qe.ConnectContext;
@@ -29,8 +30,8 @@ import org.apache.doris.qe.StmtExecutor;
  * pause job
  */
 public class ResumeJobCommand extends AlterJobStatusCommand implements ForwardWithSync {
-    public ResumeJobCommand(Expression wildWhere) {
-        super(PlanType.RESUME_JOB_COMMAND, wildWhere);
+    public ResumeJobCommand(String jobName) {
+        super(PlanType.RESUME_JOB_COMMAND, jobName);
     }
 
     @Override
@@ -40,7 +41,12 @@ public class ResumeJobCommand extends AlterJobStatusCommand implements ForwardWi
 
     @Override
     public void doRun(ConnectContext ctx, StmtExecutor executor) throws Exception {
-        ctx.getEnv().getJobManager().alterJobStatus(super.getJobName(), JobStatus.RUNNING);
+        AbstractJob job = ctx.getEnv().getJobManager().getJobByName(super.getJobName());
+        if (job instanceof StreamingInsertJob) {
+            ctx.getEnv().getJobManager().alterJobStatus(super.getJobName(), JobStatus.PENDING, null);
+        } else {
+            ctx.getEnv().getJobManager().alterJobStatus(super.getJobName(), JobStatus.RUNNING, null);
+        }
     }
 
     @Override

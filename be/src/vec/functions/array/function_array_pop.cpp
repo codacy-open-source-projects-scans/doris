@@ -27,7 +27,6 @@
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_vector.h"
-#include "vec/columns/columns_number.h"
 #include "vec/core/block.h"
 #include "vec/core/column_numbers.h"
 #include "vec/core/column_with_type_and_name.h"
@@ -56,7 +55,7 @@ public:
     size_t get_number_of_arguments() const override { return 1; }
 
     DataTypePtr get_return_type_impl(const DataTypes& arguments) const override {
-        DCHECK(is_array(arguments[0]))
+        DCHECK(arguments[0]->get_primitive_type() == TYPE_ARRAY)
                 << "First argument for function: " << PopType::name
                 << " should be DataTypeArray but it has type " << arguments[0]->get_name() << ".";
         return arguments[0];
@@ -75,7 +74,7 @@ public:
         }
         // prepare dst array column
         bool is_nullable = src.nested_nullmap_data != nullptr;
-        ColumnArrayMutableData dst = create_mutable_data(src.nested_col, is_nullable);
+        ColumnArrayMutableData dst = create_mutable_data(src.nested_col.get(), is_nullable);
         dst.offsets_ptr->reserve(input_rows_count);
         // start from index depending on the PopType::start_offset
         auto offset_column = ColumnInt64::create(array_column->size(), PopType::start_offset);

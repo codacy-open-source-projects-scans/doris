@@ -29,18 +29,29 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndexMeta;
 import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionInfo;
+import org.apache.doris.catalog.PartitionItem;
+import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.util.Util;
 import org.apache.doris.mysql.privilege.PrivPredicate;
+import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.NereidsPlanner;
+import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.analyzer.UnboundAlias;
 import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.analyzer.UnboundSlot;
 import org.apache.doris.nereids.analyzer.UnboundTableSinkCreator;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.glue.LogicalPlanAdapter;
+import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.rules.RuleType;
+import org.apache.doris.nereids.rules.expression.rules.PartitionPruner;
+import org.apache.doris.nereids.rules.expression.rules.PartitionPruner.PartitionTableType;
+import org.apache.doris.nereids.rules.expression.rules.SortedPartitionRanges;
 import org.apache.doris.nereids.trees.expressions.And;
 import org.apache.doris.nereids.trees.expressions.ComparisonPredicate;
 import org.apache.doris.nereids.trees.expressions.Expression;
@@ -48,6 +59,7 @@ import org.apache.doris.nereids.trees.expressions.InPredicate;
 import org.apache.doris.nereids.trees.expressions.IsNull;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Not;
+import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.TinyIntLiteral;
@@ -70,22 +82,29 @@ import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.qe.VariableMgr;
+import org.apache.doris.thrift.TPartialUpdateNewRowPolicy;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
  * delete from unique key table.
  */
 public class DeleteFromCommand extends Command implements ForwardWithSync, Explainable {
+    private static final Logger LOG = LogManager.getLogger(DeleteFromCommand.class);
 
     protected final List<String> nameParts;
     protected final String tableAlias;
@@ -110,8 +129,18 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
     public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
         LogicalPlanAdapter logicalPlanAdapter = new LogicalPlanAdapter(logicalQuery, ctx.getStatementContext());
         updateSessionVariableForDelete(ctx.getSessionVariable());
-        NereidsPlanner planner = new NereidsPlanner(ctx.getStatementContext());
-        planner.plan(logicalPlanAdapter, ctx.getSessionVariable().toThrift());
+        StatementContext statementContext = ctx.getStatementContext();
+        // delete not prune predicate after partition prune
+        statementContext.setSkipPrunePredicate(true);
+        NereidsPlanner planner = new NereidsPlanner(statementContext);
+        boolean originalIsSkipAuth = ctx.isSkipAuth();
+        // delete not need select priv
+        ctx.setSkipAuth(true);
+        try {
+            planner.plan(logicalPlanAdapter, ctx.getSessionVariable().toThrift());
+        } finally {
+            ctx.setSkipAuth(originalIsSkipAuth);
+        }
         executor.setPlanner(planner);
         executor.checkBlockRules();
         // if fe could do fold constant to get delete will do nothing for table, just return.
@@ -142,7 +171,7 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
                         scan.getTable().getName(), PrivPredicate.LOAD)) {
             String message = ErrorCode.ERR_TABLEACCESS_DENIED_ERROR.formatErrorMsg("LOAD",
                     ConnectContext.get().getQualifiedUser(), ConnectContext.get().getRemoteIP(),
-                    scan.getDatabase().getFullName() + ": " + scan.getTable().getName());
+                    scan.getDatabase().getFullName() + ": " + Util.getTempTableDisplayName(scan.getTable().getName()));
             throw new AnalysisException(message);
         }
 
@@ -195,10 +224,14 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
             //  just throw exception to fallback until storage support true predicate.
             throw new AnalysisException("delete all rows is forbidden temporary.");
         }
+
+        ArrayList<String> partitionNames = Lists.newArrayList(relation.getPartNames());
+        List<Partition> selectedPartitions = getSelectedPartitions(olapTable, filter, scan, partitionNames);
+
         Env.getCurrentEnv()
                 .getDeleteHandler()
                 .process((Database) scan.getDatabase(), scan.getTable(),
-                        Lists.newArrayList(relation.getPartNames()), predicates, ctx.getState());
+                        selectedPartitions, predicates, ctx.getState(), partitionNames);
     }
 
     private void updateSessionVariableForDelete(SessionVariable sessionVariable) {
@@ -219,12 +252,60 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
         }
     }
 
+    private List<Partition> getSelectedPartitions(
+            OlapTable olapTable, PhysicalFilter<?> filter,
+            PhysicalOlapScan scan,
+            List<String> partitionNames) {
+        // For un_partitioned table, return all partitions.
+        if (olapTable.getPartitionInfo().getType().equals(PartitionType.UNPARTITIONED)) {
+            return Lists.newArrayList(olapTable.getPartitions());
+        }
+        List<Slot> partitionSlots = Lists.newArrayList();
+        for (Column c : olapTable.getPartitionColumns()) {
+            Slot partitionSlot = null;
+            // loop search is faster than build a map
+            for (Slot slot : filter.getOutput()) {
+                if (slot.getName().equalsIgnoreCase(c.getName())) {
+                    partitionSlot = slot;
+                    break;
+                }
+            }
+            if (partitionSlot != null) {
+                partitionSlots.add(partitionSlot);
+            }
+        }
+        PartitionInfo partitionInfo = olapTable.getPartitionInfo();
+        Map<Long, PartitionItem> idToPartitions = partitionInfo.getIdToItem(false);
+        Optional<SortedPartitionRanges<Long>> sortedPartitionRanges = Optional.empty();
+        // User specified partition is not empty.
+        if (partitionNames != null && !partitionNames.isEmpty()) {
+            Set<Long> partitionIds = partitionNames.stream()
+                    .map(olapTable::getPartition)
+                    .map(Partition::getId)
+                    .collect(Collectors.toSet());
+            idToPartitions = idToPartitions.keySet().stream()
+                    .filter(partitionIds::contains)
+                    .collect(Collectors.toMap(Function.identity(), idToPartitions::get));
+        } else {
+            Optional<SortedPartitionRanges<?>> sortedPartitionRangesOpt
+                    = Env.getCurrentEnv().getSortedPartitionsCacheManager().get(olapTable, scan);
+            if (sortedPartitionRangesOpt.isPresent()) {
+                sortedPartitionRanges = (Optional) sortedPartitionRangesOpt;
+            }
+        }
+        List<Long> prunedPartitions = PartitionPruner.prune(
+                partitionSlots, filter.getPredicate(), idToPartitions,
+                CascadesContext.initContext(new StatementContext(), this, PhysicalProperties.ANY),
+                PartitionTableType.OLAP, sortedPartitionRanges).first;
+        return prunedPartitions.stream().map(olapTable::getPartition).collect(Collectors.toList());
+    }
+
     private void checkColumn(Set<String> tableColumns, SlotReference slotReference, OlapTable table) {
         // 0. must slot from table
-        if (!slotReference.getColumn().isPresent()) {
+        if (!slotReference.getOriginalColumn().isPresent()) {
             throw new AnalysisException("");
         }
-        Column column = slotReference.getColumn().get();
+        Column column = slotReference.getOriginalColumn().get();
 
         if (Column.DELETE_SIGN.equalsIgnoreCase(column.getName())) {
             return;
@@ -256,11 +337,13 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
         if (!column.isKey()) {
             if (table.getKeysType() == KeysType.AGG_KEYS) {
                 throw new AnalysisException("delete predicate on value column only supports Unique table with"
-                        + " merge-on-write enabled and Duplicate table, but " + "Table[" + table.getName()
+                        + " merge-on-write enabled and Duplicate table, but " + "Table["
+                        + Util.getTempTableDisplayName(table.getName())
                         + "] is an Aggregate table.");
             } else if (table.getKeysType() == KeysType.UNIQUE_KEYS && !table.getEnableUniqueKeyMergeOnWrite()) {
                 throw new AnalysisException("delete predicate on value column only supports Unique table with"
-                        + " merge-on-write enabled and Duplicate table, but " + "Table[" + table.getName()
+                        + " merge-on-write enabled and Duplicate table, but " + "Table["
+                        + Util.getTempTableDisplayName(table.getName())
                         + "] is an unique table without merge-on-write.");
             }
         }
@@ -268,9 +351,9 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
         for (String indexName : table.getIndexNameToId().keySet()) {
             MaterializedIndexMeta meta = table.getIndexMetaByIndexId(table.getIndexIdByName(indexName));
             Set<String> columns = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-            meta.getSchema().stream()
-                    .map(col -> org.apache.doris.analysis.CreateMaterializedViewStmt.mvColumnBreaker(col.getName()))
-                    .forEach(name -> columns.add(name));
+            for (Column col : meta.getSchema()) {
+                columns.add(col.tryGetBaseColumnName());
+            }
             if (!columns.contains(column.getName())) {
                 throw new AnalysisException("Column[" + column.getName() + "] not exist in index " + indexName
                         + ". maybe you need drop the corresponding materialized-view.");
@@ -374,7 +457,7 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
 
     private OlapTable getTargetTable(ConnectContext ctx) {
         List<String> qualifiedTableName = RelationUtil.getQualifierName(ctx, nameParts);
-        TableIf table = RelationUtil.getTable(qualifiedTableName, ctx.getEnv());
+        TableIf table = RelationUtil.getTable(qualifiedTableName, ctx.getEnv(), Optional.empty());
         if (!(table instanceof OlapTable)) {
             throw new AnalysisException("table must be olapTable in delete command");
         }
@@ -391,7 +474,7 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
         List<NamedExpression> selectLists = Lists.newArrayList();
         List<String> cols = Lists.newArrayList();
         boolean isMow = targetTable.getEnableUniqueKeyMergeOnWrite();
-        String tableName = tableAlias != null ? tableAlias : targetTable.getName();
+        String tableName = tableAlias != null ? tableAlias : Util.getTempTableDisplayName(targetTable.getName());
         boolean hasClusterKey = targetTable.getBaseSchema().stream().anyMatch(Column::isClusterKey);
         boolean hasSyncMaterializedView = false;
         // currently cluster key doesn't support partial update, so we can't convert
@@ -408,7 +491,8 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
                 expr = new UnboundAlias(new TinyIntLiteral(((byte) 1)), Column.DELETE_SIGN);
             } else if (column.getName().equalsIgnoreCase(Column.SEQUENCE_COL)
                     && targetTable.getSequenceMapCol() != null) {
-                expr = new UnboundSlot(tableName, targetTable.getSequenceMapCol());
+                expr = new UnboundAlias(new UnboundSlot(tableName, targetTable.getSequenceMapCol()),
+                        Column.SEQUENCE_COL);
             } else if (column.isKey()) {
                 expr = new UnboundSlot(tableName, column.getName());
             } else if (!isMow && (!column.isVisible() || (!column.isAllowNull() && !column.hasDefaultValue()))) {
@@ -429,7 +513,8 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
         logicalQuery = handleCte(logicalQuery);
         // make UnboundTableSink
         return UnboundTableSinkCreator.createUnboundTableSink(nameParts, cols, ImmutableList.of(),
-                isTempPart, partitions, isPartialUpdate, DMLCommandType.DELETE, logicalQuery);
+                isTempPart, partitions, isPartialUpdate, TPartialUpdateNewRowPolicy.APPEND,
+                        DMLCommandType.DELETE, logicalQuery);
     }
 
     protected LogicalPlan handleCte(LogicalPlan logicalPlan) {

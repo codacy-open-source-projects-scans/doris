@@ -34,7 +34,6 @@
 #include "cloud/config.h"
 #include "common/signal_handler.h"
 #include "exec/tablet_info.h"
-#include "gutil/ref_counted.h"
 #include "olap/tablet.h"
 #include "olap/tablet_fwd.h"
 #include "olap/tablet_schema.h"
@@ -52,19 +51,20 @@
 #define UNKNOWN_ID_FOR_TEST 0x7c00
 
 namespace doris {
+#include "common/compile_check_begin.h"
 
 bvar::Adder<int64_t> g_load_stream_cnt("load_stream_count");
 bvar::LatencyRecorder g_load_stream_flush_wait_ms("load_stream_flush_wait_ms");
 bvar::Adder<int> g_load_stream_flush_running_threads("load_stream_flush_wait_threads");
 
-TabletStream::TabletStream(PUniqueId load_id, int64_t id, int64_t txn_id,
+TabletStream::TabletStream(const PUniqueId& load_id, int64_t id, int64_t txn_id,
                            LoadStreamMgr* load_stream_mgr, RuntimeProfile* profile)
         : _id(id),
           _next_segid(0),
           _load_id(load_id),
           _txn_id(txn_id),
           _load_stream_mgr(load_stream_mgr) {
-    load_stream_mgr->create_tokens(_flush_tokens);
+    load_stream_mgr->create_token(_flush_token);
     _profile = profile->create_child(fmt::format("TabletStream {}", id), true, true);
     _append_data_timer = ADD_TIMER(_profile, "AppendDataTime");
     _add_segment_timer = ADD_TIMER(_profile, "AddSegmentTime");
@@ -72,7 +72,7 @@ TabletStream::TabletStream(PUniqueId load_id, int64_t id, int64_t txn_id,
 }
 
 inline std::ostream& operator<<(std::ostream& ostr, const TabletStream& tablet_stream) {
-    ostr << "load_id=" << tablet_stream._load_id << ", txn_id=" << tablet_stream._txn_id
+    ostr << "load_id=" << print_id(tablet_stream._load_id) << ", txn_id=" << tablet_stream._txn_id
          << ", tablet_id=" << tablet_stream._id << ", status=" << tablet_stream._status.status();
     return ostr;
 }
@@ -178,7 +178,6 @@ Status TabletStream::append_data(const PStreamHeader& header, butil::IOBuf* data
             LOG(WARNING) << "write data failed " << st << ", " << *this;
         }
     };
-    auto& flush_token = _flush_tokens[new_segid % _flush_tokens.size()];
     auto load_stream_flush_token_max_tasks = config::load_stream_flush_token_max_tasks;
     auto load_stream_max_wait_flush_token_time_ms =
             config::load_stream_max_wait_flush_token_time_ms;
@@ -188,7 +187,7 @@ Status TabletStream::append_data(const PStreamHeader& header, butil::IOBuf* data
     });
     MonotonicStopWatch timer;
     timer.start();
-    while (flush_token->num_tasks() >= load_stream_flush_token_max_tasks) {
+    while (_flush_token->num_tasks() >= load_stream_flush_token_max_tasks) {
         if (timer.elapsed_time() / 1000 / 1000 >= load_stream_max_wait_flush_token_time_ms) {
             _status.update(
                     Status::Error<true>("wait flush token back pressure time is more than "
@@ -206,7 +205,7 @@ Status TabletStream::append_data(const PStreamHeader& header, butil::IOBuf* data
     DBUG_EXECUTE_IF("TabletStream.append_data.submit_func_failed",
                     { st = Status::InternalError("fault injection"); });
     if (st.ok()) {
-        st = flush_token->submit_func(flush_func);
+        st = _flush_token->submit_func(flush_func);
     }
     if (!st.ok()) {
         _status.update(st);
@@ -222,11 +221,6 @@ Status TabletStream::add_segment(const PStreamHeader& header, butil::IOBuf* data
     SCOPED_TIMER(_add_segment_timer);
     DCHECK(header.has_segment_statistics());
     SegmentStatistics stat(header.segment_statistics());
-    TabletSchemaSPtr flush_schema;
-    if (header.has_flush_schema()) {
-        flush_schema = std::make_shared<TabletSchema>();
-        flush_schema->init_from_pb(header.flush_schema());
-    }
 
     int64_t src_id = header.src_id();
     uint32_t segid = header.segment_id();
@@ -242,7 +236,7 @@ Status TabletStream::add_segment(const PStreamHeader& header, butil::IOBuf* data
             return _status.status();
         }
         DBUG_EXECUTE_IF("TabletStream.add_segment.segid_never_written",
-                        { segid = _segids_mapping[src_id]->size(); });
+                        { segid = static_cast<uint32_t>(_segids_mapping[src_id]->size()); });
         if (segid >= _segids_mapping[src_id]->size()) {
             _status.update(Status::InternalError(
                     "add segment failed, segment is never written, src_id={}, segment_id={}",
@@ -253,9 +247,9 @@ Status TabletStream::add_segment(const PStreamHeader& header, butil::IOBuf* data
     }
     DCHECK(new_segid != std::numeric_limits<uint32_t>::max());
 
-    auto add_segment_func = [this, new_segid, stat, flush_schema]() {
+    auto add_segment_func = [this, new_segid, stat]() {
         signal::set_signal_task_id(_load_id);
-        auto st = _load_stream_writer->add_segment(new_segid, stat, flush_schema);
+        auto st = _load_stream_writer->add_segment(new_segid, stat);
         DBUG_EXECUTE_IF("TabletStream.add_segment.add_segment_failed",
                         { st = Status::InternalError("fault injection"); });
         if (!st.ok()) {
@@ -263,12 +257,11 @@ Status TabletStream::add_segment(const PStreamHeader& header, butil::IOBuf* data
             LOG(INFO) << "add segment failed " << *this;
         }
     };
-    auto& flush_token = _flush_tokens[new_segid % _flush_tokens.size()];
     Status st = Status::OK();
     DBUG_EXECUTE_IF("TabletStream.add_segment.submit_func_failed",
                     { st = Status::InternalError("fault injection"); });
     if (st.ok()) {
-        st = flush_token->submit_func(add_segment_func);
+        st = _flush_token->submit_func(add_segment_func);
     }
     if (!st.ok()) {
         _status.update(st);
@@ -298,14 +291,14 @@ Status TabletStream::_run_in_heavy_work_pool(std::function<Status()> fn) {
 
 void TabletStream::pre_close() {
     if (!_status.ok()) {
+        // cancel all pending tasks, wait all running tasks to finish
+        _flush_token->shutdown();
         return;
     }
 
     SCOPED_TIMER(_close_wait_timer);
     _status.update(_run_in_heavy_work_pool([this]() {
-        for (auto& token : _flush_tokens) {
-            token->wait();
-        }
+        _flush_token->wait();
         return Status::OK();
     }));
     // it is necessary to check status after wait_func,
@@ -336,7 +329,7 @@ Status TabletStream::close() {
     return _status.status();
 }
 
-IndexStream::IndexStream(PUniqueId load_id, int64_t id, int64_t txn_id,
+IndexStream::IndexStream(const PUniqueId& load_id, int64_t id, int64_t txn_id,
                          std::shared_ptr<OlapTableSchemaParam> schema,
                          LoadStreamMgr* load_stream_mgr, RuntimeProfile* profile)
         : _id(id),
@@ -419,7 +412,8 @@ void IndexStream::close(const std::vector<PTabletID>& tablets_to_commit,
 // TODO: Profile is temporary disabled, because:
 // 1. It's not being processed by the upstream for now
 // 2. There are some problems in _profile->to_thrift()
-LoadStream::LoadStream(PUniqueId load_id, LoadStreamMgr* load_stream_mgr, bool enable_profile)
+LoadStream::LoadStream(const PUniqueId& load_id, LoadStreamMgr* load_stream_mgr,
+                       bool enable_profile)
         : _load_id(load_id), _enable_profile(false), _load_stream_mgr(load_stream_mgr) {
     g_load_stream_cnt << 1;
     _profile = std::make_unique<RuntimeProfile>("LoadStream");
@@ -430,19 +424,22 @@ LoadStream::LoadStream(PUniqueId load_id, LoadStreamMgr* load_stream_mgr, bool e
     std::shared_ptr<QueryContext> query_context =
             ExecEnv::GetInstance()->fragment_mgr()->get_query_ctx(load_tid);
     if (query_context != nullptr) {
-        _query_thread_context = {load_tid, query_context->query_mem_tracker,
-                                 query_context->workload_group()};
+        _resource_ctx = query_context->resource_ctx();
     } else {
-        _query_thread_context = {load_tid, MemTrackerLimiter::create_shared(
-                                                   MemTrackerLimiter::Type::LOAD,
-                                                   fmt::format("(FromLoadStream)Load#Id={}",
-                                                               ((UniqueId)load_id).to_string()))};
+        _resource_ctx = ResourceContext::create_shared();
+        _resource_ctx->task_controller()->set_task_id(load_tid);
+        std::shared_ptr<MemTrackerLimiter> mem_tracker = MemTrackerLimiter::create_shared(
+                MemTrackerLimiter::Type::LOAD,
+                fmt::format("(FromLoadStream)Load#Id={}", ((UniqueId)load_id).to_string()));
+        _resource_ctx->memory_context()->set_mem_tracker(mem_tracker);
     }
 #else
-    _query_thread_context = {load_tid, MemTrackerLimiter::create_shared(
-                                               MemTrackerLimiter::Type::LOAD,
-                                               fmt::format("(FromLoadStream)Load#Id={}",
-                                                           ((UniqueId)load_id).to_string()))};
+    _resource_ctx = ResourceContext::create_shared();
+    _resource_ctx->task_controller()->set_task_id(load_tid);
+    std::shared_ptr<MemTrackerLimiter> mem_tracker = MemTrackerLimiter::create_shared(
+            MemTrackerLimiter::Type::LOAD,
+            fmt::format("(FromLoadStream)Load#Id={}", ((UniqueId)load_id).to_string()));
+    _resource_ctx->memory_context()->set_mem_tracker(mem_tracker);
 #endif
 }
 
@@ -453,7 +450,7 @@ LoadStream::~LoadStream() {
 
 Status LoadStream::init(const POpenLoadStreamRequest* request) {
     _txn_id = request->txn_id();
-    _total_streams = request->total_streams();
+    _total_streams = static_cast<int32_t>(request->total_streams());
     _is_incremental = (_total_streams == 0);
 
     _schema = std::make_shared<OlapTableSchemaParam>();
@@ -466,7 +463,7 @@ Status LoadStream::init(const POpenLoadStreamRequest* request) {
     return Status::OK();
 }
 
-void LoadStream::close(int64_t src_id, const std::vector<PTabletID>& tablets_to_commit,
+bool LoadStream::close(int64_t src_id, const std::vector<PTabletID>& tablets_to_commit,
                        std::vector<int64_t>* success_tablet_ids, FailedTablets* failed_tablets) {
     std::lock_guard<bthread::Mutex> lock_guard(_lock);
     SCOPED_TIMER(_close_wait_timer);
@@ -485,7 +482,7 @@ void LoadStream::close(int64_t src_id, const std::vector<PTabletID>& tablets_to_
 
     if (_close_load_cnt < _total_streams) {
         // do not return commit info if there is remaining streams.
-        return;
+        return false;
     }
 
     for (auto& [_, index_stream] : _index_streams_map) {
@@ -493,6 +490,7 @@ void LoadStream::close(int64_t src_id, const std::vector<PTabletID>& tablets_to_
     }
     LOG(INFO) << "close load " << *this << ", success_tablet_num=" << success_tablet_ids->size()
               << ", failed_tablet_num=" << failed_tablets->size();
+    return true;
 }
 
 void LoadStream::_report_result(StreamId stream, const Status& status,
@@ -516,14 +514,14 @@ void LoadStream::_report_result(StreamId stream, const Status& status,
     if (_enable_profile && _close_load_cnt == _total_streams) {
         TRuntimeProfileTree tprofile;
         ThriftSerializer ser(false, 4096);
-        uint8_t* buf = nullptr;
+        uint8_t* profile_buf = nullptr;
         uint32_t len = 0;
         std::unique_lock<bthread::Mutex> l(_lock);
 
         _profile->to_thrift(&tprofile);
-        auto st = ser.serialize(&tprofile, &len, &buf);
+        auto st = ser.serialize(&tprofile, &len, &profile_buf);
         if (st.ok()) {
-            response.set_load_stream_profile(buf, len);
+            response.set_load_stream_profile(profile_buf, len);
         } else {
             LOG(WARNING) << "TRuntimeProfileTree serialize failed, errmsg=" << st << ", " << *this;
         }
@@ -639,14 +637,15 @@ int LoadStream::on_received_messages(StreamId id, butil::IOBuf* const messages[]
 void LoadStream::_dispatch(StreamId id, const PStreamHeader& hdr, butil::IOBuf* data) {
     VLOG_DEBUG << PStreamHeader_Opcode_Name(hdr.opcode()) << " from " << hdr.src_id()
                << " with tablet " << hdr.tablet_id();
-    SCOPED_ATTACH_TASK(_query_thread_context);
+    SCOPED_ATTACH_TASK(_resource_ctx);
     // CLOSE_LOAD message should not be fault injected,
     // otherwise the message will be ignored and causing close wait timeout
     if (hdr.opcode() != PStreamHeader::CLOSE_LOAD) {
         DBUG_EXECUTE_IF("LoadStream._dispatch.unknown_loadid", {
-            PUniqueId& load_id = const_cast<PUniqueId&>(hdr.load_id());
-            load_id.set_hi(UNKNOWN_ID_FOR_TEST);
-            load_id.set_lo(UNKNOWN_ID_FOR_TEST);
+            PStreamHeader& t_hdr = const_cast<PStreamHeader&>(hdr);
+            PUniqueId* load_id = t_hdr.mutable_load_id();
+            load_id->set_hi(UNKNOWN_ID_FOR_TEST);
+            load_id->set_lo(UNKNOWN_ID_FOR_TEST);
         });
         DBUG_EXECUTE_IF("LoadStream._dispatch.unknown_srcid", {
             PStreamHeader& t_hdr = const_cast<PStreamHeader&>(hdr);
@@ -682,9 +681,25 @@ void LoadStream::_dispatch(StreamId id, const PStreamHeader& hdr, butil::IOBuf* 
         std::vector<int64_t> success_tablet_ids;
         FailedTablets failed_tablets;
         std::vector<PTabletID> tablets_to_commit(hdr.tablets().begin(), hdr.tablets().end());
-        close(hdr.src_id(), tablets_to_commit, &success_tablet_ids, &failed_tablets);
+        bool all_closed =
+                close(hdr.src_id(), tablets_to_commit, &success_tablet_ids, &failed_tablets);
         _report_result(id, Status::OK(), success_tablet_ids, failed_tablets, true);
-        brpc::StreamClose(id);
+        std::lock_guard<bthread::Mutex> lock_guard(_lock);
+        // if incremental stream, we need to wait for all non-incremental streams to be closed
+        // before closing incremental streams. We need a fencing mechanism to avoid use after closing
+        // across different be.
+        if (hdr.has_num_incremental_streams() && hdr.num_incremental_streams() > 0) {
+            _closing_stream_ids.push_back(id);
+        } else {
+            brpc::StreamClose(id);
+        }
+
+        if (all_closed) {
+            for (auto& closing_id : _closing_stream_ids) {
+                brpc::StreamClose(closing_id);
+            }
+            _closing_stream_ids.clear();
+        }
     } break;
     case PStreamHeader::GET_SCHEMA: {
         _report_schema(id, hdr);
@@ -718,4 +733,5 @@ inline std::ostream& operator<<(std::ostream& ostr, const LoadStream& load_strea
     return ostr;
 }
 
+#include "common/compile_check_end.h"
 } // namespace doris

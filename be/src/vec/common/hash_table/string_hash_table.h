@@ -327,8 +327,7 @@ protected:
                 return iterator5 == rhs.iterator5;
             }
             }
-            LOG(FATAL) << "__builtin_unreachable";
-            __builtin_unreachable();
+            throw doris::Exception(doris::Status::FatalError("__builtin_unreachable"));
         }
 
         bool operator!=(const iterator_base& rhs) const { return !(*this == rhs); }
@@ -419,27 +418,27 @@ protected:
         auto& operator*() const {
             switch (sub_table_index) {
             case 0: {
-                const_cast<iterator_base*>(this)->cell = *(container->m0.zero_value());
+                this->cell = *(container->m0.zero_value());
                 break;
             }
             case 1: {
-                const_cast<iterator_base*>(this)->cell = *iterator1;
+                this->cell = *iterator1;
                 break;
             }
             case 2: {
-                const_cast<iterator_base*>(this)->cell = *iterator2;
+                this->cell = *iterator2;
                 break;
             }
             case 3: {
-                const_cast<iterator_base*>(this)->cell = *iterator3;
+                this->cell = *iterator3;
                 break;
             }
             case 4: {
-                const_cast<iterator_base*>(this)->cell = *iterator4;
+                this->cell = *iterator4;
                 break;
             }
             case 5: {
-                const_cast<iterator_base*>(this)->cell = *iterator5;
+                this->cell = *iterator5;
                 break;
             }
             }
@@ -651,7 +650,7 @@ public:
     size_t get_buffer_size_in_bytes() const {
         return m0.get_buffer_size_in_bytes() + m1.get_buffer_size_in_bytes() +
                m2.get_buffer_size_in_bytes() + m3.get_buffer_size_in_bytes() +
-               ms.get_buffer_size_in_bytes();
+               m4.get_buffer_size_in_bytes() + ms.get_buffer_size_in_bytes();
     }
 
     class iterator : public iterator_base<iterator, false> {
@@ -678,5 +677,31 @@ public:
         return m1.add_elem_size_overflow(add_size) || m2.add_elem_size_overflow(add_size) ||
                m3.add_elem_size_overflow(add_size) || m4.add_elem_size_overflow(add_size) ||
                ms.add_elem_size_overflow(add_size);
+    }
+
+    size_t estimate_memory(size_t num_elem) const {
+        size_t estimate_size = 0;
+
+        if (m1.add_elem_size_overflow(num_elem)) {
+            estimate_size = m1.estimate_memory(num_elem);
+        }
+
+        if (m2.add_elem_size_overflow(num_elem)) {
+            estimate_size = std::max(estimate_size, m2.estimate_memory(num_elem));
+        }
+
+        if (m3.add_elem_size_overflow(num_elem)) {
+            estimate_size = std::max(estimate_size, m3.estimate_memory(num_elem));
+        }
+
+        if (m4.add_elem_size_overflow(num_elem)) {
+            estimate_size = std::max(estimate_size, m4.estimate_memory(num_elem));
+        }
+
+        if (ms.add_elem_size_overflow(num_elem)) {
+            estimate_size = std::max(estimate_size, ms.estimate_memory(num_elem));
+        }
+
+        return estimate_size;
     }
 };

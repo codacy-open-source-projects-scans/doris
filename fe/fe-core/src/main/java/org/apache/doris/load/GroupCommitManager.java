@@ -17,6 +17,7 @@
 
 package org.apache.doris.load;
 
+import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.cloud.system.CloudSystemInfoService;
@@ -27,8 +28,8 @@ import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.LoadException;
+import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.util.SlidingWindowCounter;
-import org.apache.doris.mysql.privilege.Auth;
 import org.apache.doris.proto.InternalService.PGetWalQueueSizeRequest;
 import org.apache.doris.proto.InternalService.PGetWalQueueSizeResponse;
 import org.apache.doris.qe.ConnectContext;
@@ -128,6 +129,11 @@ public class GroupCommitManager {
     }
 
     public long getAllWalQueueSize(Backend backend) {
+        long getAllWalQueueSizeDP = DebugPointUtil.getDebugParamOrDefault("FE.GET_ALL_WAL_QUEUE_SIZE", -1L);
+        if (getAllWalQueueSizeDP > 0) {
+            LOG.info("backend id:" + backend.getHost() + ",use dp all wal size:" + getAllWalQueueSizeDP);
+            return getAllWalQueueSizeDP;
+        }
         PGetWalQueueSizeRequest request = PGetWalQueueSizeRequest.newBuilder()
                 .setTableId(-1)
                 .build();
@@ -215,7 +221,7 @@ public class GroupCommitManager {
             try {
                 // Master FE will select BE by itself.
                 return Env.getCurrentSystemInfo()
-                    .getBackend(selectBackendForGroupCommitInternal(tableId, clusterName));
+                        .getBackend(selectBackendForGroupCommitInternal(tableId, clusterName));
             } catch (Exception e) {
                 LOG.warn("get backend failed, tableId: {}, exception", tableId, e);
                 throw new LoadException(e.getMessage());
@@ -261,8 +267,10 @@ public class GroupCommitManager {
 
     private long selectBackendForCloudGroupCommitInternal(long tableId, String cluster)
             throws DdlException, LoadException {
-        LOG.debug("cloud group commit select be info, tableToBeMap {}, tablePressureMap {}",
-                tableToBeMap.toString(), tableToPressureMap.toString());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("cloud group commit select be info, tableToBeMap {}, tablePressureMap {}",
+                    tableToBeMap.toString(), tableToPressureMap.toString());
+        }
         if (Strings.isNullOrEmpty(cluster)) {
             ErrorReport.reportDdlException(ErrorCode.ERR_NO_CLUSTER_ERROR);
         }
@@ -291,8 +299,10 @@ public class GroupCommitManager {
     }
 
     private long selectBackendForLocalGroupCommitInternal(long tableId) throws LoadException {
-        LOG.debug("group commit select be info, tableToBeMap {}, tablePressureMap {}", tableToBeMap.toString(),
-                tableToPressureMap.toString());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("group commit select be info, tableToBeMap {}, tablePressureMap {}", tableToBeMap.toString(),
+                    tableToPressureMap.toString());
+        }
         Long cachedBackendId = getCachedBackend(null, tableId);
         if (cachedBackendId != null) {
             return cachedBackendId;
@@ -326,7 +336,9 @@ public class GroupCommitManager {
     private Long getCachedBackend(String cluster, long tableId) {
         OlapTable table = (OlapTable) Env.getCurrentEnv().getInternalCatalog().getTableByTableId(tableId);
         if (tableToBeMap.containsKey(encode(cluster, tableId))) {
-            if (tableToPressureMap.get(tableId).get() < table.getGroupCommitDataBytes()) {
+            if (tableToPressureMap.get(tableId) == null) {
+                return null;
+            } else if (tableToPressureMap.get(tableId).get() < table.getGroupCommitDataBytes()) {
                 // There are multiple threads getting cached backends for the same table.
                 // Maybe one thread removes the tableId from the tableToBeMap.
                 // Another thread gets the same tableId but can not find this tableId.
@@ -380,7 +392,7 @@ public class GroupCommitManager {
             ctx.setEnv(Env.getCurrentEnv());
             ctx.setThreadLocalInfo();
             // set user to ADMIN_USER, so that we can get the proper resource tag
-            ctx.setQualifiedUser(Auth.ADMIN_USER);
+            ctx.setCurrentUserIdentity(UserIdentity.ADMIN);
             ctx.setThreadLocalInfo();
             try {
                 new MasterOpExecutor(ctx).updateLoadData(tableId, receiveData);
@@ -395,8 +407,10 @@ public class GroupCommitManager {
     private void updateLoadDataInternal(long tableId, long receiveData) {
         if (tableToPressureMap.containsKey(tableId)) {
             tableToPressureMap.get(tableId).add(receiveData);
-            LOG.info("Update load data for table {}, receiveData {}, tablePressureMap {}", tableId, receiveData,
-                    tableToPressureMap.toString());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Update load data for table {}, receiveData {}, tablePressureMap {}", tableId, receiveData,
+                        tableToPressureMap.toString());
+            }
         } else if (LOG.isDebugEnabled()) {
             LOG.debug("can not find table id {}", tableId);
         }

@@ -55,8 +55,12 @@ import java.util.function.BiFunction;
 
 /** LoadBalanceScanWorkerSelector */
 public class LoadBalanceScanWorkerSelector implements ScanWorkerSelector {
-    private final BackendDistributedPlanWorkerManager workerManager = new BackendDistributedPlanWorkerManager();
+    private final DistributedPlanWorkerManager workerManager;
     private final Map<DistributedPlanWorker, WorkerWorkload> workloads = Maps.newLinkedHashMap();
+
+    public LoadBalanceScanWorkerSelector(DistributedPlanWorkerManager workerManager) {
+        this.workerManager = workerManager;
+    }
 
     @Override
     public DistributedPlanWorkerManager getWorkerManager() {
@@ -238,6 +242,17 @@ public class LoadBalanceScanWorkerSelector implements ScanWorkerSelector {
     private WorkerScanRanges selectScanReplicaAndMinWorkloadWorker(
             TScanRangeLocations tabletLocation, long tabletBytes, boolean orderedScanRangeLocations) {
         List<TScanRangeLocation> replicaLocations = tabletLocation.getLocations();
+        if (replicaLocations.size() == 1) {
+            TScanRangeLocation replicaLocation = replicaLocations.get(0);
+            DistributedPlanWorker worker = workerManager.getWorker(replicaLocation.getBackendId());
+            ScanRanges scanRanges = new ScanRanges();
+            TScanRangeParams scanReplicaParams =
+                    ScanWorkerSelector.buildScanReplicaParams(tabletLocation, replicaLocation);
+            scanRanges.addScanRange(scanReplicaParams, tabletBytes);
+            getWorkload(worker).recordOneScanTask(tabletBytes);
+            return new WorkerScanRanges(worker, scanRanges);
+        }
+
         if (orderedScanRangeLocations) {
             replicaLocations = Lists.newArrayList(replicaLocations);
             Collections.sort(replicaLocations);

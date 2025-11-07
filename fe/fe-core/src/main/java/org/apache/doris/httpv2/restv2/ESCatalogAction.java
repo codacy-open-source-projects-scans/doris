@@ -27,6 +27,8 @@ import org.apache.doris.httpv2.rest.RestBaseController;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.Maps;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -38,8 +40,6 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 @RestController
 @RequestMapping("/rest/v2/api/es_catalog")
@@ -55,12 +55,12 @@ public class ESCatalogAction extends RestBaseController {
             executeCheckPassword(request, response);
         }
 
-        try {
-            if (!Env.getCurrentEnv().isMaster()) {
-                return redirectToMasterOrException(request, response);
-            }
-        } catch (Exception e) {
-            return ResponseEntityBuilder.okWithCommonError(e.getMessage());
+        if (needRedirect(request.getScheme())) {
+            return redirectToHttps(request);
+        }
+
+        if (checkForwardToMaster(request)) {
+            return forwardToMaster(request);
         }
 
         Map<String, Object> resultMap = Maps.newHashMap();

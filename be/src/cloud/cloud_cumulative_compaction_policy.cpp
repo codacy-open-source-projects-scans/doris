@@ -26,6 +26,7 @@
 #include "common/config.h"
 #include "common/logging.h"
 #include "cpp/sync_point.h"
+#include "olap/cumulative_compaction_time_series_policy.h"
 #include "olap/olap_common.h"
 #include "olap/tablet.h"
 #include "olap/tablet_meta.h"
@@ -49,11 +50,71 @@ int64_t CloudSizeBasedCumulativeCompactionPolicy::_level_size(const int64_t size
     return (int64_t)1 << (sizeof(size) * 8 - 1 - __builtin_clzl(size));
 }
 
+void find_longest_consecutive_empty_rowsets(std::vector<RowsetSharedPtr>* result,
+                                            const std::vector<RowsetSharedPtr>& candidate_rowsets) {
+    std::vector<RowsetSharedPtr> current_sequence;
+    std::vector<RowsetSharedPtr> longest_sequence;
+
+    for (size_t i = 0; i < candidate_rowsets.size(); ++i) {
+        auto& rowset = candidate_rowsets[i];
+
+        // Check if rowset is empty and has no delete predicate
+        if (rowset->num_segments() == 0 && !rowset->rowset_meta()->has_delete_predicate()) {
+            // Check if this is consecutive with previous rowset
+            if (current_sequence.empty() ||
+                (current_sequence.back()->end_version() == rowset->start_version() - 1)) {
+                current_sequence.push_back(rowset);
+            } else {
+                // Start new sequence if not consecutive
+                if (current_sequence.size() > longest_sequence.size()) {
+                    longest_sequence = current_sequence;
+                }
+                current_sequence.clear();
+                current_sequence.push_back(rowset);
+            }
+        } else {
+            // Non-empty rowset, check if we have a sequence to compare
+            if (current_sequence.size() > longest_sequence.size()) {
+                longest_sequence = current_sequence;
+            }
+            current_sequence.clear();
+        }
+    }
+
+    // Check final sequence
+    if (current_sequence.size() > longest_sequence.size()) {
+        longest_sequence = current_sequence;
+    }
+
+    *result = longest_sequence;
+}
+
 int64_t CloudSizeBasedCumulativeCompactionPolicy::pick_input_rowsets(
         CloudTablet* tablet, const std::vector<RowsetSharedPtr>& candidate_rowsets,
         const int64_t max_compaction_score, const int64_t min_compaction_score,
         std::vector<RowsetSharedPtr>* input_rowsets, Version* last_delete_version,
         size_t* compaction_score, bool allow_delete) {
+    DBUG_EXECUTE_IF(
+            "CloudSizeBasedCumulativeCompactionPolicy::pick_input_rowsets.set_input_rowsets", {
+                auto target_tablet_id = dp->param<int64_t>("tablet_id", -1);
+                if (target_tablet_id == tablet->tablet_id()) {
+                    auto start_version = dp->param<int64_t>("start_version", -1);
+                    auto end_version = dp->param<int64_t>("end_version", -1);
+                    for (auto& rowset : candidate_rowsets) {
+                        if (rowset->start_version() >= start_version &&
+                            rowset->end_version() <= end_version) {
+                            input_rowsets->push_back(rowset);
+                        }
+                    }
+                    LOG_INFO(
+                            "[CloudSizeBasedCumulativeCompactionPolicy::pick_input_rowsets.set_"
+                            "input_rowsets] tablet_id={}, start={}, end={}, "
+                            "input_rowsets->size()={}",
+                            target_tablet_id, start_version, end_version, input_rowsets->size());
+                    return input_rowsets->size();
+                }
+            })
+
     size_t promotion_size = cloud_promotion_size(tablet);
     auto max_version = tablet->max_version().first;
     int transient_size = 0;
@@ -109,6 +170,24 @@ int64_t CloudSizeBasedCumulativeCompactionPolicy::pick_input_rowsets(
             }
         }
         return transient_size;
+    }
+
+    // Check if empty rowset compaction strategy is enabled
+    if (config::enable_empty_rowset_compaction && !input_rowsets->empty()) {
+        // Check if input_rowsets contain consecutive empty rowsets that meet criteria
+        std::vector<RowsetSharedPtr> consecutive_empty_rowsets;
+        find_longest_consecutive_empty_rowsets(&consecutive_empty_rowsets, *input_rowsets);
+
+        if (!consecutive_empty_rowsets.empty() &&
+            consecutive_empty_rowsets.size() >= config::empty_rowset_compaction_min_count &&
+            static_cast<double>(consecutive_empty_rowsets.size()) /
+                            static_cast<double>(input_rowsets->size()) >=
+                    config::empty_rowset_compaction_min_ratio) {
+            // Prioritize consecutive empty rowset compaction
+            *input_rowsets = consecutive_empty_rowsets;
+            *compaction_score = consecutive_empty_rowsets.size();
+            return consecutive_empty_rowsets.size();
+        }
     }
 
     auto rs_begin = input_rowsets->begin();
@@ -198,6 +277,17 @@ int64_t CloudSizeBasedCumulativeCompactionPolicy::new_cumulative_point(
         int64_t last_cumulative_point) {
     TEST_INJECTION_POINT_RETURN_WITH_VALUE("new_cumulative_point", int64_t(0), output_rowset.get(),
                                            last_cumulative_point);
+    DBUG_EXECUTE_IF("CloudSizeBasedCumulativeCompactionPolicy::new_cumulative_point", {
+        auto target_tablet_id = dp->param<int64_t>("tablet_id", -1);
+        auto cumu_point = dp->param<int64_t>("cumu_point", -1);
+        if (target_tablet_id == tablet->tablet_id() && cumu_point != -1) {
+            LOG_INFO(
+                    "[CloudSizeBasedCumulativeCompactionPolicy::new_cumulative_point] "
+                    "tablet_id={}, cumu_point={}",
+                    target_tablet_id, cumu_point);
+            return cumu_point;
+        }
+    });
     // for MoW table, if there's too many versions, the delete bitmap will grow to
     // a very big size, which may cause the tablet meta too big and the `save_meta`
     // operation too slow.
@@ -208,10 +298,9 @@ int64_t CloudSizeBasedCumulativeCompactionPolicy::new_cumulative_point(
                                              config::compaction_promotion_version_count;
     // if rowsets have delete version, move to the last directly.
     // if rowsets have no delete version, check output_rowset total disk size satisfies promotion size.
-    return output_rowset->start_version() == last_cumulative_point &&
-                           (last_delete_version.first != -1 ||
-                            output_rowset->total_disk_size() >= cloud_promotion_size(tablet) ||
-                            satisfy_promotion_version)
+    return (last_delete_version.first != -1 ||
+            output_rowset->total_disk_size() >= cloud_promotion_size(tablet) ||
+            satisfy_promotion_version)
                    ? output_rowset->end_version() + 1
                    : last_cumulative_point;
 }
@@ -221,146 +310,17 @@ int64_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
         const int64_t max_compaction_score, const int64_t min_compaction_score,
         std::vector<RowsetSharedPtr>* input_rowsets, Version* last_delete_version,
         size_t* compaction_score, bool allow_delete) {
-    if (tablet->tablet_state() == TABLET_NOTREADY) {
-        return 0;
-    }
-
-    input_rowsets->clear();
-    int64_t compaction_goal_size_mbytes =
-            tablet->tablet_meta()->time_series_compaction_goal_size_mbytes();
-
-    int transient_size = 0;
-    *compaction_score = 0;
-    int64_t total_size = 0;
-
-    for (const auto& rowset : candidate_rowsets) {
-        // check whether this rowset is delete version
-        if (!allow_delete && rowset->rowset_meta()->has_delete_predicate()) {
-            *last_delete_version = rowset->version();
-            if (!input_rowsets->empty()) {
-                // we meet a delete version, and there were other versions before.
-                // we should compact those version before handling them over to base compaction
-                break;
-            } else {
-                // we meet a delete version, and no other versions before, skip it and continue
-                input_rowsets->clear();
-                *compaction_score = 0;
-                transient_size = 0;
-                total_size = 0;
-                continue;
-            }
-        }
-
-        *compaction_score += rowset->rowset_meta()->get_compaction_score();
-        total_size += rowset->rowset_meta()->total_disk_size();
-
-        transient_size += 1;
-        input_rowsets->push_back(rowset);
-
-        // Condition 1: the size of input files for compaction meets the requirement of parameter compaction_goal_size
-        if (total_size >= (compaction_goal_size_mbytes * 1024 * 1024)) {
-            if (input_rowsets->size() == 1 &&
-                !input_rowsets->front()->rowset_meta()->is_segments_overlapping()) {
-                // Only 1 non-overlapping rowset, skip it
-                input_rowsets->clear();
-                *compaction_score = 0;
-                total_size = 0;
-                continue;
-            }
-            return transient_size;
-        } else if (
-                *compaction_score >=
-                config::compaction_max_rowset_count) { // If the number of rowsets is too large: FDB_ERROR_CODE_TXN_TOO_LARGE
-            return transient_size;
-        }
-    }
-
-    // if there is delete version, do compaction directly
-    if (last_delete_version->first != -1) {
-        // if there is only one rowset and not overlapping,
-        // we do not need to do cumulative compaction
-        if (input_rowsets->size() == 1 &&
-            !input_rowsets->front()->rowset_meta()->is_segments_overlapping()) {
-            input_rowsets->clear();
-            *compaction_score = 0;
-        }
-        return transient_size;
-    }
-
-    // Condition 2: the number of input files reaches the threshold specified by parameter compaction_file_count_threshold
-    if (*compaction_score >= tablet->tablet_meta()->time_series_compaction_file_count_threshold()) {
-        return transient_size;
-    }
-
-    // Condition 3: level1 achieve compaction_goal_size
-    std::vector<RowsetSharedPtr> level1_rowsets;
-    if (tablet->tablet_meta()->time_series_compaction_level_threshold() >= 2) {
-        int64_t continuous_size = 0;
-        for (const auto& rowset : candidate_rowsets) {
-            const auto& rs_meta = rowset->rowset_meta();
-            if (rs_meta->compaction_level() == 0) {
-                break;
-            }
-            level1_rowsets.push_back(rowset);
-            continuous_size += rs_meta->total_disk_size();
-            if (level1_rowsets.size() >= 2) {
-                if (continuous_size >= compaction_goal_size_mbytes * 1024 * 1024) {
-                    input_rowsets->swap(level1_rowsets);
-                    return input_rowsets->size();
-                }
-            }
-        }
-    }
-
-    int64_t now = UnixMillis();
     int64_t last_cumu = tablet->last_cumu_compaction_success_time();
-    if (last_cumu != 0) {
-        int64_t cumu_interval = now - last_cumu;
-
-        // Condition 4: the time interval between compactions exceeds the value specified by parameter compaction_time_threshold_second
-        if (cumu_interval >
-            (tablet->tablet_meta()->time_series_compaction_time_threshold_seconds() * 1000)) {
-            if (tablet->tablet_meta()->time_series_compaction_level_threshold() >= 2) {
-                if (input_rowsets->empty() && level1_rowsets.size() >= 2) {
-                    input_rowsets->swap(level1_rowsets);
-                    return input_rowsets->size();
-                }
-            }
-            return transient_size;
-        }
-    }
-
-    input_rowsets->clear();
-    // Condition 5: If their are many empty rowsets, maybe should be compacted
-    tablet->calc_consecutive_empty_rowsets(
-            input_rowsets, candidate_rowsets,
-            tablet->tablet_meta()->time_series_compaction_empty_rowsets_threshold());
-    if (!input_rowsets->empty()) {
-        VLOG_NOTICE << "tablet is " << tablet->tablet_id()
-                    << ", there are too many consecutive empty rowsets, size is "
-                    << input_rowsets->size();
-        return 0;
-    }
-    *compaction_score = 0;
-
-    return 0;
+    return TimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
+            tablet, last_cumu, candidate_rowsets, max_compaction_score, min_compaction_score,
+            input_rowsets, last_delete_version, compaction_score, allow_delete);
 }
 
-int64_t CloudTimeSeriesCumulativeCompactionPolicy::new_compaction_level(
-        const std::vector<RowsetSharedPtr>& input_rowsets) {
-    int64_t first_level = 0;
-    for (size_t i = 0; i < input_rowsets.size(); i++) {
-        int64_t cur_level = input_rowsets[i]->rowset_meta()->compaction_level();
-        if (i == 0) {
-            first_level = cur_level;
-        } else {
-            if (first_level != cur_level) {
-                LOG(ERROR) << "Failed to check compaction level, first_level: " << first_level
-                           << ", cur_level: " << cur_level;
-            }
-        }
-    }
-    return first_level + 1;
+int64_t CloudTimeSeriesCumulativeCompactionPolicy::get_compaction_level(
+        CloudTablet* tablet, const std::vector<RowsetSharedPtr>& input_rowsets,
+        RowsetSharedPtr output_rowset) {
+    return TimeSeriesCumulativeCompactionPolicy::get_compaction_level((BaseTablet*)tablet,
+                                                                      input_rowsets, output_rowset);
 }
 
 int64_t CloudTimeSeriesCumulativeCompactionPolicy::new_cumulative_point(

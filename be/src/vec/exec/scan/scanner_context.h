@@ -21,22 +21,27 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <cstdint>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <stack>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "common/config.h"
 #include "common/factory_creator.h"
 #include "common/status.h"
 #include "concurrentqueue.h"
+#include "util/doris_metrics.h"
 #include "util/runtime_profile.h"
 #include "vec/core/block.h"
-#include "vec/exec/scan/vscanner.h"
+#include "vec/exec/executor/split_runner.h"
+#include "vec/exec/scan/scanner.h"
 
 namespace doris {
 
-class ThreadPoolToken;
 class RuntimeState;
 class TupleDescriptor;
 class WorkloadGroup;
@@ -48,20 +53,26 @@ class Dependency;
 
 namespace vectorized {
 
-class VScanner;
+class Scanner;
 class ScannerDelegate;
 class ScannerScheduler;
 class SimplifiedScanScheduler;
+class TaskExecutor;
+class TaskHandle;
 
 class ScanTask {
 public:
     ScanTask(std::weak_ptr<ScannerDelegate> delegate_scanner) : scanner(delegate_scanner) {
-        _query_thread_context.init_unlocked();
+        _resource_ctx = thread_context()->resource_ctx();
         DorisMetrics::instance()->scanner_task_cnt->increment(1);
     }
 
+    ScanTask(std::shared_ptr<ResourceContext> resource_ctx,
+             std::weak_ptr<ScannerDelegate> delegate_scanner)
+            : _resource_ctx(std::move(resource_ctx)), scanner(delegate_scanner) {}
+
     ~ScanTask() {
-        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_query_thread_context.query_mem_tracker);
+        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_resource_ctx->memory_context()->mem_tracker());
         cached_blocks.clear();
         DorisMetrics::instance()->scanner_task_cnt->increment(-1);
     }
@@ -70,11 +81,16 @@ private:
     // whether current scanner is finished
     bool eos = false;
     Status status = Status::OK();
-    QueryThreadContext _query_thread_context;
+    std::shared_ptr<ResourceContext> _resource_ctx;
 
 public:
     std::weak_ptr<ScannerDelegate> scanner;
     std::list<std::pair<vectorized::BlockUPtr, size_t>> cached_blocks;
+    bool is_first_schedule = true;
+    // Use weak_ptr to avoid circular references and potential memory leaks with SplitRunner.
+    // ScannerContext only needs to observe the lifetime of SplitRunner without owning it.
+    // When SplitRunner is destroyed, split_runner.lock() will return nullptr, ensuring safe access.
+    std::weak_ptr<SplitRunner> split_runner;
 
     void set_status(Status _status) {
         if (_status.is<ErrorCode::END_OF_FILE>()) {
@@ -100,6 +116,7 @@ public:
 class ScannerContext : public std::enable_shared_from_this<ScannerContext>,
                        public HasTaskExecutionCtx {
     ENABLE_FACTORY_CREATOR(ScannerContext);
+    friend class SimplifiedScanScheduler;
 
 public:
     ScannerContext(RuntimeState* state, pipeline::ScanLocalStateBase* local_state,
@@ -107,23 +124,17 @@ public:
                    const RowDescriptor* output_row_descriptor,
                    const std::list<std::shared_ptr<vectorized::ScannerDelegate>>& scanners,
                    int64_t limit_, std::shared_ptr<pipeline::Dependency> dependency,
-                   bool ignore_data_distribution, bool is_file_scan_operator);
+                   int num_parallel_instances);
 
-    ~ScannerContext() override {
-        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_query_thread_context.query_mem_tracker);
-        _tasks_queue.clear();
-        vectorized::BlockUPtr block;
-        while (_free_blocks.try_dequeue(block)) {
-            // do nothing
-        }
-        block.reset();
-        DorisMetrics::instance()->scanner_ctx_cnt->increment(-1);
-    }
+    ~ScannerContext() override;
     Status init();
 
     vectorized::BlockUPtr get_free_block(bool force);
     void return_free_block(vectorized::BlockUPtr block);
+    void clear_free_blocks();
     inline void inc_block_usage(size_t usage) { _block_memory_usage += usage; }
+
+    int64_t block_memory_usage() { return _block_memory_usage; }
 
     // Caller should make sure the pipeline task is still running when calling this function
     void update_peak_running_scanner(int num);
@@ -138,7 +149,7 @@ public:
     // set the next scanned block to `ScanTask::current_block`
     // set the error state to `ScanTask::status`
     // set the `eos` to `ScanTask::eos` if there is no more data in current scanner
-    Status submit_scan_task(std::shared_ptr<ScanTask> scan_task);
+    Status submit_scan_task(std::shared_ptr<ScanTask> scan_task, std::unique_lock<std::mutex>&);
 
     // Push back a scan task.
     void push_back_scan_task(std::shared_ptr<ScanTask> scan_task);
@@ -148,6 +159,10 @@ public:
 
     std::string debug_string();
 
+    std::shared_ptr<TaskHandle> task_handle() const { return _task_handle; }
+
+    std::shared_ptr<ResourceContext> resource_ctx() const { return _resource_ctx; }
+
     RuntimeState* state() { return _state; }
 
     SimplifiedScanScheduler* get_scan_scheduler() { return _scanner_scheduler; }
@@ -156,12 +171,33 @@ public:
 
     int batch_size() const { return _batch_size; }
 
+    // During low memory mode, there will be at most 4 scanners running and every scanner will
+    // cache at most 1MB data. So that every instance will keep 8MB buffer.
+    bool low_memory_mode() const;
+
+    // TODO(yiguolei) add this as session variable
+    int32_t low_memory_mode_scan_bytes_per_scanner() const {
+        return 1 * 1024 * 1024; // 1MB
+    }
+
+    int32_t low_memory_mode_scanners() const { return 4; }
+
+    pipeline::ScanLocalStateBase* local_state() const { return _local_state; }
+
     // the unique id of this context
     std::string ctx_id;
     TUniqueId _query_id;
-    ThreadPoolToken* thread_token = nullptr;
 
     bool _should_reset_thread_name = true;
+
+    int32_t num_scheduled_scanners() {
+        std::lock_guard<std::mutex> l(_transfer_lock);
+        return _num_scheduled_scanners;
+    }
+
+    Status schedule_scan_task(std::shared_ptr<ScanTask> current_scan_task,
+                              std::unique_lock<std::mutex>& transfer_lock,
+                              std::unique_lock<std::shared_mutex>& scheduler_lock);
 
 protected:
     /// Four criteria to determine whether to increase the parallelism of the scanners
@@ -193,38 +229,43 @@ protected:
     // The limit from SQL's limit clause
     int64_t limit;
 
-    int32_t _max_thread_num = 0;
     int64_t _max_bytes_in_queue = 0;
     doris::vectorized::ScannerScheduler* _scanner_scheduler_global = nullptr;
     SimplifiedScanScheduler* _scanner_scheduler = nullptr;
-    moodycamel::ConcurrentQueue<std::weak_ptr<ScannerDelegate>> _scanners;
-    int32_t _num_scheduled_scanners = 0;
+    // Using stack so that we can resubmit scanner in a LIFO order, maybe more cache friendly
+    std::stack<std::weak_ptr<ScannerDelegate>> _pending_scanners;
+    // Scanner that is submitted to the scheduler.
+    std::atomic_int _num_scheduled_scanners = 0;
+    // Scanner that is eos or error.
     int32_t _num_finished_scanners = 0;
-    int32_t _num_running_scanners = 0;
     // weak pointer for _scanners, used in stop function
     std::vector<std::weak_ptr<ScannerDelegate>> _all_scanners;
     std::shared_ptr<RuntimeProfile> _scanner_profile;
-    RuntimeProfile::Counter* _scanner_sched_counter = nullptr;
     // This counter refers to scan operator's local state
     RuntimeProfile::Counter* _scanner_memory_used_counter = nullptr;
     RuntimeProfile::Counter* _newly_create_free_blocks_num = nullptr;
     RuntimeProfile::Counter* _scale_up_scanners_counter = nullptr;
-    QueryThreadContext _query_thread_context;
+    std::shared_ptr<ResourceContext> _resource_ctx;
     std::shared_ptr<pipeline::Dependency> _dependency = nullptr;
-    bool _ignore_data_distribution = false;
-    bool _is_file_scan_operator = false;
+    const int _parallism_of_scan_operator;
+    std::shared_ptr<doris::vectorized::TaskHandle> _task_handle;
 
-    // for scaling up the running scanners
-    size_t _estimated_block_size = 0;
     std::atomic<int64_t> _block_memory_usage = 0;
-    int64_t _last_scale_up_time = 0;
-    int64_t _last_fetch_time = 0;
-    int64_t _total_wait_block_time = 0;
-    double _last_wait_duration_ratio = 0;
-    const int64_t SCALE_UP_DURATION = 5000; // 5000ms
-    const float WAIT_BLOCK_DURATION_RATIO = 0.5;
-    const float SCALE_UP_RATIO = 0.5;
-    float MAX_SCALE_UP_RATIO;
+
+    // adaptive scan concurrency related
+
+    int32_t _min_scan_concurrency_of_scan_scheduler = 0;
+    int32_t _min_scan_concurrency = 1;
+    int32_t _max_scan_concurrency = 0;
+
+    std::shared_ptr<ScanTask> _pull_next_scan_task(std::shared_ptr<ScanTask> current_scan_task,
+                                                   int32_t current_concurrency);
+
+    int32_t _get_margin(std::unique_lock<std::mutex>& transfer_lock,
+                        std::unique_lock<std::shared_mutex>& scheduler_lock);
+
+    // TODO: Add implementation of runtime_info_feed_back
+    // adaptive scan concurrency related end
 };
 } // namespace vectorized
 } // namespace doris

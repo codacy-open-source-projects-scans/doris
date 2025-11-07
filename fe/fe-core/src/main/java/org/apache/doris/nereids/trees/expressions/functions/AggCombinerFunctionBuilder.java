@@ -117,9 +117,14 @@ public class AggCombinerFunctionBuilder extends FunctionBuilder {
         }
 
         Expression arg = (Expression) arguments.get(0);
-        AggStateType type = (AggStateType) arg.getDataType();
+        List<Expression> nestedArguments;
+        if (arg instanceof StateCombinator) {
+            nestedArguments = arg.children();
+        } else {
+            nestedArguments = ((AggStateType) arg.getDataType()).getMockedExpressions();
+        }
 
-        return (AggregateFunction) nestedBuilder.build(nestedName, type.getMockedExpressions()).first;
+        return (AggregateFunction) nestedBuilder.build(nestedName, nestedArguments).first;
     }
 
     @Override
@@ -143,6 +148,11 @@ public class AggCombinerFunctionBuilder extends FunctionBuilder {
             return Pair.of(new ForEachCombinator((List<Expression>) arguments, nestedFunction), nestedFunction);
         }
         return null;
+    }
+
+    @Override
+    public String parameterDisplayString() {
+        return nestedBuilder.parameterDisplayString();
     }
 
     public static boolean isAggStateCombinator(String name) {

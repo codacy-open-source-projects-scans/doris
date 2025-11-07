@@ -247,17 +247,6 @@ echo "===== Patching thirdparty archives..."
 ###################################################################################
 PATCHED_MARK="patched_mark"
 
-# abseil patch
-if [[ " ${TP_ARCHIVES[*]} " =~ " ABSEIL " ]]; then
-    cd "${TP_SOURCE_DIR}/${ABSEIL_SOURCE}"
-    if [[ ! -f "${PATCHED_MARK}" ]]; then
-        patch -p1 <"${TP_PATCH_DIR}/absl.patch"
-        touch "${PATCHED_MARK}"
-    fi
-    cd -
-    echo "Finished patching ${ABSEIL_SOURCE}"
-fi
-
 # glog patch
 if [[ " ${TP_ARCHIVES[*]} " =~ " GLOG " ]]; then
     if [[ "${GLOG_SOURCE}" == "glog-0.4.0" ]]; then
@@ -278,17 +267,6 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " GLOG " ]]; then
     echo "Finished patching ${GLOG_SOURCE}"
 fi
 
-# gtest patch
-if [[ " ${TP_ARCHIVES[*]} " =~ " GTEST " ]]; then
-    cd "${TP_SOURCE_DIR}/${GTEST_SOURCE}"
-    if [[ ! -f "${PATCHED_MARK}" ]]; then
-        patch -p1 <"${TP_PATCH_DIR}/googletest-release-1.11.0.patch"
-        touch "${PATCHED_MARK}"
-    fi
-    cd -
-    echo "Finished patching ${GTEST_SOURCE}"
-fi
-
 # mysql patch
 if [[ " ${TP_ARCHIVES[*]} " =~ " MYSQL " ]]; then
     cd "${TP_SOURCE_DIR}/${MYSQL_SOURCE}"
@@ -298,19 +276,6 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " MYSQL " ]]; then
     fi
     cd -
     echo "Finished patching ${MYSQL_SOURCE}"
-fi
-
-# libevent patch
-if [[ " ${TP_ARCHIVES[*]} " =~ " LIBEVENT " ]]; then
-    cd "${TP_SOURCE_DIR}/${LIBEVENT_SOURCE}"
-    if [[ ! -f "${PATCHED_MARK}" ]]; then
-        patch -p1 <"${TP_PATCH_DIR}/libevent.patch"
-        patch -p1 <"${TP_PATCH_DIR}/libevent-1532.patch"
-        patch -p1 <"${TP_PATCH_DIR}/libevent-keepalive-accepted-socket.patch"
-        touch "${PATCHED_MARK}"
-    fi
-    cd -
-    echo "Finished patching ${LIBEVENT_SOURCE}"
 fi
 
 # gsasl2 patch to fix link error such as mutilple func defination
@@ -354,6 +319,9 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " ROCKSDB " ]]; then
         cd "${TP_SOURCE_DIR}/${ROCKSDB_SOURCE}"
         if [[ ! -f "${PATCHED_MARK}" ]]; then
             patch -p1 <"${TP_PATCH_DIR}/rocksdb-5.14.2.patch"
+            if [[ "$(uname -s)" == "Darwin" ]]; then
+                patch -p1 <"${TP_PATCH_DIR}/rocksdb-mac-compile-fix.patch"
+            fi 
             touch "${PATCHED_MARK}"
         fi
         cd -
@@ -376,10 +344,10 @@ fi
 
 # patch librdkafka to avoid crash
 if [[ " ${TP_ARCHIVES[*]} " =~ " LIBRDKAFKA " ]]; then
-    if [[ "${LIBRDKAFKA_SOURCE}" == "librdkafka-1.9.2" ]]; then
+    if [[ "${LIBRDKAFKA_SOURCE}" == "librdkafka-2.11.0" ]]; then
         cd "${TP_SOURCE_DIR}/${LIBRDKAFKA_SOURCE}"
         if [[ ! -f "${PATCHED_MARK}" ]]; then
-            patch -p0 <"${TP_PATCH_DIR}/librdkafka-1.9.2.patch"
+            patch -p0 <"${TP_PATCH_DIR}/librdkafka-2.11.0.patch"
             touch "${PATCHED_MARK}"
         fi
         cd -
@@ -425,6 +393,7 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " AWS_SDK " ]]; then
                 bash ./prefetch_crt_dependency.sh
             fi
             patch -p1 <"${TP_PATCH_DIR}/aws-sdk-cpp-1.11.119.patch"
+            patch -p1 <"${TP_PATCH_DIR}/aws-sdk-cpp-1.11.119-cmake.patch"
         else
             bash ./prefetch_crt_dependency.sh
         fi
@@ -436,7 +405,7 @@ fi
 
 # patch simdjson, change simdjson::dom::element_type::BOOL to BOOLEAN to avoid conflict with odbc macro BOOL
 if [[ " ${TP_ARCHIVES[*]} " =~ " SIMDJSON " ]]; then
-    if [[ "${SIMDJSON_SOURCE}" = "simdjson-3.0.1" ]]; then
+    if [[ "${SIMDJSON_SOURCE}" = "simdjson-3.11.6" ]]; then
         cd "${TP_SOURCE_DIR}/${SIMDJSON_SOURCE}"
         if [[ ! -f "${PATCHED_MARK}" ]]; then
             patch -p1 <"${TP_PATCH_DIR}/simdjson-3.0.1.patch"
@@ -489,6 +458,59 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " BASE64 " ]]; then
     echo "Finished patching ${BASE64_SOURCE}"
 fi
 
+# patch libuuid
+if [[ " ${TP_ARCHIVES[*]} " =~ " LIBUUID " ]]; then
+    if [[ "${LIBUUID_SOURCE}" = "libuuid-1.0.3" ]]; then
+        cd "${TP_SOURCE_DIR}/${LIBUUID_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            patch -p1 <"${TP_PATCH_DIR}/libuuid-1.0.3.patch"
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
+    echo "Finished patching ${LIBUUID_SOURCE}"
+fi
+
+# patch libdivide
+if [[ " ${TP_ARCHIVES[*]} " =~ " LIBDIVIDE " ]]; then
+    if [[ "${LIBDIVIDE_SOURCE}" = "libdivide-5.0" ]]; then
+        cd "${TP_SOURCE_DIR}/${LIBDIVIDE_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            patch -p1 <"${TP_PATCH_DIR}/libdivide-5.0.patch"
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
+    echo "Finished patching ${LIBDIVIDE_SOURCE}"
+fi
+
+# patch grpc
+if [[ " ${TP_ARCHIVES[*]} " =~ " GRPC " ]]; then
+    if [[ "${GRPC_SOURCE}" = "grpc-1.54.3" ]]; then
+        cd "${TP_SOURCE_DIR}/${GRPC_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            patch -p1 <"${TP_PATCH_DIR}/grpc-1.54.3.patch"
+            patch -p1 <"${TP_PATCH_DIR}/grpc-absl-fix.patch"
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
+    echo "Finished patching ${GRPC_SOURCE}"
+fi
+
+# patch flatbuffer
+if [[ " ${TP_ARCHIVES[*]} " =~ " FLATBUFFERS " ]]; then
+    if [[ "${FLATBUFFERS_SOURCE}" = "flatbuffers-2.0.0" ]]; then
+        cd "${TP_SOURCE_DIR}/${FLATBUFFERS_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            patch -p1 <"${TP_PATCH_DIR}/flatbuffers-2.0.0.patch"
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
+    echo "Finished patching ${FLATBUFFERS_SOURCE}"
+fi
+
 # patch krb
 if [[ " ${TP_ARCHIVES[*]} " =~ " KRB5 " ]]; then
     if [[ "${KRB5_SOURCE}" = "krb5-1.19" ]]; then
@@ -519,6 +541,59 @@ else
         fi
         echo "Finished patching ${BITSHUFFLE_SOURCE}"
     fi
+fi
+
+# patch thrift
+if [[ " ${TP_ARCHIVES[*]} " =~ " THRIFT " ]]; then
+    if [[ "${THRIFT_SOURCE}" == 'thrift-0.16.0' ]]; then
+        cd "${TP_SOURCE_DIR}/${THRIFT_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            for patch_file in "${TP_PATCH_DIR}"/thrift-0.16*; do
+                echo "patch ${patch_file}"
+                patch -p1 --ignore-whitespace <"${patch_file}"
+            done
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
+    echo "Finished patching ${THRIFT_SOURCE}"
+fi
+
+# patch re2
+if [[ " ${TP_ARCHIVES[*]} " =~ " RE2 " ]]; then
+    if [[ "${RE2_SOURCE}" == 're2-2021-02-02' ]]; then
+        cd "${TP_SOURCE_DIR}/${RE2_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            for patch_file in "${TP_PATCH_DIR}"/re2-*; do
+                echo "patch ${patch_file}"
+                patch -p1 --ignore-whitespace <"${patch_file}"
+            done
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
+    echo "Finished patching ${RE2_SOURCE}"
+fi
+
+# patch azure
+if [[ " ${TP_ARCHIVES[*]} " =~ " AZURE " ]]; then
+    cd "${TP_SOURCE_DIR}/${AZURE_SOURCE}"
+    if [[ ! -f "${PATCHED_MARK}" ]]; then
+        patch -p1 <"${TP_PATCH_DIR}/azure-sdk-for-cpp-azure-core_1.16.0.patch"
+        touch "${PATCHED_MARK}"
+    fi
+    cd -
+    echo "Finished patching ${AZURE_SOURCE}"
+fi
+
+if [[ " ${TP_ARCHIVES[*]} " =~ " CCTZ " ]] ; then
+    cd $TP_SOURCE_DIR/$CCTZ_SOURCE
+    if [[ ! -f "$PATCHED_MARK" ]] ; then
+        patch -p1 <"${TP_PATCH_DIR}/cctz-civil-cache.patch"
+        touch "$PATCHED_MARK"
+    fi
+    cd -
+    echo "Finished patching ${CCTZ_SOURCE}"
 fi
 
 # vim: ts=4 sw=4 ts=4 tw=100:

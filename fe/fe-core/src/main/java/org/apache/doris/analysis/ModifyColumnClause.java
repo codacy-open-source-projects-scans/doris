@@ -22,7 +22,7 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.OlapTable;
-import org.apache.doris.catalog.Table;
+import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 
@@ -33,6 +33,7 @@ import java.util.Map;
 // modify one column
 public class ModifyColumnClause extends AlterTableClause {
     private ColumnDef columnDef;
+    private String sql;
     private ColumnPosition colPos;
     // which rollup is to be modify, if rollup is null, modify base table.
     private String rollupName;
@@ -67,14 +68,26 @@ public class ModifyColumnClause extends AlterTableClause {
         this.properties = properties;
     }
 
+    public ModifyColumnClause(String sql, Column column, ColumnPosition colPos, String rollup,
+            Map<String, String> properties) {
+        super(AlterOpType.SCHEMA_CHANGE);
+        this.sql = sql;
+        this.column = column;
+        this.colPos = colPos;
+        this.rollupName = rollup;
+        this.properties = properties;
+    }
+
     @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException, DdlException {
+    public void analyze() throws AnalysisException, DdlException {
         if (columnDef == null) {
             throw new AnalysisException("No column definition in modify column clause.");
         }
-        if (tableName != null) {
-            Table table = Env.getCurrentInternalCatalog().getDbOrDdlException(tableName.getDb())
-                    .getTableOrDdlException(tableName.getTbl());
+        if (tableNameInfo != null) {
+            TableIf table = Env.getCurrentEnv().getCatalogMgr()
+                    .getCatalogOrDdlException(tableNameInfo.getCtl())
+                    .getDbOrDdlException(tableNameInfo.getDb())
+                    .getTableOrDdlException(tableNameInfo.getTbl());
             if (table instanceof OlapTable && ((OlapTable) table).getKeysType() == KeysType.AGG_KEYS
                     && columnDef.getAggregateType() == null) {
                 columnDef.setIsKey(true);
@@ -112,15 +125,19 @@ public class ModifyColumnClause extends AlterTableClause {
 
     @Override
     public String toSql() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("MODIFY COLUMN ").append(columnDef.toSql());
-        if (colPos != null) {
-            sb.append(" ").append(colPos);
+        if (sql != null) {
+            return sql;
+        } else {
+            StringBuilder sb = new StringBuilder();
+            sb.append("MODIFY COLUMN ").append(columnDef.toSql());
+            if (colPos != null) {
+                sb.append(" ").append(colPos);
+            }
+            if (rollupName != null) {
+                sb.append(" IN `").append(rollupName).append("`");
+            }
+            return sb.toString();
         }
-        if (rollupName != null) {
-            sb.append(" IN `").append(rollupName).append("`");
-        }
-        return sb.toString();
     }
 
     @Override

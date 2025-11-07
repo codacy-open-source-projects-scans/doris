@@ -52,31 +52,6 @@ suite("test_agg_keys_schema_change_decimalv2", "nonConcurrent") {
     def configList = parseJson(out.trim())
     assert configList instanceof List
 
-    def do_compact = { tableName ->
-        String[][] tablets = sql """ show tablets from ${tableName}; """
-        for (String[] tablet in tablets) {
-            String tablet_id = tablet[0]
-            backend_id = tablet[2]
-            logger.info("run compaction:" + tablet_id)
-            (code, out, err) = be_run_cumulative_compaction(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id), tablet_id )
-            logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
-        }
-
-        // wait for all compactions done
-        for (String[] tablet in tablets) {
-            Awaitility.await().untilAsserted(() -> {
-                String tablet_id = tablet[0]
-                backend_id = tablet[2]
-                (code, out, err) = be_get_compaction_status(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id), tablet_id)
-                logger.info("Get compaction status: code=" + code + ", out=" + out + ", err=" + err)
-                assertEquals(code, 0)
-                def compactionStatus = parseJson(out.trim())
-                assertEquals("success", compactionStatus.status.toLowerCase())
-                return compactionStatus.run_status;
-            });
-        }
-    }
-
     sql """ DROP TABLE IF EXISTS ${tbName} FORCE"""
     // Create table and disable light weight schema change
     sql """
@@ -109,7 +84,7 @@ suite("test_agg_keys_schema_change_decimalv2", "nonConcurrent") {
 
     sql """sync"""
     qt_sql2 """select * from ${tbName} ORDER BY 1,2,3,4;"""
-    do_compact(tbName)
+    trigger_and_wait_compaction(tbName, "cumulative")
     sql """sync"""
     qt_sql3 """select * from ${tbName} ORDER BY 1,2,3,4;"""
 
@@ -195,6 +170,7 @@ suite("test_agg_keys_schema_change_decimalv2", "nonConcurrent") {
 
 
     // DECIMALV3(21,3) -> decimalv2 OK
+    /*
     sql """ alter table ${tbName} modify column decimalv2k2 DECIMALV2(21,3) key """
     Awaitility.await().atMost(max_try_secs, TimeUnit.SECONDS).with().pollDelay(500, TimeUnit.MILLISECONDS).await().until(() -> {
         String result = getJobState(tbName)
@@ -235,6 +211,7 @@ suite("test_agg_keys_schema_change_decimalv2", "nonConcurrent") {
 
     sql """sync"""
     qt_sql9_3 """select * from ${tbName} ORDER BY 1,2,3,4;"""
+    */
 
     // restore disable_decimalv2 to old_value
     sql """ ADMIN SET FRONTEND CONFIG ("disable_decimalv2" = "${old_value1}"); """

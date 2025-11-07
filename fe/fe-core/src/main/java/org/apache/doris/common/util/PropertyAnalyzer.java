@@ -21,6 +21,7 @@ import org.apache.doris.analysis.DataSortInfo;
 import org.apache.doris.analysis.DateLiteral;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DataProperty;
+import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.EnvFactory;
@@ -34,13 +35,16 @@ import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.Pair;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.datasource.ExternalCatalog;
+import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.policy.Policy;
 import org.apache.doris.policy.StoragePolicy;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TCompressionType;
+import org.apache.doris.thrift.TEncryptionAlgorithm;
 import org.apache.doris.thrift.TInvertedIndexFileStorageFormat;
 import org.apache.doris.thrift.TSortType;
 import org.apache.doris.thrift.TStorageFormat;
@@ -54,11 +58,13 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import lombok.val;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -101,6 +107,9 @@ public class PropertyAnalyzer {
 
     public static final String PROPERTIES_STORAGE_PAGE_SIZE = "storage_page_size";
     public static final long STORAGE_PAGE_SIZE_DEFAULT_VALUE = 65536L;
+
+    public static final String PROPERTIES_STORAGE_DICT_PAGE_SIZE = "storage_dict_page_size";
+    public static final long STORAGE_DICT_PAGE_SIZE_DEFAULT_VALUE = 262144L;
 
     public static final String PROPERTIES_ENABLE_LIGHT_SCHEMA_CHANGE = "light_schema_change";
 
@@ -240,6 +249,19 @@ public class PropertyAnalyzer {
     public static final long TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD_DEFAULT_VALUE = 5;
     public static final long TIME_SERIES_COMPACTION_LEVEL_THRESHOLD_DEFAULT_VALUE = 1;
 
+    public static final String PROPERTIES_VARIANT_MAX_SUBCOLUMNS_COUNT = "variant_max_subcolumns_count";
+
+    public static final String PROPERTIES_VARIANT_ENABLE_TYPED_PATHS_TO_SPARSE = "variant_enable_typed_paths_to_sparse";
+    public static final String PROPERTIES_TDE_ALGORITHM = "tde_algorithm";
+    public static final String AES256 = "AES256";
+    public static final String SM4 = "SM4";
+    public static final String PLAINTEXT = "PLAINTEXT";
+
+    public static final String PROPERTIES_VARIANT_MAX_SPARSE_COLUMN_STATISTICS_SIZE =
+            "variant_max_sparse_column_statistics_size";
+    // number of buckets when using bucketized sparse serialization
+    public static final String PROPERTIES_VARIANT_SPARSE_HASH_SHARD_COUNT = "variant_sparse_hash_shard_count";
+
     public enum RewriteType {
         PUT,      // always put property
         REPLACE,  // replace if exists property
@@ -332,6 +354,7 @@ public class PropertyAnalyzer {
         String newStoragePolicy = oldStoragePolicy;
         boolean hasStoragePolicy = false;
         boolean storageMediumSpecified = false;
+        boolean isBeingSynced = false;
 
         for (Map.Entry<String, String> entry : properties.entrySet()) {
             String key = entry.getKey();
@@ -357,6 +380,8 @@ public class PropertyAnalyzer {
             } else if (key.equalsIgnoreCase(PROPERTIES_STORAGE_POLICY)) {
                 hasStoragePolicy = true;
                 newStoragePolicy = value;
+            } else if (key.equalsIgnoreCase(PROPERTIES_IS_BEING_SYNCED)) {
+                isBeingSynced = Boolean.parseBoolean(value);
             }
         } // end for properties
 
@@ -384,6 +409,12 @@ public class PropertyAnalyzer {
 
         if (storageMedium == TStorageMedium.SSD && !hasCooldown) {
             cooldownTimestamp = DataProperty.MAX_COOLDOWN_TIME_MS;
+        }
+
+        // when isBeingSynced property is set to true, the storage policy will be ignored
+        if (isBeingSynced) {
+            hasStoragePolicy = false;
+            newStoragePolicy = "";
         }
 
         if (hasStoragePolicy && !"".equals(newStoragePolicy)) {
@@ -886,7 +917,8 @@ public class PropertyAnalyzer {
                 + " must be `true` or `false`");
     }
 
-    public static String analyzeCompactionPolicy(Map<String, String> properties) throws AnalysisException {
+    public static String analyzeCompactionPolicy(Map<String, String> properties, KeysType keysType)
+            throws AnalysisException {
         if (properties == null || properties.isEmpty()) {
             return SIZE_BASED_COMPACTION_POLICY;
         }
@@ -901,6 +933,9 @@ public class PropertyAnalyzer {
             }
         }
 
+        if (keysType == KeysType.UNIQUE_KEYS && compactionPolicy.equals(TIME_SERIES_COMPACTION_POLICY)) {
+            throw new AnalysisException("Time series compaction policy is not supported for unique key table");
+        }
         return compactionPolicy;
     }
 
@@ -1022,16 +1057,7 @@ public class PropertyAnalyzer {
         return goalSizeMbytes;
     }
 
-    // analyzeCompressionType will parse the compression type from properties
-    public static TCompressionType analyzeCompressionType(Map<String, String> properties) throws AnalysisException {
-        String compressionType = "";
-        if (properties != null && properties.containsKey(PROPERTIES_COMPRESSION)) {
-            compressionType = properties.get(PROPERTIES_COMPRESSION);
-            properties.remove(PROPERTIES_COMPRESSION);
-        } else {
-            return TCompressionType.LZ4F;
-        }
-
+    public static TCompressionType stringToCompressionType(String compressionType) throws AnalysisException {
         if (compressionType.equalsIgnoreCase("no_compression")) {
             return TCompressionType.NO_COMPRESSION;
         } else if (compressionType.equalsIgnoreCase("lz4")) {
@@ -1046,11 +1072,34 @@ public class PropertyAnalyzer {
             return TCompressionType.ZSTD;
         } else if (compressionType.equalsIgnoreCase("snappy")) {
             return TCompressionType.SNAPPY;
+        } else if (compressionType.equalsIgnoreCase("default_compression")
+                && !Config.default_compression_type.equalsIgnoreCase("default_compression")) {
+            return TCompressionType.valueOf(Config.default_compression_type);
         } else if (compressionType.equalsIgnoreCase("default_compression")) {
             return TCompressionType.LZ4F;
         } else {
             throw new AnalysisException("unknown compression type: " + compressionType);
         }
+    }
+
+    // analyzeCompressionType will parse the compression type from properties
+    public static TCompressionType getCompressionTypeFromProperties(Map<String, String> properties)
+            throws AnalysisException {
+        String compressionType = "";
+        if (properties != null && properties.containsKey(PROPERTIES_COMPRESSION)) {
+            compressionType = properties.get(PROPERTIES_COMPRESSION);
+        } else {
+            return stringToCompressionType(Config.default_compression_type);
+        }
+
+        return stringToCompressionType(compressionType);
+    }
+
+    // analyzeCompressionType will parse the compression type from properties
+    public static TCompressionType analyzeCompressionType(Map<String, String> properties) throws AnalysisException {
+        TCompressionType compressionType = getCompressionTypeFromProperties(properties);
+        properties.remove(PROPERTIES_COMPRESSION);
+        return compressionType;
     }
 
     public static long alignTo4K(long size) {
@@ -1096,6 +1145,24 @@ public class PropertyAnalyzer {
         return storagePageSize;
     }
 
+    public static long analyzeStorageDictPageSize(Map<String, String> properties) throws AnalysisException {
+        long storageDictPageSize = STORAGE_DICT_PAGE_SIZE_DEFAULT_VALUE;
+        if (properties != null && properties.containsKey(PROPERTIES_STORAGE_DICT_PAGE_SIZE)) {
+            String storageDictPageSizeStr = properties.get(PROPERTIES_STORAGE_DICT_PAGE_SIZE);
+            try {
+                storageDictPageSize = Long.parseLong(storageDictPageSizeStr);
+            } catch (NumberFormatException e) {
+                throw new AnalysisException("Invalid storage dict page size: " + storageDictPageSizeStr);
+            }
+            if (storageDictPageSize < 0 || storageDictPageSize > 104857600) {
+                throw new AnalysisException("Storage dict page size must be between 0 and 100MB.");
+            }
+            storageDictPageSize = alignTo4K(storageDictPageSize);
+            properties.remove(PROPERTIES_STORAGE_DICT_PAGE_SIZE);
+        }
+        return storageDictPageSize;
+    }
+
     // analyzeStorageFormat will parse the storage format from properties
     // sql: alter table tablet_name set ("storage_format" = "v2")
     // Use this sql to convert all tablets(base and rollup index) to a new format segment
@@ -1129,10 +1196,10 @@ public class PropertyAnalyzer {
         } else {
             if (Config.inverted_index_storage_format.equalsIgnoreCase("V1")) {
                 return TInvertedIndexFileStorageFormat.V1;
-            } else if (Config.inverted_index_storage_format.equalsIgnoreCase("V3")) {
-                return TInvertedIndexFileStorageFormat.V3;
-            } else {
+            } else if (Config.inverted_index_storage_format.equalsIgnoreCase("V2")) {
                 return TInvertedIndexFileStorageFormat.V2;
+            } else {
+                return TInvertedIndexFileStorageFormat.V3;
             }
         }
 
@@ -1145,10 +1212,10 @@ public class PropertyAnalyzer {
         } else if (invertedIndexFileStorageFormat.equalsIgnoreCase("default")) {
             if (Config.inverted_index_storage_format.equalsIgnoreCase("V1")) {
                 return TInvertedIndexFileStorageFormat.V1;
-            } else if (Config.inverted_index_storage_format.equalsIgnoreCase("V3")) {
-                return TInvertedIndexFileStorageFormat.V3;
-            } else {
+            } else if (Config.inverted_index_storage_format.equalsIgnoreCase("V2")) {
                 return TInvertedIndexFileStorageFormat.V2;
+            } else {
+                return TInvertedIndexFileStorageFormat.V3;
             }
         } else {
             throw new AnalysisException("unknown inverted index storage format: " + invertedIndexFileStorageFormat);
@@ -1183,14 +1250,78 @@ public class PropertyAnalyzer {
         return storagePolicy;
     }
 
-    public static String analyzeStorageVault(Map<String, String> properties) {
-        String storageVault = null;
+    public static boolean hasStoragePolicy(Map<String, String> properties) {
+        if (properties != null && properties.containsKey(PROPERTIES_STORAGE_POLICY)) {
+            return true;
+        }
+        return false;
+    }
+
+    public static String analyzeStorageVaultName(Map<String, String> properties) {
+        String storageVaultName = null;
         if (properties != null && properties.containsKey(PROPERTIES_STORAGE_VAULT_NAME)) {
-            storageVault = properties.get(PROPERTIES_STORAGE_VAULT_NAME);
+            storageVaultName = properties.get(PROPERTIES_STORAGE_VAULT_NAME);
             properties.remove(PROPERTIES_STORAGE_VAULT_NAME);
         }
 
-        return storageVault;
+        return storageVaultName;
+    }
+
+    /**
+     * @param properties, db
+     * @return <storageVaultName, storageVaultId>
+     * @throws AnalysisException
+     */
+    public static Pair<String, String> analyzeStorageVault(Map<String, String> properties, Database db)
+            throws AnalysisException {
+        String storageVaultName = analyzeStorageVaultName(properties);
+        String storageVaultId = null;
+
+        if (Strings.isNullOrEmpty(storageVaultName)) {
+            // If user does not specify one storage vault then FE would check db's storage vault then the default vault
+            // the storage vault inherit order is as follows: table -> db -> default
+            if (db.getDbProperties() != null) {
+                Map<String, String> dbProperties = new HashMap<>(db.getDbProperties().getProperties());
+                storageVaultName = PropertyAnalyzer.analyzeStorageVaultName(dbProperties);
+            }
+
+            if (!Strings.isNullOrEmpty(storageVaultName)) {
+                storageVaultId = Env.getCurrentEnv().getStorageVaultMgr().getVaultIdByName(storageVaultName);
+                LOG.info("Using database[{}] storage vault: name={}, id={}",
+                        db.getName(), storageVaultName, storageVaultId);
+            } else {
+                // continue to check default vault
+                Pair<String, String> info = Env.getCurrentEnv().getStorageVaultMgr().getDefaultStorageVault();
+                if (info == null || Strings.isNullOrEmpty(info.first) || Strings.isNullOrEmpty(info.second)) {
+                    throw new AnalysisException("No default storage vault."
+                            + " You can use `SHOW STORAGE VAULT` to get all available vaults,"
+                            + " and pick one set default vault with `SET <vault_name> AS DEFAULT STORAGE VAULT`");
+                }
+                storageVaultName = info.first;
+                LOG.info("Using default storage vault, name:{} id:{}", info.first, info.second);
+            }
+        }
+
+        if (Strings.isNullOrEmpty(storageVaultName)) {
+            throw new AnalysisException("Invalid Storage Vault. "
+                    + " You can use `SHOW STORAGE VAULT` to get all available vaults,"
+                    + " and pick one to set the table property `\"storage_vault_name\" = \"<vault_name>\"`");
+        }
+
+        storageVaultId = Env.getCurrentEnv().getStorageVaultMgr().getVaultIdByName(storageVaultName);
+        if (Strings.isNullOrEmpty(storageVaultId)) {
+            throw new AnalysisException("Storage vault '" + storageVaultName + "' does not exist. "
+                    + "You can use `SHOW STORAGE VAULT` to get all available vaults, "
+                    + "or create a new one with `CREATE STORAGE VAULT`.");
+        }
+
+        if (properties != null && properties.containsKey(PROPERTIES_STORAGE_VAULT_ID)) {
+            Preconditions.checkArgument(storageVaultId.equals(properties.get(PROPERTIES_STORAGE_VAULT_ID)),
+                    "storageVaultId check failed, %s-%s", storageVaultId, properties.get(PROPERTIES_STORAGE_VAULT_ID));
+            properties.remove(PROPERTIES_STORAGE_VAULT_ID);
+        }
+
+        return Pair.of(storageVaultName, storageVaultId);
     }
 
     // analyze property like : "type" = "xxx";
@@ -1216,11 +1347,14 @@ public class PropertyAnalyzer {
         if (typeStr != null && keysType != KeysType.UNIQUE_KEYS) {
             throw new AnalysisException("sequence column only support UNIQUE_KEYS");
         }
-        PrimitiveType type = PrimitiveType.valueOf(typeStr.toUpperCase());
+
+        Type type = DataType.convertFromString(typeStr.toLowerCase()).toCatalogDataType();
+
         if (!type.isFixedPointType() && !type.isDateType()) {
             throw new AnalysisException("sequence type only support integer types and date types");
         }
-        return ScalarType.createType(type);
+
+        return type;
     }
 
     public static String analyzeSequenceMapCol(Map<String, String> properties, KeysType keysType)
@@ -1724,5 +1858,107 @@ public class PropertyAnalyzer {
                     Boolean.toString(Config.enable_skip_bitmap_column_by_default));
         }
         return properties;
+    }
+
+    public static int analyzeVariantMaxSubcolumnsCount(Map<String, String> properties, int defuatValue)
+                                                                                throws AnalysisException {
+        int maxSubcoumnsCount = defuatValue;
+        if (properties != null && properties.containsKey(PROPERTIES_VARIANT_MAX_SUBCOLUMNS_COUNT)) {
+            String maxSubcoumnsCountStr = properties.get(PROPERTIES_VARIANT_MAX_SUBCOLUMNS_COUNT);
+            try {
+                maxSubcoumnsCount = Integer.parseInt(maxSubcoumnsCountStr);
+                if (maxSubcoumnsCount < 0 || maxSubcoumnsCount > 100000) {
+                    throw new AnalysisException("varaint max counts count must between 0 and 100000 ");
+                }
+            } catch (Exception e) {
+                throw new AnalysisException("varaint max counts count format error");
+            }
+
+            properties.remove(PROPERTIES_VARIANT_MAX_SUBCOLUMNS_COUNT);
+        }
+        return maxSubcoumnsCount;
+    }
+
+    public static boolean analyzeEnableTypedPathsToSparse(Map<String, String> properties,
+                        boolean defaultValue) throws AnalysisException {
+        boolean enableTypedPathsToSparse = defaultValue;
+        if (properties != null && properties.containsKey(PROPERTIES_VARIANT_ENABLE_TYPED_PATHS_TO_SPARSE)) {
+            String enableTypedPathsToSparseStr = properties.get(PROPERTIES_VARIANT_ENABLE_TYPED_PATHS_TO_SPARSE);
+            try {
+                enableTypedPathsToSparse = Boolean.parseBoolean(enableTypedPathsToSparseStr);
+            } catch (Exception e) {
+                throw new AnalysisException("variant_enable_typed_paths_to_sparse must be `true` or `false`");
+            }
+            properties.remove(PROPERTIES_VARIANT_ENABLE_TYPED_PATHS_TO_SPARSE);
+        }
+        return enableTypedPathsToSparse;
+    }
+
+    public static int analyzeVariantMaxSparseColumnStatisticsSize(Map<String, String> properties, int defuatValue)
+                                                                                throws AnalysisException {
+        int maxSparseColumnStatisticsSize = defuatValue;
+        if (properties != null && properties.containsKey(PROPERTIES_VARIANT_MAX_SPARSE_COLUMN_STATISTICS_SIZE)) {
+            String maxSparseColumnStatisticsSizeStr =
+                    properties.get(PROPERTIES_VARIANT_MAX_SPARSE_COLUMN_STATISTICS_SIZE);
+            try {
+                maxSparseColumnStatisticsSize = Integer.parseInt(maxSparseColumnStatisticsSizeStr);
+                if (maxSparseColumnStatisticsSize < 0 || maxSparseColumnStatisticsSize > 50000) {
+                    throw new AnalysisException("variant_max_sparse_column_statistics_size must between 0 and 50000 ");
+                }
+            } catch (Exception e) {
+                throw new AnalysisException("variant_max_sparse_column_statistics_size format error:" + e.getMessage());
+            }
+
+            properties.remove(PROPERTIES_VARIANT_MAX_SPARSE_COLUMN_STATISTICS_SIZE);
+        }
+        return maxSparseColumnStatisticsSize;
+    }
+
+    public static int analyzeVariantSparseHashShardCount(Map<String, String> properties, int defaultValue)
+                                                                                throws AnalysisException {
+        int bucketNum = defaultValue;
+        if (properties != null && properties.containsKey(PROPERTIES_VARIANT_SPARSE_HASH_SHARD_COUNT)) {
+            String bucketNumStr = properties.get(PROPERTIES_VARIANT_SPARSE_HASH_SHARD_COUNT);
+            try {
+                bucketNum = Integer.parseInt(bucketNumStr);
+                if (bucketNum < 1 || bucketNum > 1024) {
+                    throw new AnalysisException("variant_sparse_hash_shard_count must between 1 and 1024 ");
+                }
+            } catch (Exception e) {
+                throw new AnalysisException("variant_sparse_hash_shard_count format error:" + e.getMessage());
+            }
+
+            properties.remove(PROPERTIES_VARIANT_SPARSE_HASH_SHARD_COUNT);
+        }
+        return bucketNum;
+    }
+
+    public static TEncryptionAlgorithm analyzeTDEAlgorithm(Map<String, String> properties) throws AnalysisException {
+        String name;
+        //if (properties == null || !properties.containsKey(PROPERTIES_TDE_ALGORITHM)) {
+        //    name = Config.doris_tde_algorithm;
+        //} else if (!PLAINTEXT.equals(Config.doris_tde_algorithm)) {
+        //    throw new AnalysisException("Cannot create a table on encrypted FE,"
+        //            + " please set Config.doris_tde_algorithm to PLAINTEXT");
+        //} else {
+        //    name = properties.remove(PROPERTIES_TDE_ALGORITHM);
+        //}
+        //
+        if (properties == null || !properties.containsKey(PROPERTIES_TDE_ALGORITHM)) {
+            name = Config.doris_tde_algorithm;
+        } else {
+            throw new AnalysisException("Do not support tde_algorithm property currently");
+        }
+
+        if (AES256.equalsIgnoreCase(name)) {
+            return TEncryptionAlgorithm.AES256;
+        }
+        if (SM4.equalsIgnoreCase(name)) {
+            return TEncryptionAlgorithm.SM4;
+        }
+        if (PLAINTEXT.equalsIgnoreCase(name)) {
+            return TEncryptionAlgorithm.PLAINTEXT;
+        }
+        throw new AnalysisException("Invalid tde algorithm: " + name + ", only support AES256 and SM4 currently");
     }
 }

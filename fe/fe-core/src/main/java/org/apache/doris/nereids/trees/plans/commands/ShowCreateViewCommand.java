@@ -27,9 +27,9 @@ import org.apache.doris.catalog.View;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
+import org.apache.doris.info.TableNameInfo;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.trees.plans.PlanType;
-import org.apache.doris.nereids.trees.plans.commands.info.TableNameInfo;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ShowResultSet;
@@ -93,6 +93,11 @@ public class ShowCreateViewCommand extends ShowCommand {
     }
 
     @Override
+    public ShowResultSetMetaData getMetaData() {
+        return VIEW_META_DATA;
+    }
+
+    @Override
     public ShowResultSet doRun(ConnectContext ctx, StmtExecutor executor) throws Exception {
         validate(ctx);
         // Fetch the catalog, database, and view metadata
@@ -121,6 +126,6 @@ public class ShowCreateViewCommand extends ShowCommand {
         }
 
         // Set the result set and send it using the executor
-        return new ShowResultSet(VIEW_META_DATA, rows);
+        return new ShowResultSet(getMetaData(), rows);
     }
 }

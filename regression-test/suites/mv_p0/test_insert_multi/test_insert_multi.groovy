@@ -19,15 +19,27 @@ import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("test_insert_multi") {
 
+    // this mv rewrite would not be rewritten in RBO phase, so set TRY_IN_RBO explicitly to make case stable
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
     sql """ DROP TABLE IF EXISTS sales_records; """
 
     sql """
              create table sales_records(record_id int, seller_id int, store_id int, sale_date date, sale_amt bigint) distributed by hash(record_id) properties("replication_num" = "1");
         """
 
-    createMV ("create materialized view store_amt as select store_id, sum(sale_amt) from sales_records group by store_id;")
+    createMV ("create materialized view store_amt as select store_id as a1, sum(sale_amt) from sales_records group by store_id;")
 
-    sql """insert into sales_records values(1,1,1,"2020-02-02",1),(1,2,2,"2020-02-02",1);"""
+    sql """insert into sales_records
+    values
+    (1,1,1,"2020-02-02",1),
+    (1,1,1,"2020-02-02",1),
+    (1,1,1,"2020-02-02",1),
+    (1,2,2,"2020-02-02",1),
+    (1,2,2,"2020-02-02",1),
+    (1,2,2,"2020-02-02",1);
+    """
+
+    sql """alter table sales_records modify column record_id set stats ('row_count'='6');"""
 
     qt_select_star "select * from sales_records order by 1,2;"
 

@@ -17,10 +17,8 @@
 
 package org.apache.doris.mysql.privilege;
 
-import org.apache.doris.common.io.Text;
-import org.apache.doris.common.io.Writable;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.persist.gson.GsonPostProcessable;
-import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.resource.workloadgroup.WorkloadGroupMgr;
 
@@ -30,15 +28,13 @@ import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Set;
 
 /**
  * Used in
  */
-public class CommonUserProperties implements Writable, GsonPostProcessable {
+public class CommonUserProperties implements GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(CommonUserProperties.class);
 
     // The max connections allowed for a user on one FE
@@ -66,11 +62,17 @@ public class CommonUserProperties implements Writable, GsonPostProcessable {
     @SerializedName(value = "it", alternate = {"insertTimeout"})
     private int insertTimeout = -1;
 
+    @SerializedName(value = "ic")
+    private String initCatalog = InternalCatalog.INTERNAL_CATALOG_NAME;
+
     @SerializedName(value = "wg", alternate = {"workloadGroup"})
     private String workloadGroup = WorkloadGroupMgr.DEFAULT_GROUP_NAME;
 
-    @SerializedName(value = "ard", alternate = {"AllowResourceTagDowngrade"})
-    private boolean allowResourceTagDowngrade = false;
+    @SerializedName(value = "epcr", alternate = {"enablePreferCachedRowset"})
+    private boolean enablePreferCachedRowset = false;
+
+    @SerializedName(value = "qft", alternate = {"queryFreshnessTolerance"})
+    private long queryFreshnessToleranceMs = -1;
 
     private String[] sqlBlockRulesSplit = {};
 
@@ -145,9 +147,6 @@ public class CommonUserProperties implements Writable, GsonPostProcessable {
     }
 
     public void setQueryTimeout(int timeout) {
-        if (timeout <= 0) {
-            LOG.warn("Setting 0 query timeout", new RuntimeException(""));
-        }
         this.queryTimeout = timeout;
     }
 
@@ -159,6 +158,14 @@ public class CommonUserProperties implements Writable, GsonPostProcessable {
         this.insertTimeout = insertTimeout;
     }
 
+    public String getInitCatalog() {
+        return initCatalog;
+    }
+
+    public void setInitCatalog(String initCatalog) {
+        this.initCatalog = initCatalog;
+    }
+
     public String getWorkloadGroup() {
         return workloadGroup;
     }
@@ -167,25 +174,20 @@ public class CommonUserProperties implements Writable, GsonPostProcessable {
         this.workloadGroup = workloadGroup;
     }
 
-    public void setAllowResourceTagDowngrade(boolean allowResourceTagDowngrade) {
-        this.allowResourceTagDowngrade = allowResourceTagDowngrade;
+    public long getQueryFreshnessToleranceMs() {
+        return queryFreshnessToleranceMs;
     }
 
-    public boolean isAllowResourceTagDowngrade() {
-        return this.allowResourceTagDowngrade;
+    public void setQueryFreshnessToleranceMs(long queryFreshnessToleranceMs) {
+        this.queryFreshnessToleranceMs = queryFreshnessToleranceMs;
     }
 
-    @Deprecated
-    public static CommonUserProperties read(DataInput in) throws IOException {
-        String json = Text.readString(in);
-        CommonUserProperties commonUserProperties = GsonUtils.GSON.fromJson(json, CommonUserProperties.class);
-        return commonUserProperties;
+    public boolean getEnablePreferCachedRowset() {
+        return enablePreferCachedRowset;
     }
 
-    @Override
-    public void write(DataOutput out) throws IOException {
-        String json = GsonUtils.GSON.toJson(this);
-        Text.writeString(out, json);
+    public void setEnablePreferCachedRowset(boolean enablePreferCachedRowset) {
+        this.enablePreferCachedRowset = enablePreferCachedRowset;
     }
 
     @Override

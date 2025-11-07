@@ -47,10 +47,12 @@ namespace ErrorCode {
     TStatusError(IO_ERROR, true);                         \
     TStatusError(NOT_FOUND, true);                        \
     TStatusError(ALREADY_EXIST, true);                    \
+    TStatusError(DIRECTORY_NOT_EMPTY, true);              \
     TStatusError(NOT_IMPLEMENTED_ERROR, false);           \
     TStatusError(END_OF_FILE, false);                     \
     TStatusError(INTERNAL_ERROR, true);                   \
     TStatusError(RUNTIME_ERROR, true);                    \
+    TStatusError(JNI_ERROR, true);                        \
     TStatusError(CANCELLED, false);                       \
     TStatusError(ANALYSIS_ERROR, false);                  \
     TStatusError(MEM_LIMIT_EXCEEDED, false);              \
@@ -131,6 +133,10 @@ namespace ErrorCode {
     E(BAD_CAST, -254, true);                                 \
     E(ARITHMETIC_OVERFLOW_ERRROR, -255, false);              \
     E(PERMISSION_DENIED, -256, false);                       \
+    E(QUERY_MEMORY_EXCEEDED, -257, false);                   \
+    E(WORKLOAD_GROUP_MEMORY_EXCEEDED, -258, false);          \
+    E(PROCESS_MEMORY_EXCEEDED, -259, false);                 \
+    E(INVALID_INPUT_SYNTAX, -260, false);                    \
     E(CE_CMD_PARAMS_ERROR, -300, true);                      \
     E(CE_BUFFER_TOO_SMALL, -301, true);                      \
     E(CE_CMD_NOT_VALID, -302, true);                         \
@@ -245,6 +251,7 @@ namespace ErrorCode {
     E(CUMULATIVE_MISS_VERSION, -2006, true);                 \
     E(FULL_NO_SUITABLE_VERSION, -2008, false);               \
     E(FULL_MISS_VERSION, -2009, true);                       \
+    E(CUMULATIVE_MEET_DELETE_VERSION, -2010, false);         \
     E(META_INVALID_ARGUMENT, -3000, true);                   \
     E(META_OPEN_DB_ERROR, -3001, true);                      \
     E(META_KEY_NOT_FOUND, -3002, false);                     \
@@ -271,11 +278,9 @@ namespace ErrorCode {
     E(SEGCOMPACTION_INIT_READER, -3117, false);              \
     E(SEGCOMPACTION_INIT_WRITER, -3118, false);              \
     E(SEGCOMPACTION_FAILED, -3119, false);                   \
-    E(PIP_WAIT_FOR_RF, -3120, false);                        \
-    E(PIP_WAIT_FOR_SC, -3121, false);                        \
     E(ROWSET_ADD_TO_BINLOG_FAILED, -3122, true);             \
     E(ROWSET_BINLOG_NOT_ONLY_ONE_VERSION, -3123, true);      \
-    E(INVERTED_INDEX_INVALID_PARAMETERS, -6000, false);      \
+    E(INDEX_INVALID_PARAMETERS, -6000, false);               \
     E(INVERTED_INDEX_NOT_SUPPORTED, -6001, false);           \
     E(INVERTED_INDEX_CLUCENE_ERROR, -6002, false);           \
     E(INVERTED_INDEX_FILE_NOT_FOUND, -6003, false);          \
@@ -291,9 +296,11 @@ namespace ErrorCode {
     E(KEY_NOT_FOUND, -7000, false);                          \
     E(KEY_ALREADY_EXISTS, -7001, false);                     \
     E(ENTRY_NOT_FOUND, -7002, false);                        \
+    E(NEW_ROWS_IN_PARTIAL_UPDATE, -7003, false);             \
     E(INVALID_TABLET_STATE, -7211, false);                   \
     E(ROWSETS_EXPIRED, -7311, false);                        \
-    E(CGROUP_ERROR, -7411, false);
+    E(CGROUP_ERROR, -7411, false);                           \
+    E(FATAL_ERROR, -7412, true);
 
 // Define constexpr int error_code_name = error_code_value
 #define M(NAME, ERRORCODE, ENABLESTACKTRACE) constexpr int NAME = ERRORCODE;
@@ -380,6 +387,11 @@ public:
         _code = rhs._code;
         if (rhs._err_msg) {
             _err_msg = std::make_unique<ErrMsg>(*rhs._err_msg);
+        } else {
+            // If rhs error msg is empty, then should also clear current error msg
+            // For example, if rhs is OK and current status is error, then copy to current
+            // status, should clear current error message.
+            _err_msg.reset();
         }
         return *this;
     }
@@ -389,6 +401,8 @@ public:
         _code = rhs._code;
         if (rhs._err_msg) {
             _err_msg = std::move(rhs._err_msg);
+        } else {
+            _err_msg.reset();
         }
         return *this;
     }
@@ -446,6 +460,14 @@ public:
 
     static Status OK() { return {}; }
 
+    template <bool stacktrace = true, typename... Args>
+    static Status FatalError(std::string_view msg, Args&&... args) {
+#ifndef NDEBUG
+        LOG(FATAL) << fmt::format(msg, std::forward<Args>(args)...);
+#endif
+        return Error<ErrorCode::FATAL_ERROR, stacktrace>(msg, std::forward<Args>(args)...);
+    }
+
 // default have stacktrace. could disable manually.
 #define ERROR_CTOR(name, code)                                                       \
     template <bool stacktrace = true, typename... Args>                              \
@@ -470,12 +492,12 @@ public:
     ERROR_CTOR(IOError, IO_ERROR)
     ERROR_CTOR(NotFound, NOT_FOUND)
     ERROR_CTOR_NOSTACK(AlreadyExist, ALREADY_EXIST)
+    ERROR_CTOR_NOSTACK(DirectoryNotEmpty, DIRECTORY_NOT_EMPTY)
     ERROR_CTOR(NotSupported, NOT_IMPLEMENTED_ERROR)
     ERROR_CTOR_NOSTACK(EndOfFile, END_OF_FILE)
     ERROR_CTOR(InternalError, INTERNAL_ERROR)
-    ERROR_CTOR_NOSTACK(WaitForRf, PIP_WAIT_FOR_RF)
-    ERROR_CTOR_NOSTACK(WaitForScannerContext, PIP_WAIT_FOR_SC)
     ERROR_CTOR(RuntimeError, RUNTIME_ERROR)
+    ERROR_CTOR(JniError, JNI_ERROR)
     ERROR_CTOR_NOSTACK(Cancelled, CANCELLED)
     ERROR_CTOR(MemoryLimitExceeded, MEM_LIMIT_EXCEEDED)
     ERROR_CTOR(RpcError, THRIFT_RPC_ERROR)
@@ -587,8 +609,14 @@ public:
             return false;
         }
         error_st_ = new_status;
-        error_code_.store(new_status.code(), std::memory_order_release);
+        error_code_.store(static_cast<int16_t>(new_status.code()), std::memory_order_release);
         return true;
+    }
+
+    void reset() {
+        std::lock_guard l(mutex_);
+        error_st_ = Status::OK();
+        error_code_ = 0;
     }
 
     // will copy a new status object to avoid concurrency
@@ -708,15 +736,25 @@ using ResultError = unexpected<Status>;
         }                                           \
     } while (false)
 
-#define DORIS_TRY(stmt)                          \
-    ({                                           \
-        auto&& res = (stmt);                     \
-        using T = std::decay_t<decltype(res)>;   \
-        if (!res.has_value()) [[unlikely]] {     \
-            return std::forward<T>(res).error(); \
-        }                                        \
-        std::forward<T>(res).value();            \
+#define DORIS_TRY(stmt)                              \
+    ({                                               \
+        auto&& try_res = (stmt);                     \
+        using T = std::decay_t<decltype(try_res)>;   \
+        if (!try_res.has_value()) [[unlikely]] {     \
+            return std::forward<T>(try_res).error(); \
+        }                                            \
+        std::forward<T>(try_res).value();            \
     });
+
+#define TEST_TRY(stmt)                                                                          \
+    ({                                                                                          \
+        auto&& res = (stmt);                                                                    \
+        using T = std::decay_t<decltype(res)>;                                                  \
+        if (!res.has_value()) [[unlikely]] {                                                    \
+            ASSERT_TRUE(res.has_value()) << "Expected success, but got error: " << res.error(); \
+        }                                                                                       \
+        std::forward<T>(res).value();                                                           \
+    })
 
 } // namespace doris
 

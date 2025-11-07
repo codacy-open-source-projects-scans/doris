@@ -17,8 +17,11 @@
 
 #pragma once
 
+#include <gen_cpp/Metrics_types.h>
+
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "common/config.h"
@@ -48,9 +51,9 @@ class VRuntimeFilterWrapper final : public VExpr {
 
 public:
     VRuntimeFilterWrapper(const TExprNode& node, VExprSPtr impl, double ignore_thredhold,
-                          bool null_aware = false);
+                          bool null_aware, int filter_id);
     ~VRuntimeFilterWrapper() override = default;
-    Status execute(VExprContext* context, Block* block, int* result_column_id) override;
+    Status execute(VExprContext* context, Block* block, int* result_column_id) const override;
     Status prepare(RuntimeState* state, const RowDescriptor& desc, VExprContext* context) override;
     Status open(RuntimeState* state, VExprContext* context,
                 FunctionContext::FunctionStateScope scope) override;
@@ -59,19 +62,31 @@ public:
     const std::string& expr_name() const override;
     const VExprSPtrs& children() const override { return _impl->children(); }
 
+    uint64_t get_digest(uint64_t seed) const override { return _impl->get_digest(seed); }
+
     VExprSPtr get_impl() const override { return _impl; }
 
-    void attach_profile_counter(RuntimeProfile::Counter* expr_filtered_rows_counter,
-                                RuntimeProfile::Counter* expr_input_rows_counter,
-                                RuntimeProfile::Counter* always_true_counter) {
-        _expr_filtered_rows_counter = expr_filtered_rows_counter;
-        _expr_input_rows_counter = expr_input_rows_counter;
-        _always_true_counter = always_true_counter;
+    void attach_profile_counter(std::shared_ptr<RuntimeProfile::Counter> rf_input_rows,
+                                std::shared_ptr<RuntimeProfile::Counter> rf_filter_rows,
+                                std::shared_ptr<RuntimeProfile::Counter> always_true_filter_rows) {
+        DCHECK(rf_input_rows != nullptr);
+        DCHECK(rf_filter_rows != nullptr);
+        DCHECK(always_true_filter_rows != nullptr);
+
+        if (rf_input_rows != nullptr) {
+            _rf_input_rows = rf_input_rows;
+        }
+        if (rf_filter_rows != nullptr) {
+            _rf_filter_rows = rf_filter_rows;
+        }
+        if (always_true_filter_rows != nullptr) {
+            _always_true_filter_rows = always_true_filter_rows;
+        }
     }
 
     void update_counters(int64_t filter_rows, int64_t input_rows) {
-        COUNTER_UPDATE(_expr_filtered_rows_counter, filter_rows);
-        COUNTER_UPDATE(_expr_input_rows_counter, input_rows);
+        COUNTER_UPDATE(_rf_filter_rows, filter_rows);
+        COUNTER_UPDATE(_rf_input_rows, input_rows);
     }
 
     template <typename T>
@@ -82,6 +97,8 @@ public:
     }
 
     bool is_rf_wrapper() const override { return true; }
+
+    int filter_id() const { return _filter_id; }
 
     void do_judge_selectivity(uint64_t filter_rows, uint64_t input_rows) override {
         update_counters(filter_rows, input_rows);
@@ -94,8 +111,15 @@ public:
         }
     }
 
+    std::shared_ptr<RuntimeProfile::Counter> predicate_filtered_rows_counter() const {
+        return _rf_filter_rows;
+    }
+    std::shared_ptr<RuntimeProfile::Counter> predicate_input_rows_counter() const {
+        return _rf_input_rows;
+    }
+
 private:
-    void reset_judge_selectivity() {
+    void reset_judge_selectivity() const {
         _always_true = false;
         _judge_counter = config::runtime_filter_sampling_frequency;
         _judge_input_rows = 0;
@@ -111,18 +135,22 @@ private:
     // is evaluated as true, the logic for always_true is applied for the rest of that period
     // without recalculating. At the beginning of the next period,
     // reset_judge_selectivity is used to reset these variables.
-    std::atomic_int _judge_counter = 0;
-    std::atomic_uint64_t _judge_input_rows = 0;
-    std::atomic_uint64_t _judge_filter_rows = 0;
-    std::atomic_int _always_true = false;
+    mutable std::atomic_int _judge_counter = 0;
+    mutable std::atomic_uint64_t _judge_input_rows = 0;
+    mutable std::atomic_uint64_t _judge_filter_rows = 0;
+    mutable std::atomic_int _always_true = false;
 
-    RuntimeProfile::Counter* _expr_filtered_rows_counter = nullptr;
-    RuntimeProfile::Counter* _expr_input_rows_counter = nullptr;
-    RuntimeProfile::Counter* _always_true_counter = nullptr;
+    std::shared_ptr<RuntimeProfile::Counter> _rf_input_rows =
+            std::make_shared<RuntimeProfile::Counter>(TUnit::UNIT, 0);
+    std::shared_ptr<RuntimeProfile::Counter> _rf_filter_rows =
+            std::make_shared<RuntimeProfile::Counter>(TUnit::UNIT, 0);
+    std::shared_ptr<RuntimeProfile::Counter> _always_true_filter_rows =
+            std::make_shared<RuntimeProfile::Counter>(TUnit::UNIT, 0);
 
     std::string _expr_name;
     double _ignore_thredhold;
     bool _null_aware;
+    int _filter_id;
 };
 
 using VRuntimeFilterPtr = std::shared_ptr<VRuntimeFilterWrapper>;

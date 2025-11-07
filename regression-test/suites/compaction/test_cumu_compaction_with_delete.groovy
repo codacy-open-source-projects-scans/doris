@@ -17,7 +17,7 @@
 
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
-suite("test_cumu_compaction_with_delete") {
+suite("test_cumu_compaction_with_delete", "nonConcurrent") {
     def backendId_to_backendIP = [:]
     def backendId_to_backendHttpPort = [:]
     getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort);
@@ -51,11 +51,10 @@ suite("test_cumu_compaction_with_delete") {
             CREATE TABLE ${tableName} (
             `user_id` INT NOT NULL,
             `value` INT NOT NULL)
-            UNIQUE KEY(`user_id`) 
+            DUPLICATE KEY(`user_id`) 
             DISTRIBUTED BY HASH(`user_id`) 
             BUCKETS 1 
-            PROPERTIES ("replication_allocation" = "tag.location.default: 1",
-            "enable_mow_light_delete" = "true")"""
+            PROPERTIES ("replication_allocation" = "tag.location.default: 1")"""
 
         for(int i = 1; i <= 100; ++i){
             sql """ INSERT INTO ${tableName} VALUES (1,1)"""
@@ -69,6 +68,11 @@ suite("test_cumu_compaction_with_delete") {
                 break;
             }
             Thread.sleep(10000)
+
+            def duration = System.currentTimeMillis() - now
+            if(duration > 10 * 60 * 1000) {
+                assertTrue(false)
+            }
         }
         def time_diff = System.currentTimeMillis() - now
         logger.info("time_diff:" + time_diff)
@@ -90,11 +94,10 @@ suite("test_cumu_compaction_with_delete") {
             CREATE TABLE ${tableName} (
             `user_id` INT NOT NULL,
             `value` INT NOT NULL)
-            UNIQUE KEY(`user_id`) 
+            DUPLICATE KEY(`user_id`) 
             DISTRIBUTED BY HASH(`user_id`) 
             BUCKETS 1 
-            PROPERTIES ("replication_allocation" = "tag.location.default: 1",
-            "enable_mow_light_delete" = "true")"""
+            PROPERTIES ("replication_allocation" = "tag.location.default: 1");"""
 
         for(int i = 1; i <= 100; ++i){
             sql """ INSERT INTO ${tableName} VALUES (1,1)"""
@@ -108,6 +111,11 @@ suite("test_cumu_compaction_with_delete") {
                 break;
             }
             Thread.sleep(10000)
+
+            def duration = System.currentTimeMillis() - now
+            if(duration > 10 * 60 * 1000) {
+                assertTrue(false)
+            }
         }
         def time_diff = System.currentTimeMillis() - now
         logger.info("time_diff:" + time_diff)

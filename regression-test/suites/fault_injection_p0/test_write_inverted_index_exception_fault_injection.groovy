@@ -51,7 +51,6 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
     logger.info("changed variables: " + changed_variables.toString())
     // sql "UNSET GLOBAL VARIABLE ALL;"
 
-    sql "SET global enable_match_without_inverted_index = false"
     boolean inverted_index_ram_dir_enable = true
     boolean has_update_be_config = false
     
@@ -92,6 +91,7 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
         sql """ INSERT INTO ${tableName} VALUES (2, "bason", 11, [79, 85, 97], ["singing", "dancing"], "bason is good at singing", ["bason is very clever", "bason is very healthy"]); """
         sql """ INSERT INTO ${tableName} VALUES (3, "andy", 10, [89, 80, 98], ["football", "basketball"], "andy is good at sports", ["andy has a good heart", "andy is so nice"]); """
         sql """ INSERT INTO ${tableName} VALUES (3, "bason", 11, [79, 85, 97], ["singing", "dancing"], "bason is good at singing", ["bason is very clever", "bason is very healthy"]); """
+        sql """ SYNC """
     }
 
     def check_count = { String tableName, int count ->
@@ -100,7 +100,7 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
     }
 
     def run_select = { String tableName, boolean normal ->
-        def result = sql_return_maparray "SELECT * FROM ${tableName} WHERE name MATCH 'andy'"
+        def result = sql_return_maparray "SELECT /*+ SET_VAR(enable_match_without_inverted_index = false, enable_common_expr_pushdown = true) */ * FROM ${tableName} WHERE name MATCH 'andy'"
         assertEquals(3, result.size())
         assertEquals(1, result[0]['id'])
         assertEquals("andy", result[0]['name'])
@@ -109,7 +109,7 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
         assertEquals(3, result[2]['id'])
         assertEquals("andy", result[2]['name'])
 
-        result = sql_return_maparray "SELECT * FROM ${tableName} WHERE age < 11"
+        result = sql_return_maparray "SELECT /*+ SET_VAR(enable_match_without_inverted_index = false, enable_common_expr_pushdown = true) */ * FROM ${tableName} WHERE age < 11"
         assertEquals(3, result.size())
         assertEquals("andy", result[0]['name'])
         assertEquals(2, result[1]['id'])
@@ -117,7 +117,7 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
         assertEquals(3, result[2]['id'])
         assertEquals("andy", result[2]['name'])
 
-        result = sql_return_maparray "SELECT * FROM ${tableName} WHERE description MATCH 'sports'"
+        result = sql_return_maparray "SELECT /*+ SET_VAR(enable_match_without_inverted_index = false, enable_common_expr_pushdown = true) */ * FROM ${tableName} WHERE description MATCH 'sports'"
         assertEquals(3, result.size())
         assertEquals("andy", result[0]['name'])
         assertEquals("andy is good at sports", result[0]['description'])
@@ -127,7 +127,7 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
         assertEquals("andy is good at sports", result[2]['description'])
 
         if (normal) {
-            result = sql_return_maparray "SELECT * FROM ${tableName} WHERE array_contains(scores, 79)"
+            result = sql_return_maparray "SELECT /*+ SET_VAR(enable_match_without_inverted_index = false, enable_common_expr_pushdown = true) */ * FROM ${tableName} WHERE array_contains(scores, 79)"
             assertEquals(3, result.size())
             assertEquals("bason", result[0]['name'])
             assertEquals("[79, 85, 97]", result[0]['scores'])
@@ -135,49 +135,39 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
             assertEquals("[79, 85, 97]", result[1]['scores'])
             assertEquals("bason", result[2]['name'])
             assertEquals("[79, 85, 97]", result[2]['scores'])
-
-            result = sql_return_maparray "SELECT * FROM ${tableName} WHERE array_contains(hobbies, 'football')"
-            assertEquals(3, result.size())
-            assertEquals("andy", result[0]['name'])
-            assertEquals('["football", "basketball"]', result[0]['hobbies'])
-            assertEquals("andy", result[1]['name'])
-            assertEquals('["football", "basketball"]', result[1]['hobbies'])
-            assertEquals("andy", result[2]['name'])
-            assertEquals('["football", "basketball"]', result[2]['hobbies'])
-
-            result = sql_return_maparray "SELECT * FROM ${tableName} WHERE array_contains(evaluation, 'andy is so nice')"
-            assertEquals(3, result.size())
-            assertEquals("andy", result[0]['name'])
-            assertEquals('["andy has a good heart", "andy is so nice"]', result[0]['evaluation'])
-            assertEquals("andy", result[1]['name'])
-            assertEquals('["andy has a good heart", "andy is so nice"]', result[1]['evaluation'])
-            assertEquals("andy", result[2]['name'])
-            assertEquals('["andy has a good heart", "andy is so nice"]', result[2]['evaluation'])
         } else {
-            result = sql_return_maparray "SELECT * FROM ${tableName} WHERE array_contains(scores, 79)"
-            assertEquals(0, result.size())
-
-            result = sql_return_maparray "SELECT * FROM ${tableName} WHERE array_contains(hobbies, 'football')"
-            assertEquals(0, result.size())
-
-            result = sql_return_maparray "SELECT * FROM ${tableName} WHERE array_contains(evaluation, 'andy is so nice')"
+            result = sql_return_maparray "SELECT /*+ SET_VAR(enable_match_without_inverted_index = false, enable_common_expr_pushdown = true) */ * FROM ${tableName} WHERE array_contains(scores, 79)"
             assertEquals(0, result.size())
         }
+        result = sql_return_maparray "SELECT /*+ SET_VAR(enable_match_without_inverted_index = false, enable_common_expr_pushdown = true) */ * FROM ${tableName} WHERE array_contains(hobbies, 'football')"
+        assertEquals(3, result.size())
+        assertEquals("andy", result[0]['name'])
+        assertEquals('["football", "basketball"]', result[0]['hobbies'])
+        assertEquals("andy", result[1]['name'])
+        assertEquals('["football", "basketball"]', result[1]['hobbies'])
+        assertEquals("andy", result[2]['name'])
+        assertEquals('["football", "basketball"]', result[2]['hobbies'])
+
+        result = sql_return_maparray "SELECT /*+ SET_VAR(enable_match_without_inverted_index = false, enable_common_expr_pushdown = true) */ * FROM ${tableName} WHERE array_contains(evaluation, 'andy is so nice')"
+        assertEquals(3, result.size())
+        assertEquals("andy", result[0]['name'])
+        assertEquals('["andy has a good heart", "andy is so nice"]', result[0]['evaluation'])
+        assertEquals("andy", result[1]['name'])
+        assertEquals('["andy has a good heart", "andy is so nice"]', result[1]['evaluation'])
+        assertEquals("andy", result[2]['name'])
+        assertEquals('["andy has a good heart", "andy is so nice"]', result[2]['evaluation'])
     }
 
     // define debug points array
     def debug_points = [
         "inverted_index_parser.get_parser_stopwords_from_properties",
         "CharFilterFactory::create_return_nullptr",
-        "InvertedIndexFileWriter::open_local_fs_exists_error",
-        "InvertedIndexFileWriter::open_local_fs_exists_true",
-        "InvertedIndexFileWriter::delete_index_index_meta_nullptr",
-        "InvertedIndexFileWriter::delete_index_indices_dirs_reach_end",
-        "InvertedIndexFileWriter::copyFile_openInput_error",
-        "InvertedIndexFileWriter::copyFile_remainder_is_not_zero",
-        "InvertedIndexFileWriter::copyFile_diff_not_equals_length",
-        "InvertedIndexFileWriter::write_v1_ram_output_is_nullptr",
-        "InvertedIndexFileWriter::write_v1_out_dir_createOutput_nullptr",
+        "IndexFileWriter::delete_index_index_meta_nullptr",
+        "IndexFileWriter::delete_index_indices_dirs_reach_end",
+        "IndexFileWriter::copyFile_openInput_error",
+        "IndexFileWriter::copyFile_remainder_is_not_zero",
+        "IndexFileWriter::copyFile_diff_not_equals_length",
+        "IndexFileWriter::write_v1_out_dir_createOutput_nullptr",
         "FSIndexInput::~SharedHandle_reader_close_error",
         "DorisFSDirectory::FSIndexInput::readInternal_reader_read_at_error",
         "DorisFSDirectory::FSIndexInput::readInternal_bytes_read_error",
@@ -196,7 +186,7 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
         "DorisFSDirectory::fileExists_status_is_not_ok",
         "DorisFSDirectory::touchFile_status_is_not_ok",
         "DorisFSDirectory::fileLength_status_is_not_ok",
-        //"DorisFSDirectory::close_close_with_error", // will block the process, off now
+        "DorisFSDirectory::close_close_with_error", 
         "DorisFSDirectory::doDeleteFile_status_is_not_ok",
         "DorisFSDirectory::deleteDirectory_throw_is_not_directory",
         "DorisFSDirectory::renameFile_exists_status_is_not_ok",
@@ -219,30 +209,27 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
         "InvertedIndexColumnWriter::init_inverted_index_writer_init_error",
         "InvertedIndexColumnWriter::close_on_error_throw_exception",
         "InvertedIndexColumnWriter::init_bkd_index_throw_error",
-        "InvertedIndexColumnWriter::create_chinese_analyzer_throw_error",
         "InvertedIndexColumnWriter::open_index_directory_error",
         "InvertedIndexColumnWriter::create_index_writer_setRAMBufferSizeMB_error",
         "InvertedIndexColumnWriter::create_index_writer_setMaxBufferedDocs_error",
         "InvertedIndexColumnWriter::create_index_writer_setMergeFactor_error",
-        "InvertedIndexColumnWriterImpl::add_document_throw_error",
-        "InvertedIndexColumnWriterImpl::add_null_document_throw_error",
-        "InvertedIndexColumnWriterImpl::add_nulls_field_nullptr",
-        "InvertedIndexColumnWriterImpl::add_nulls_index_writer_nullptr",
-        "InvertedIndexColumnWriterImpl::new_char_token_stream__char_string_reader_init_error",
-        "InvertedIndexColumnWriterImpl::add_values_field_is_nullptr",
-        "InvertedIndexColumnWriterImpl::add_values_index_writer_is_nullptr",
-        "InvertedIndexColumnWriterImpl::add_array_values_count_is_zero",
-        "InvertedIndexColumnWriterImpl::add_array_values_index_writer_is_nullptr",
-        "InvertedIndexColumnWriterImpl::add_array_values_create_field_error",
-        "InvertedIndexColumnWriterImpl::add_array_values_create_field_error_2",
-        "InvertedIndexColumnWriterImpl::add_array_values_field_is_nullptr",
+        "InvertedIndexColumnWriter::add_document_throw_error",
+        "InvertedIndexColumnWriter::add_null_document_throw_error",
+        "InvertedIndexColumnWriter::add_nulls_field_nullptr",
+        "InvertedIndexColumnWriter::add_nulls_index_writer_nullptr",
+        "InvertedIndexColumnWriter::new_char_token_stream__char_string_reader_init_error",
+        "InvertedIndexColumnWriter::add_values_field_is_nullptr",
+        "InvertedIndexColumnWriter::add_values_index_writer_is_nullptr",
+        "InvertedIndexColumnWriter::add_array_values_index_writer_is_nullptr",
+        "InvertedIndexColumnWriter::add_array_values_create_field_error",
+        "InvertedIndexColumnWriter::add_array_values_create_field_error_2",
+        "InvertedIndexColumnWriter::add_array_values_field_is_nullptr",
         "InvertedIndexWriter._throw_clucene_error_in_fulltext_writer_close",
         "InvertedIndexColumnWriter::create_array_typeinfo_is_nullptr",
         "InvertedIndexColumnWriter::create_unsupported_type_for_inverted_index"
     ]
 
     def inverted_index_storage_format = ["v1", "v2"]
-
     try {
         String backend_id;
         backend_id = backendId_to_backendIP.keySet()[0]
@@ -256,7 +243,7 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
         for (Object ele in (List) configList) {
             assert ele instanceof List<String>
             if (((List<String>) ele)[0] == "inverted_index_ram_dir_enable") {
-                invertedIndexCompactionEnable = Boolean.parseBoolean(((List<String>) ele)[2])
+                inverted_index_ram_dir_enable = Boolean.parseBoolean(((List<String>) ele)[2])
                 logger.info("inverted_index_ram_dir_enable: ${((List<String>) ele)[2]}")
             }
         }
@@ -275,13 +262,7 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
                     GetDebugPoint().enableDebugPointForAllBEs(debug_point)
                     run_insert("${tableName}")
                     check_count("${tableName}", 6)
-                    // if debug_point equals InvertedIndexColumnWriterImpl::add_array_values_count_is_zero, run_select(false)
-                    // else run_select(true)
-                    if (debug_point == "InvertedIndexColumnWriterImpl::add_array_values_count_is_zero") {
-                        run_select("${tableName}", false)
-                    } else {
-                        run_select("${tableName}", true)
-                    }
+                    run_select("${tableName}", true)
                     sql "TRUNCATE TABLE ${tableName}"
                 } catch (Exception e) {
                     log.error("Caught exception: ${e}")
@@ -295,7 +276,6 @@ suite("test_write_inverted_index_exception_fault_injection", "nonConcurrent") {
         if (has_update_be_config) {
             set_be_config.call("inverted_index_ram_dir_enable", inverted_index_ram_dir_enable.toString())
         }
-        sql "SET global enable_match_without_inverted_index = true"
     }
 
 }

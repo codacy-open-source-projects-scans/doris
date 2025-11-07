@@ -101,7 +101,7 @@ public abstract class CompoundPredicate extends Expression implements ExpectsInp
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         StringBuilder sb = new StringBuilder();
         children().forEach(c -> sb.append(c.toSql()).append(","));
         sb.deleteCharAt(sb.length() - 1);
@@ -112,6 +112,24 @@ public abstract class CompoundPredicate extends Expression implements ExpectsInp
     public String toString() {
         StringBuilder sb = new StringBuilder();
         children().forEach(c -> sb.append(c.toString()).append(","));
+        sb.deleteCharAt(sb.length() - 1);
+        return symbol + "[" + sb + "]";
+    }
+
+    @Override
+    public String toDigest() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("(");
+        sb.append(children().stream().map(c -> c.toDigest())
+                .collect(Collectors.joining(" " + symbol + " ")));
+        sb.append(")");
+        return sb.toString();
+    }
+
+    @Override
+    public String getFingerprint() {
+        StringBuilder sb = new StringBuilder();
+        children().forEach(c -> sb.append(c.getFingerprint()).append(","));
         sb.deleteCharAt(sb.length() - 1);
         return symbol + "[" + sb + "]";
     }

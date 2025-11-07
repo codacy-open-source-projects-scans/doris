@@ -112,7 +112,8 @@ suite("variant_mv") {
     where actor['id'] > 64259289 and cast(actor['id'] as int) + cast(repo['id'] as int) > 80000000;
     """
     order_qt_query1_0_before "${query1_0}"
-    async_mv_rewrite_success(db, mv1_0, query1_0, "mv1_0")
+    async_mv_rewrite_success_without_check_chosen(db, mv1_0, query1_0, "mv1_0", [TRY_IN_RBO, FORCE_IN_RBO])
+    async_mv_rewrite_success(db, mv1_0, query1_0, "mv1_0", [NOT_IN_RBO])
     order_qt_query1_0_after "${query1_0}"
     sql """ DROP MATERIALIZED VIEW IF EXISTS mv1_0"""
 
@@ -367,7 +368,7 @@ suite("variant_mv") {
     count(*),
     max(floor(cast(actor['id'] as int) + 100.5))
     FROM github_events1
-    where actor['id'] > 34259289 and cast(actor['id'] as int) + cast(repo['id'] as int) > 80000000
+    where cast(actor['id'] as int) > 34259289 and cast(actor['id'] as int) + cast(repo['id'] as int) > 80000000
     group by 
     id,
     type,
@@ -406,6 +407,14 @@ suite("variant_mv") {
     left join github_events2 g2 on g1.id = g2.id
     where g2.actor['id'] > 34259289 and cast(g1.actor['id'] as int) + cast(g2.repo['id'] as int) > 80000000;
     """
+    // before sub path optimize, the query tmp plan for mv rewrite is as following, when hint mv rewrite rule is
+    // begin from 101, #100 project use repo col, this is not in mv, so rewrite fail, should add
+    // project - filter - project - logical join or scan rule
+    // LogicalResultSink[103] ( outputExprs=[id#0, type#8, __floor_2#14, __element_at_3#15, __element_at_4#16] )
+    //+--LogicalProject[102] ( distinct=false, projects=[id#0, type#8, floor((cast(cast(element_at(actor#2, 'id') as INT) as DECIMALV3(12, 1)) + 100.5)) AS `floor(cast(g1.actor['id'] as int) + 100.5)`#14, element_at(actor#2, 'display_login') AS `g1.actor['display_login']`#15, element_at(element_at(payload#11, 'issue'), 'href') AS `g2.payload['issue']['href']`#16] )
+    //   +--LogicalFilter[101] ( predicates=AND[(cast(element_at(actor#9, 'id') as INT) > 34259289),((cast(element_at(actor#2, 'id') as INT) + cast(element_at(repo#10, 'id') as INT)) > 80000000)] )
+    //      +--LogicalProject[100] ( distinct=false, projects=[id#0, actor#2, id#7, type#8, actor#9, repo#10, payload#11] )
+    //             LogicalJoin
     def query3_0 = """
     SELECT
     g1.id,
@@ -556,7 +565,8 @@ suite("variant_mv") {
     where g2.actor['id'] > 34259300 and cast(g1.actor['id'] as int) + cast(g2.repo['id'] as int) > 80000000;
     """
     order_qt_query3_4_before "${query3_4}"
-    async_mv_rewrite_success(db, mv3_4, query3_4, "mv3_4")
+    async_mv_rewrite_success_without_check_chosen(db, mv3_4, query3_4, "mv3_4", [TRY_IN_RBO, FORCE_IN_RBO])
+    async_mv_rewrite_success(db, mv3_4, query3_4, "mv3_4", [NOT_IN_RBO])
     order_qt_query3_4_after "${query3_4}"
     sql """ DROP MATERIALIZED VIEW IF EXISTS mv3_4"""
 
@@ -574,7 +584,7 @@ suite("variant_mv") {
     where g2.actor['id'] > 34259289;
     """
     def query3_6 = """
-    SELECT  /*+SET_VAR(batch_size=4064,broker_load_batch_size=16352,disable_streaming_preaggregations=false,enable_distinct_streaming_aggregation=true,parallel_fragment_exec_instance_num=3,parallel_pipeline_task_num=0,profile_level=1,enable_pipeline_engine=true,enable_parallel_scan=true,parallel_scan_max_scanners_count=32,parallel_scan_min_rows_per_scanner=64,enable_fold_constant_by_be=true,enable_rewrite_element_at_to_slot=true,runtime_filter_type=1,enable_parallel_result_sink=false,enable_nereids_planner=true,rewrite_or_to_in_predicate_threshold=100000,enable_function_pushdown=false,enable_common_expr_pushdown=false,enable_local_exchange=true,partitioned_hash_join_rows_threshold=8,partitioned_hash_agg_rows_threshold=8,partition_pruning_expand_threshold=10,enable_share_hash_table_for_broadcast_join=true,enable_two_phase_read_opt=true,enable_common_expr_pushdown_for_inverted_index=false,enable_delete_sub_predicate_v2=false,min_revocable_mem=33554432,fetch_remote_schema_timeout_seconds=120,max_fetch_remote_schema_tablet_count=512,enable_join_spill=false,enable_sort_spill=false,enable_agg_spill=false,enable_force_spill=false,data_queue_max_blocks=1,spill_streaming_agg_mem_limit=268435456,external_agg_partition_bits=5) */
+    SELECT  /*+SET_VAR(batch_size=4064,broker_load_batch_size=16352,disable_streaming_preaggregations=false,enable_distinct_streaming_aggregation=true,parallel_pipeline_task_num=0,profile_level=1,enable_pipeline_engine=true,enable_parallel_scan=true,parallel_scan_max_scanners_count=32,parallel_scan_min_rows_per_scanner=64,enable_fold_constant_by_be=true,enable_rewrite_element_at_to_slot=true,runtime_filter_type=1,enable_parallel_result_sink=false,enable_nereids_planner=true,rewrite_or_to_in_predicate_threshold=100000,enable_function_pushdown=false,enable_common_expr_pushdown=false,enable_local_exchange=true,partition_pruning_expand_threshold=10,enable_share_hash_table_for_broadcast_join=true,enable_two_phase_read_opt=true,enable_common_expr_pushdown_for_inverted_index=false,spill_min_revocable_mem=33554432,fetch_remote_schema_timeout_seconds=120,max_fetch_remote_schema_tablet_count=512,enable_spill=false,enable_force_spill=false,data_queue_max_blocks=1,spill_streaming_agg_mem_limit=268435456,spill_aggregation_partition_count=5) */
     g1.id,
     g2.type,
     floor(cast(g1.actor['id'] as int) + 100.5),

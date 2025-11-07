@@ -36,6 +36,7 @@ import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.plans.commands.Command;
 import org.apache.doris.nereids.trees.plans.commands.ExplainCommand;
+import org.apache.doris.nereids.trees.plans.logical.LogicalEmptyRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
@@ -61,6 +62,8 @@ import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.base.Strings;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
@@ -78,8 +81,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 /**
  * This class responsible for parse the sql and generate the query plan fragment for a (only one) table{@see OlapTable}
@@ -140,7 +141,7 @@ public class TableQueryPlanAction extends RestBaseController {
                     ConnectContext.get().getSessionVariable().setEnableTwoPhaseReadOpt(false);
                 }
                 if (Config.isCloudMode()) { // Choose a cluster to for this query
-                    ConnectContext.get().getCurrentCloudCluster();
+                    ConnectContext.get().getCloudCluster();
                 }
                 // parse/analysis/plan the sql and acquire tablet distributions
                 handleQuery(ConnectContext.get(), fullDbName, tblName, sql, resultMap);
@@ -239,7 +240,7 @@ public class TableQueryPlanAction extends RestBaseController {
                     PhysicalProperties.GATHER, ExplainCommand.ExplainLevel.REWRITTEN_PLAN);
             if (!rewrittenPlan.allMatch(planTreeNode -> planTreeNode instanceof LogicalOlapScan
                     || planTreeNode instanceof LogicalFilter || planTreeNode instanceof LogicalProject
-                    || planTreeNode instanceof LogicalResultSink)) {
+                    || planTreeNode instanceof LogicalResultSink || planTreeNode instanceof LogicalEmptyRelation)) {
                 throw new DorisHttpException(HttpResponseStatus.BAD_REQUEST,
                         "only support single table filter-prune-scan, but found [ " + sql + "]");
             }
@@ -254,11 +255,12 @@ public class TableQueryPlanAction extends RestBaseController {
             // acquire ScanNode to obtain pruned tablet
             // in this way, just retrieve only one scannode
             List<ScanNode> scanNodes = planner.getScanNodes();
-            if (scanNodes.size() != 1) {
+            if (scanNodes.size() > 1) {
                 throw new DorisHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
                         "Planner should plan just only one ScanNode but found [ " + scanNodes.size() + "]");
             }
-            List<TScanRangeLocations> scanRangeLocations = scanNodes.get(0).getScanRangeLocations(0);
+            List<TScanRangeLocations> scanRangeLocations = scanNodes.size() == 1
+                    ? scanNodes.get(0).getScanRangeLocations(0) : new ArrayList<>();
             // acquire the PlanFragment which the executable template
             List<PlanFragment> fragments = planner.getFragments();
             if (fragments.size() != 1) {

@@ -44,7 +44,7 @@ namespace doris::vectorized {
 #include "common/compile_check_begin.h"
 
 VDataStreamRecvr::SenderQueue::SenderQueue(
-        VDataStreamRecvr* parent_recvr, int num_senders, RuntimeProfile* profile,
+        VDataStreamRecvr* parent_recvr, int num_senders,
         std::shared_ptr<pipeline::Dependency> local_channel_dependency)
         : _recvr(parent_recvr),
           _is_cancelled(false),
@@ -80,7 +80,7 @@ Status VDataStreamRecvr::SenderQueue::get_batch(Block* block, bool* eos) {
 #endif
     BlockItem block_item;
     {
-        std::lock_guard<std::mutex> l(_lock);
+        INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
         //check and get block_item from data_queue
         if (_is_cancelled) {
             RETURN_IF_ERROR(_cancel_status);
@@ -88,7 +88,12 @@ Status VDataStreamRecvr::SenderQueue::get_batch(Block* block, bool* eos) {
         }
 
         if (_block_queue.empty()) {
-            DCHECK_EQ(_num_remaining_senders, 0);
+            if (_num_remaining_senders != 0) {
+                return Status::InternalError(
+                        "Data queue is empty but there are still remaining senders. "
+                        "_num_remaining_senders: {}",
+                        _num_remaining_senders);
+            }
             *eos = true;
             return Status::OK();
         }
@@ -101,10 +106,10 @@ Status VDataStreamRecvr::SenderQueue::get_batch(Block* block, bool* eos) {
     RETURN_IF_ERROR(block_item.get_block(next_block));
     size_t block_byte_size = block_item.block_byte_size();
     COUNTER_UPDATE(_recvr->_deserialize_row_batch_timer, block_item.deserialize_time());
-    COUNTER_UPDATE(_recvr->_decompress_timer, block->get_decompress_time());
-    COUNTER_UPDATE(_recvr->_decompress_bytes, block->get_decompressed_bytes());
-    _recvr->_parent->memory_used_counter()->update(-(int64_t)block_byte_size);
-    std::lock_guard<std::mutex> l(_lock);
+    COUNTER_UPDATE(_recvr->_decompress_timer, block_item.decompress_time());
+    COUNTER_UPDATE(_recvr->_decompress_bytes, block_item.decompress_bytes());
+    _recvr->_memory_used_counter->update(-(int64_t)block_byte_size);
+    INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
     sub_blocks_memory_usage(block_byte_size);
     _record_debug_info();
     if (_block_queue.empty() && _source_dependency) {
@@ -125,12 +130,15 @@ Status VDataStreamRecvr::SenderQueue::get_batch(Block* block, bool* eos) {
         closure_pair.second.stop();
         _recvr->_buffer_full_total_timer->update(closure_pair.second.elapsed_time());
     }
+    DCHECK(block->empty());
     block->swap(*next_block);
     *eos = false;
     return Status::OK();
 }
 
-void VDataStreamRecvr::SenderQueue::try_set_dep_ready_without_lock() {
+void VDataStreamRecvr::SenderQueue::set_source_ready(std::lock_guard<std::mutex>&) {
+    // Here, it is necessary to check if _source_dependency is not nullptr.
+    // This is because the queue might be closed before setting the source dependency.
     if (!_source_dependency) {
         return;
     }
@@ -140,23 +148,37 @@ void VDataStreamRecvr::SenderQueue::try_set_dep_ready_without_lock() {
     }
 }
 
+std::string VDataStreamRecvr::SenderQueue::debug_string() {
+    fmt::memory_buffer debug_string_buffer;
+    fmt::format_to(debug_string_buffer,
+                   "_num_remaining_senders = {}, block_queue size = {}, _is_cancelled: {}, "
+                   "_cancel_status: {}, _sender_eos_set: (",
+                   _num_remaining_senders, _block_queue.size(), _is_cancelled,
+                   _cancel_status.to_string());
+    std::lock_guard<std::mutex> l(_lock);
+    for (auto& i : _sender_eos_set) {
+        fmt::format_to(debug_string_buffer, "{}, ", i);
+    }
+    fmt::format_to(debug_string_buffer, ")");
+    return fmt::to_string(debug_string_buffer);
+}
+
 Status VDataStreamRecvr::SenderQueue::add_block(std::unique_ptr<PBlock> pblock, int be_number,
                                                 int64_t packet_seq,
                                                 ::google::protobuf::Closure** done,
                                                 const int64_t wait_for_worker,
                                                 const uint64_t time_to_find_recvr) {
     {
-        std::lock_guard<std::mutex> l(_lock);
+        INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
         if (_is_cancelled) {
             return Status::OK();
         }
         auto iter = _packet_seq_map.find(be_number);
         if (iter != _packet_seq_map.end()) {
             if (iter->second >= packet_seq) {
-                LOG(WARNING) << fmt::format(
+                return Status::InternalError(
                         "packet already exist [cur_packet_id= {} receive_packet_id={}]",
                         iter->second, packet_seq);
-                return Status::OK();
             }
             iter->second = packet_seq;
         } else {
@@ -170,7 +192,7 @@ Status VDataStreamRecvr::SenderQueue::add_block(std::unique_ptr<PBlock> pblock, 
         }
     }
 
-    std::lock_guard<std::mutex> l(_lock);
+    INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
     if (_is_cancelled) {
         return Status::OK();
     }
@@ -188,7 +210,7 @@ Status VDataStreamRecvr::SenderQueue::add_block(std::unique_ptr<PBlock> pblock, 
     _block_queue.emplace_back(std::move(pblock), block_byte_size);
     COUNTER_UPDATE(_recvr->_remote_bytes_received_counter, block_byte_size);
     _record_debug_info();
-    try_set_dep_ready_without_lock();
+    set_source_ready(l);
 
     // if done is nullptr, this function can't delay this response
     if (done != nullptr && _recvr->exceeds_limit(block_byte_size)) {
@@ -198,7 +220,7 @@ Status VDataStreamRecvr::SenderQueue::add_block(std::unique_ptr<PBlock> pblock, 
         _pending_closures.emplace_back(*done, monotonicStopWatch);
         *done = nullptr;
     }
-    _recvr->_parent->memory_used_counter()->update(block_byte_size);
+    _recvr->_memory_used_counter->update(block_byte_size);
     add_blocks_memory_usage(block_byte_size);
     return Status::OK();
 }
@@ -208,8 +230,12 @@ void VDataStreamRecvr::SenderQueue::add_block(Block* block, bool use_move) {
         return;
     }
     {
-        std::unique_lock<std::mutex> l(_lock);
+        INJECT_MOCK_SLEEP(std::unique_lock<std::mutex> l(_lock));
         if (_is_cancelled) {
+            return;
+        }
+        DCHECK(_num_remaining_senders >= 0);
+        if (_num_remaining_senders == 0) {
             return;
         }
     }
@@ -229,21 +255,21 @@ void VDataStreamRecvr::SenderQueue::add_block(Block* block, bool use_move) {
 
     auto block_mem_size = nblock->allocated_bytes();
     {
-        std::unique_lock<std::mutex> l(_lock);
+        INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
         if (_is_cancelled) {
             return;
         }
         _block_queue.emplace_back(std::move(nblock), block_mem_size);
         _record_debug_info();
-        try_set_dep_ready_without_lock();
+        set_source_ready(l);
         COUNTER_UPDATE(_recvr->_local_bytes_received_counter, block_mem_size);
-        _recvr->_parent->memory_used_counter()->update(block_mem_size);
+        _recvr->_memory_used_counter->update(block_mem_size);
         add_blocks_memory_usage(block_mem_size);
     }
 }
 
 void VDataStreamRecvr::SenderQueue::decrement_senders(int be_number) {
-    std::lock_guard<std::mutex> l(_lock);
+    INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
     if (_sender_eos_set.end() != _sender_eos_set.find(be_number)) {
         return;
     }
@@ -255,25 +281,25 @@ void VDataStreamRecvr::SenderQueue::decrement_senders(int be_number) {
               << print_id(_recvr->fragment_instance_id()) << " node_id=" << _recvr->dest_node_id()
               << " #senders=" << _num_remaining_senders;
     if (_num_remaining_senders == 0) {
-        try_set_dep_ready_without_lock();
+        set_source_ready(l);
     }
 }
 
 void VDataStreamRecvr::SenderQueue::cancel(Status cancel_status) {
     {
-        std::lock_guard<std::mutex> l(_lock);
+        INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
         if (_is_cancelled) {
             return;
         }
         _is_cancelled = true;
         _cancel_status = cancel_status;
-        try_set_dep_ready_without_lock();
+        set_source_ready(l);
         VLOG_QUERY << "cancelled stream: _fragment_instance_id="
                    << print_id(_recvr->fragment_instance_id())
                    << " node_id=" << _recvr->dest_node_id();
     }
     {
-        std::lock_guard<std::mutex> l(_lock);
+        INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
         for (auto closure_pair : _pending_closures) {
             closure_pair.first->Run();
             int64_t elapse_time = closure_pair.second.elapsed_time();
@@ -286,42 +312,40 @@ void VDataStreamRecvr::SenderQueue::cancel(Status cancel_status) {
 }
 
 void VDataStreamRecvr::SenderQueue::close() {
-    {
-        // If _is_cancelled is not set to true, there may be concurrent send
-        // which add batch to _block_queue. The batch added after _block_queue
-        // is clear will be memory leak
-        std::lock_guard<std::mutex> l(_lock);
-        _is_cancelled = true;
-        try_set_dep_ready_without_lock();
+    // If _is_cancelled is not set to true, there may be concurrent send
+    // which add batch to _block_queue. The batch added after _block_queue
+    // is clear will be memory leak
+    INJECT_MOCK_SLEEP(std::lock_guard<std::mutex> l(_lock));
+    _is_cancelled = true;
+    set_source_ready(l);
 
-        for (auto closure_pair : _pending_closures) {
-            closure_pair.first->Run();
-            int64_t elapse_time = closure_pair.second.elapsed_time();
-            if (_recvr->_max_wait_to_process_time->value() < elapse_time) {
-                _recvr->_max_wait_to_process_time->set(elapse_time);
-            }
+    for (auto closure_pair : _pending_closures) {
+        closure_pair.first->Run();
+        int64_t elapse_time = closure_pair.second.elapsed_time();
+        if (_recvr->_max_wait_to_process_time->value() < elapse_time) {
+            _recvr->_max_wait_to_process_time->set(elapse_time);
         }
-        _pending_closures.clear();
     }
-
+    _pending_closures.clear();
     // Delete any batches queued in _block_queue
     _block_queue.clear();
 }
 
-VDataStreamRecvr::VDataStreamRecvr(VDataStreamMgr* stream_mgr, pipeline::ExchangeLocalState* parent,
-                                   RuntimeState* state, const RowDescriptor& row_desc,
-                                   const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id,
-                                   int num_senders, bool is_merging, RuntimeProfile* profile)
+VDataStreamRecvr::VDataStreamRecvr(VDataStreamMgr* stream_mgr,
+                                   RuntimeProfile::HighWaterMarkCounter* memory_used_counter,
+                                   RuntimeState* state, const TUniqueId& fragment_instance_id,
+                                   PlanNodeId dest_node_id, int num_senders, bool is_merging,
+                                   RuntimeProfile* profile, size_t data_queue_capacity)
         : HasTaskExecutionCtx(state),
           _mgr(stream_mgr),
-          _parent(parent),
-          _query_thread_context(state->query_id(), state->query_mem_tracker(),
-                                state->get_query_ctx()->workload_group()),
+          _memory_used_counter(memory_used_counter),
+          _resource_ctx(state->get_query_ctx()->resource_ctx()),
+          _query_context(state->get_query_ctx()->shared_from_this()),
           _fragment_instance_id(fragment_instance_id),
           _dest_node_id(dest_node_id),
-          _row_desc(row_desc),
           _is_merging(is_merging),
           _is_closed(false),
+          _sender_queue_mem_limit(data_queue_capacity),
           _profile(profile) {
     // DataStreamRecvr may be destructed after the instance execution thread ends.
     _mem_tracker =
@@ -333,14 +357,14 @@ VDataStreamRecvr::VDataStreamRecvr(VDataStreamMgr* stream_mgr, pipeline::Exchang
     _sender_to_local_channel_dependency.resize(num_queues);
     for (size_t i = 0; i < num_queues; i++) {
         _sender_to_local_channel_dependency[i] = pipeline::Dependency::create_shared(
-                _dest_node_id, _dest_node_id, "LocalExchangeChannelDependency", true);
+                _dest_node_id, _dest_node_id, fmt::format("LocalExchangeChannelDependency_{}", i),
+                true);
     }
     _sender_queues.reserve(num_queues);
     int num_sender_per_queue = is_merging ? 1 : num_senders;
-    _sender_queue_mem_limit = std::max(20480, config::exchg_node_buffer_size_bytes / num_queues);
     for (int i = 0; i < num_queues; ++i) {
         SenderQueue* queue = nullptr;
-        queue = _sender_queue_pool.add(new SenderQueue(this, num_sender_per_queue, profile,
+        queue = _sender_queue_pool.add(new SenderQueue(this, num_sender_per_queue,
                                                        _sender_to_local_channel_dependency[i]));
         _sender_queues.push_back(queue);
     }
@@ -389,15 +413,34 @@ Status VDataStreamRecvr::add_block(std::unique_ptr<PBlock> pblock, int sender_id
                                    int64_t packet_seq, ::google::protobuf::Closure** done,
                                    const int64_t wait_for_worker,
                                    const uint64_t time_to_find_recvr) {
-    SCOPED_ATTACH_TASK(_query_thread_context);
+    SCOPED_ATTACH_TASK(_resource_ctx);
+    if (_query_context->low_memory_mode()) {
+        set_low_memory_mode();
+    }
+
     int use_sender_id = _is_merging ? sender_id : 0;
     return _sender_queues[use_sender_id]->add_block(std::move(pblock), be_number, packet_seq, done,
                                                     wait_for_worker, time_to_find_recvr);
 }
 
 void VDataStreamRecvr::add_block(Block* block, int sender_id, bool use_move) {
+    if (_query_context->low_memory_mode()) {
+        set_low_memory_mode();
+    }
     int use_sender_id = _is_merging ? sender_id : 0;
     _sender_queues[use_sender_id]->add_block(block, use_move);
+}
+
+std::string VDataStreamRecvr::debug_string() {
+    fmt::memory_buffer debug_string_buffer;
+    fmt::format_to(debug_string_buffer,
+                   "fragment_instance_id: {}, _dest_node_id: {}, _is_merging: {}, _is_closed: {}",
+                   print_id(_fragment_instance_id), _dest_node_id, _is_merging, _is_closed);
+    for (size_t i = 0; i < _sender_queues.size(); i++) {
+        fmt::format_to(debug_string_buffer, "No. {} queue: {}", i,
+                       _sender_queues[i]->debug_string());
+    }
+    return fmt::to_string(debug_string_buffer);
 }
 
 std::shared_ptr<pipeline::Dependency> VDataStreamRecvr::get_local_channel_dependency(
@@ -477,18 +520,17 @@ void VDataStreamRecvr::close() {
     }
     // Remove this receiver from the DataStreamMgr that created it.
     // TODO: log error msg
-    static_cast<void>(_mgr->deregister_recvr(fragment_instance_id(), dest_node_id()));
+    if (_mgr) {
+        static_cast<void>(_mgr->deregister_recvr(fragment_instance_id(), dest_node_id()));
+    }
     _mgr = nullptr;
 
     _merger.reset();
 }
 
 void VDataStreamRecvr::set_sink_dep_always_ready() const {
-    for (auto* sender_queues : sender_queues()) {
-        auto dep = sender_queues->local_channel_dependency();
-        if (dep) {
-            dep->set_always_ready();
-        }
+    for (auto dep : _sender_to_local_channel_dependency) {
+        dep->set_always_ready();
     }
 }
 

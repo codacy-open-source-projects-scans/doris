@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.expressions.functions.agg;
 
 import org.apache.doris.catalog.FunctionSignature;
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
 import org.apache.doris.nereids.trees.expressions.literal.ArrayLiteral;
@@ -74,13 +75,26 @@ public class PercentileArray extends NotNullableAggregateFunction
         super("percentile_array", distinct, arg0, arg1);
     }
 
+    /** constructor for withChildren and reuse signature */
+    private PercentileArray(AggregateFunctionParams functionParams) {
+        super(functionParams);
+    }
+
+    @Override
+    public void checkLegalityBeforeTypeCoercion() {
+        if (!getArgument(1).isConstant()) {
+            throw new AnalysisException(
+                    "percentile_array requires second parameter must be a constant : " + this.toSql());
+        }
+    }
+
     /**
      * withDistinctAndChildren.
      */
     @Override
     public PercentileArray withDistinctAndChildren(boolean distinct, List<Expression> children) {
         Preconditions.checkArgument(children.size() == 2);
-        return new PercentileArray(distinct, children.get(0), children.get(1));
+        return new PercentileArray(getFunctionParams(distinct, children));
     }
 
     @Override

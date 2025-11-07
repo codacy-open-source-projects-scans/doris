@@ -41,7 +41,6 @@ public:
     NestedLoopJoinProbeLocalState(RuntimeState* state, OperatorXBase* parent);
     ~NestedLoopJoinProbeLocalState() = default;
 
-    void add_tuple_is_null_column(vectorized::Block* block) override;
 #define CLEAR_BLOCK                                                  \
     for (size_t i = 0; i < column_to_keep; ++i) {                    \
         block->get_by_position(i).column->assume_mutable()->clear(); \
@@ -57,7 +56,6 @@ private:
     void _update_additional_flags(vectorized::Block* block);
     template <bool BuildSide, bool IsSemi>
     void _finalize_current_phase(vectorized::Block& block, size_t batch_size);
-    void _resize_fill_tuple_is_null_column(size_t new_size, uint8_t left_flag, uint8_t right_flag);
     void _reset_with_next_probe_row();
     void _append_left_data_with_null(vectorized::Block& block) const;
     void _process_left_child_block(vectorized::Block& block,
@@ -99,7 +97,7 @@ private:
                     }
                     if (!_cur_probe_row_visited_flags[i]) {
                         _cur_probe_row_visited_flags[i] =
-                                simd::contain_byte<uint8>(filter.data() + offset, end - offset, 1)
+                                simd::contain_byte<uint8_t>(filter.data() + offset, end - offset, 1)
                                         ? 1
                                         : 0;
                     }
@@ -206,7 +204,7 @@ public:
     NestedLoopJoinProbeOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
                                  const DescriptorTbl& descs);
     Status init(const TPlanNode& tnode, RuntimeState* state) override;
-    Status open(RuntimeState* state) override;
+    Status prepare(RuntimeState* state) override;
 
     Status push(RuntimeState* state, vectorized::Block* input_block, bool eos) const override;
     Status pull(doris::RuntimeState* state, vectorized::Block* output_block,
@@ -215,7 +213,7 @@ public:
         return _old_version_flag ? _row_descriptor : *_intermediate_row_desc;
     }
 
-    DataDistribution required_data_distribution() const override {
+    DataDistribution required_data_distribution(RuntimeState* /*state*/) const override {
         if (_join_op == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN ||
             _join_op == TJoinOp::RIGHT_OUTER_JOIN || _join_op == TJoinOp::RIGHT_ANTI_JOIN ||
             _join_op == TJoinOp::RIGHT_SEMI_JOIN || _join_op == TJoinOp::FULL_OUTER_JOIN) {

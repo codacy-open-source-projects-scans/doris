@@ -23,6 +23,8 @@ import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.DataType;
+import org.apache.doris.nereids.types.DateTimeType;
+import org.apache.doris.nereids.types.DateTimeV2Type;
 import org.apache.doris.nereids.types.DateType;
 import org.apache.doris.nereids.types.coercion.DateLikeType;
 import org.apache.doris.nereids.util.DateTimeFormatterUtils;
@@ -30,6 +32,7 @@ import org.apache.doris.nereids.util.DateUtils;
 
 import com.google.common.collect.ImmutableSet;
 
+import java.math.BigInteger;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.Year;
@@ -41,7 +44,7 @@ import java.util.function.UnaryOperator;
 /**
  * Date literal in Nereids.
  */
-public class DateLiteral extends Literal {
+public class DateLiteral extends Literal implements ComparableLiteral {
     public static final String JAVA_DATE_FORMAT = "yyyy-MM-dd";
 
     public static final Set<Character> punctuations = ImmutableSet.of('!', '@', '#', '$', '%', '^', '&', '*', '(', ')',
@@ -63,7 +66,7 @@ public class DateLiteral extends Literal {
         this(DateType.INSTANCE, s);
     }
 
-    protected DateLiteral(DateLikeType dataType, String s) throws AnalysisException {
+    public DateLiteral(DateLikeType dataType, String s) throws AnalysisException {
         super(dataType);
         init(s);
     }
@@ -188,19 +191,23 @@ public class DateLiteral extends Literal {
                 if (len == 4 || len == 2) {
                     sb.append(s, i, j);
                 } else if (len == 3) {
-                    if (partNumber == 0) {
-                        String yy = s.substring(i, i + 2);
-                        int year = Integer.parseInt(yy);
-                        if (year >= 0 && year <= 69) {
-                            sb.append("20");
-                        } else if (year >= 70 && year <= 99) {
-                            sb.append("19");
+                    if (s.charAt(j) == '.') {
+                        if (partNumber == 0) {
+                            String yy = s.substring(i, i + 2);
+                            int year = Integer.parseInt(yy);
+                            if (year >= 0 && year <= 69) {
+                                sb.append("20");
+                            } else if (year >= 70 && year <= 99) {
+                                sb.append("19");
+                            }
+                            sb.append(yy).append('-');
+                        } else {
+                            sb.append(s, i, i + 2).append(' ');
                         }
-                        sb.append(yy).append('-');
+                        j = j - 1;
                     } else {
-                        sb.append(s, i, i + 2).append(' ');
+                        sb.append("0").append(s, i, j);
                     }
-                    j = j - 1;
                 } else if (len == 1) {
                     if (partNumber == 0) {
                         sb.append("000").append(c);
@@ -269,7 +276,7 @@ public class DateLiteral extends Literal {
     }
 
     /** parseDateLiteral */
-    public static Result<DateLiteral, AnalysisException> parseDateLiteral(String s) {
+    public static Result<DateLiteral, AnalysisException> parseDateLiteral(String s, boolean isV2) {
         Result<TemporalAccessor, AnalysisException> parseResult = parseDateTime(s);
         if (parseResult.isError()) {
             return parseResult.cast();
@@ -282,21 +289,32 @@ public class DateLiteral extends Literal {
         if (checkDatetime(dateTime) || checkRange(year, month, day) || checkDate(year, month, day)) {
             return Result.err(() -> new AnalysisException("date/datetime literal [" + s + "] is out of range"));
         }
-        return Result.ok(new DateLiteral(year, month, day));
+        if (isV2) {
+            return Result.ok(new DateV2Literal(year, month, day));
+        } else {
+            return Result.ok(new DateLiteral(year, month, day));
+        }
     }
 
     /** parseDateTime */
     public static Result<TemporalAccessor, AnalysisException> parseDateTime(String s) {
-        // fast parse '2022-01-01'
-        if (s.length() == 10 && s.charAt(4) == '-' && s.charAt(7) == '-') {
-            TemporalAccessor date = fastParseDate(s);
-            if (date != null) {
-                return Result.ok(date);
-            }
-        }
-
         String originalString = s;
         try {
+            // fast parse '2022-01-01'
+            if ((s.length() == 10 || s.length() == 19) && s.charAt(4) == '-' && s.charAt(7) == '-') {
+                if (s.length() == 10) {
+                    TemporalAccessor date = fastParseDate(s);
+                    if (date != null) {
+                        return Result.ok(date);
+                    }
+                } else if (s.charAt(10) == ' ' && s.charAt(13) == ':' && s.charAt(16) == ':') {
+                    TemporalAccessor date = fastParseDateTime(s);
+                    if (date != null) {
+                        return Result.ok(date);
+                    }
+                }
+            }
+
             TemporalAccessor dateTime;
 
             // remove suffix/prefix ' '
@@ -372,7 +390,7 @@ public class DateLiteral extends Literal {
         return false;
     }
 
-    protected static boolean isDateOutOfRange(LocalDateTime dateTime) {
+    public static boolean isDateOutOfRange(LocalDateTime dateTime) {
         return dateTime == null || dateTime.isBefore(START_OF_A_DAY) || dateTime.isAfter(END_OF_A_DAY);
     }
 
@@ -423,7 +441,7 @@ public class DateLiteral extends Literal {
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return "'" + getStringValue() + "'";
     }
 
@@ -440,6 +458,35 @@ public class DateLiteral extends Literal {
     @Override
     public LiteralExpr toLegacyLiteral() {
         return new org.apache.doris.analysis.DateLiteral(year, month, day, Type.DATE);
+    }
+
+    @Override
+    protected String castValueToString() {
+        return getStringValue();
+    }
+
+    @Override
+    public int compareTo(ComparableLiteral other) {
+        if (other instanceof DateLiteral) {
+            int cmp = Long.compare(getValue(), ((DateLiteral) other).getValue());
+            if (cmp != 0) {
+                return cmp;
+            }
+
+            long thisMicrosecond = this instanceof DateTimeV2Literal ? ((DateTimeV2Literal) this).getMicroSecond() : 0L;
+            long otherMicrosecond = other instanceof DateTimeV2Literal
+                    ? ((DateTimeV2Literal) other).getMicroSecond() : 0L;
+            return Long.compare(thisMicrosecond, otherMicrosecond);
+        }
+        if (other instanceof NullLiteral) {
+            return 1;
+        }
+        if (other instanceof MaxLiteral) {
+            return -1;
+        }
+
+        throw new RuntimeException("Cannot compare two values with different data types: "
+                + this + " (" + dataType + ") vs " + other + " (" + ((Literal) other).dataType + ")");
     }
 
     public long getYear() {
@@ -518,9 +565,10 @@ public class DateLiteral extends Literal {
     }
 
     public static Expression fromJavaDateType(LocalDateTime dateTime) {
-        return isDateOutOfRange(dateTime)
-                ? new NullLiteral(DateType.INSTANCE)
-                : new DateLiteral(dateTime.getYear(), dateTime.getMonthValue(), dateTime.getDayOfMonth());
+        if (isDateOutOfRange(dateTime)) {
+            throw new AnalysisException("datetime out of range: " + dateTime.toString());
+        }
+        return new DateLiteral(dateTime.getYear(), dateTime.getMonthValue(), dateTime.getDayOfMonth());
     }
 
     /**
@@ -555,12 +603,59 @@ public class DateLiteral extends Literal {
         }
     }
 
+    @Override
+    protected Expression uncheckedCastTo(DataType targetType) throws AnalysisException {
+        if (this.dataType.equals(targetType)) {
+            return this;
+        }
+        int value = (int) (year * 10000 + month * 100 + day);
+        if (targetType.isIntegralType()) {
+            if (targetType.isIntegerType()) {
+                return new IntegerLiteral(value);
+            } else if (targetType.isBigIntType()) {
+                return new BigIntLiteral(value);
+            } else if (targetType.isLargeIntType()) {
+                return new LargeIntLiteral(new BigInteger(String.valueOf(value)));
+            } else {
+                throw new AnalysisException("Date can not cast to " + targetType);
+            }
+        } else if (targetType.isFloatType()) {
+            return new FloatLiteral(value);
+        } else if (targetType.isDoubleType()) {
+            return new DoubleLiteral(value);
+        } else if (targetType.isDateTimeV2Type()) {
+            return new DateTimeV2Literal((DateTimeV2Type) targetType, year, month, day, 0, 0, 0, 0);
+        } else if (targetType.isDateTimeType()) {
+            return new DateTimeLiteral((DateTimeType) targetType, year, month, day, 0, 0, 0, 0);
+        } else if (targetType.isDateV2Type()) {
+            return new DateV2Literal(year, month, day);
+        } else if (targetType.isDateType()) {
+            return new DateLiteral(year, month, day);
+        }
+        return super.uncheckedCastTo(targetType);
+    }
+
     private static TemporalAccessor fastParseDate(String date) {
         Integer year = readNextInt(date, 0, 4);
         Integer month = readNextInt(date, 5, 2);
         Integer day = readNextInt(date, 8, 2);
         if (year != null && month != null && day != null) {
             return LocalDate.of(year, month, day);
+        } else {
+            return null;
+        }
+    }
+
+    private static TemporalAccessor fastParseDateTime(String date) {
+        Integer year = readNextInt(date, 0, 4);
+        Integer month = readNextInt(date, 5, 2);
+        Integer day = readNextInt(date, 8, 2);
+        Integer hour = readNextInt(date, 11, 2);
+        Integer minute = readNextInt(date, 14, 2);
+        Integer second = readNextInt(date, 17, 2);
+
+        if (year != null && month != null && day != null && hour != null && minute != null && second != null) {
+            return LocalDateTime.of(year, month, day, hour, minute, second);
         } else {
             return null;
         }

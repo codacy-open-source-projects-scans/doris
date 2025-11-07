@@ -16,7 +16,7 @@
 // under the License.
 
 import org.apache.doris.regression.suite.ClusterOptions
-import org.apache.doris.regression.util.Http
+
 
 suite('test_clean_tablet_when_drop_force_table', 'docker') {
     if (!isCloudMode()) {
@@ -31,76 +31,104 @@ suite('test_clean_tablet_when_drop_force_table', 'docker') {
         'rehash_tablet_after_be_dead_seconds=5'
     ]
     options.beConfigs += [
-        'report_tablet_interval_seconds=1'
+        'report_tablet_interval_seconds=1',
+        'write_buffer_size=10240',
+        'write_buffer_size_for_agg=10240'
     ]
     options.setFeNum(3)
     options.setBeNum(3)
     options.cloudMode = true
     options.enableDebugPoints()
     
-    def backendIdToHost = { ->
-        def spb = sql_return_maparray """SHOW BACKENDS"""
-        def beIdToHost = [:]
-        spb.each {
-            beIdToHost[it.BackendId] = it.Host
-        }
-        beIdToHost 
-    }
+    def testCase = { tableName, waitTime, useDp=false-> 
+        def ms = cluster.getAllMetaservices().get(0)
+        def msHttpPort = ms.host + ":" + ms.httpPort
+        sql """CREATE TABLE IF NOT EXISTS ${tableName} (
+                  `k1` int(11) NULL,
+                  `k2` tinyint(4) NULL,
+                  `k3` smallint(6) NULL,
+                  `k4` bigint(20) NULL,
+                  `k5` largeint(40) NULL,
+                  `k6` float NULL,
+                  `k7` double NULL,
+                  `k8` decimal(9, 0) NULL,
+                  `k9` char(10) NULL,
+                  `k10` varchar(1024) NULL,
+                  `k11` text NULL,
+                  `k12` date NULL,
+                  `k13` datetime NULL
+                ) ENGINE=OLAP
+                DISTRIBUTED BY HASH(`k1`) BUCKETS 3
+        """
+        def txnId = -1;
+        // version 2
+        streamLoad {
+            table "${tableName}"
 
-    def getTabletAndBeHostFromFe = { table ->
-        def result = sql_return_maparray """SHOW TABLETS FROM $table"""
-        def bes = backendIdToHost.call()
-        // tablet : host
-        def ret = [:]
-        result.each {
-            ret[it.TabletId] = bes[it.BackendId]
-        }
-        ret
-    }
+            set 'column_separator', ','
+            set 'compress_type', 'gz'
+            file 'all_types.csv.gz'
+            time 10000 // limit inflight 10s
+            setFeAddr cluster.getAllFrontends().get(0).host, cluster.getAllFrontends().get(0).httpPort
 
-    def getTabletAndBeHostFromBe = { ->
-        def bes = cluster.getAllBackends()
-        def ret = [:]
-        bes.each { be ->
-            // {"msg":"OK","code":0,"data":{"host":"128.2.51.2","tablets":[{"tablet_id":10560},{"tablet_id":10554},{"tablet_id":10552}]},"count":3}
-            def data = Http.GET("http://${be.host}:${be.httpPort}/tablets_json?limit=all", true).data
-            def tablets = data.tablets.collect { it.tablet_id as String }
-            tablets.each{
-                ret[it] = data.host
+            check { loadResult, exception, startTime, endTime ->
+                if (exception != null) {
+                    throw exception
+                }
+                log.info("Stream load result: ${loadResult}".toString())
+                def json = parseJson(loadResult)
+                assertEquals("success", json.Status.toLowerCase())
+                assertEquals(80000, json.NumberTotalRows)
+                assertEquals(0, json.NumberFilteredRows)
+                txnId = json.TxnId
             }
         }
-        ret
-    }
-
-    def testCase = { table, waitTime, useDp=false-> 
-        sql """CREATE TABLE $table (
-            `k1` int(11) NULL,
-            `k2` int(11) NULL
-            )
-            DUPLICATE KEY(`k1`, `k2`)
-            COMMENT 'OLAP'
-            DISTRIBUTED BY HASH(`k1`) BUCKETS 3
-            PROPERTIES (
-            "replication_num"="1"
-            );
-        """
-        sql """
-            insert into $table values (1, 1), (2, 2), (3, 3)
-        """
-
+     
+        context.reconnectFe()
         for (int i = 0; i < 5; i++) {
             sql """
-                select * from $table
+                select count(*) from $tableName
             """
+        }
+        // version 3
+        streamLoad {
+            table "${tableName}"
+
+            set 'column_separator', ','
+            set 'compress_type', 'gz'
+            file 'all_types.csv.gz'
+            time 10000 // limit inflight 10s
+            setFeAddr cluster.getAllFrontends().get(0).host, cluster.getAllFrontends().get(0).httpPort
+
+            check { loadResult, exception, startTime, endTime ->
+                if (exception != null) {
+                    throw exception
+                }
+                log.info("Stream load result: ${loadResult}".toString())
+                def json = parseJson(loadResult)
+                assertEquals("success", json.Status.toLowerCase())
+                assertEquals(80000, json.NumberTotalRows)
+                assertEquals(0, json.NumberFilteredRows)
+                txnId = json.TxnId
+            }
         }
 
         // before drop table force
-        def beforeGetFromFe = getTabletAndBeHostFromFe(table)
-        def beforeGetFromBe = getTabletAndBeHostFromBe.call()
-        logger.info("fe tablets {}, be tablets {}", beforeGetFromFe, beforeGetFromBe)
+        def beforeGetFromFe = getTabletAndBeHostFromFe(tableName)
+        def beforeGetFromBe = getTabletAndBeHostFromBe(cluster.getAllBackends())
+        // version 2
+        def cacheDirVersion2 = getTabletFileCacheDirFromBe(msHttpPort, tableName, 2)
+        // version 3
+        def cacheDirVersion3 = getTabletFileCacheDirFromBe(msHttpPort, tableName, 3)
+
+        def mergedCacheDir = cacheDirVersion2 + cacheDirVersion3.collectEntries { host, hashFiles ->
+            [(host): cacheDirVersion2[host] ? (cacheDirVersion2[host] + hashFiles) : hashFiles]
+        }
+        
+        logger.info("fe tablets {}, be tablets {}, cache dir {}", beforeGetFromFe, beforeGetFromBe, mergedCacheDir)
         beforeGetFromFe.each {
             assertTrue(beforeGetFromBe.containsKey(it.Key))
-            assertEquals(beforeGetFromBe[it.Key], it.Value)
+            assertEquals(beforeGetFromBe[it.Key], it.Value[1])
         }
         if (useDp) {
             GetDebugPoint().enableDebugPointForAllBEs("WorkPoolCloudDropTablet.drop_tablet_callback.failed")
@@ -108,7 +136,7 @@ suite('test_clean_tablet_when_drop_force_table', 'docker') {
         // after drop table force
 
         sql """
-            DROP TABLE $table FORCE
+            DROP TABLE $tableName FORCE
         """
         def futrue
         if (useDp) {
@@ -119,16 +147,50 @@ suite('test_clean_tablet_when_drop_force_table', 'docker') {
         }
         def start = System.currentTimeMillis() / 1000
         // tablet can't find in be 
-        dockerAwaitUntil(50) {
-            def beTablets = getTabletAndBeHostFromBe.call().keySet()
+        awaitUntil(500) {
+            def beTablets = getTabletAndBeHostFromBe(cluster.getAllBackends()).keySet()
             logger.info("before drop tablets {}, after tablets {}", beforeGetFromFe, beTablets)
-            beforeGetFromFe.keySet().every { !getTabletAndBeHostFromBe.call().containsKey(it) }
+            beforeGetFromFe.keySet().every { !getTabletAndBeHostFromBe(cluster.getAllBackends()).containsKey(it) }
         }
-        logger.info("table {}, cost {}s", table, System.currentTimeMillis() / 1000 - start)
+        logger.info("table {}, cost {}s", tableName, System.currentTimeMillis() / 1000 - start)
         assertTrue(System.currentTimeMillis() / 1000 - start > waitTime)
         if (useDp) {
             futrue.get()
         }
+
+        sleep(25 * 1000)
+
+        // check cache file has been deleted
+        beforeGetFromFe.each {
+            def tabletId = it.Key
+            def backendId = it.Value[0]
+            def backendHost = it.Value[1]
+            def be = cluster.getBeByBackendId(backendId.toLong())
+            def dataPath = new File("${be.path}/storage/file_cache")
+            def subDirs = []
+            
+            def collectDirs
+            collectDirs = { File dir ->
+                if (dir.exists()) {
+                    dir.eachDir { subDir ->
+                        subDirs << subDir.name
+                        collectDirs(subDir) 
+                    }
+                }
+            }
+            
+            collectDirs(dataPath)
+            logger.info("BE {} file_cache subdirs: {}", backendHost, subDirs)
+            def cacheDir = mergedCacheDir[backendHost]
+
+            // add check
+            cacheDir.each { hashFile ->
+                assertFalse(subDirs.any { subDir -> subDir.startsWith(hashFile) }, 
+                "Found unexpected cache file pattern ${hashFile} in BE ${backendHost}'s file_cache directory. " + 
+                "Matching subdir found in: ${subDirs}")
+            }
+        }
+
     }
 
     docker(options) {

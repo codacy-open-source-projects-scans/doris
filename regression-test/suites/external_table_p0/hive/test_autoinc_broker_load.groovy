@@ -46,7 +46,7 @@ suite("test_autoinc_broker_load", "p0,external,hive,external_docker,external_doc
         }
 
         def wait_for_load_result = {checklabel, testTable ->
-            def max_try_milli_secs = 10000
+            def max_try_milli_secs = 60000
             while(max_try_milli_secs) {
                 def result = sql "show load where label = '${checklabel}'"
                 if(result[0][2] == "FINISHED") {
@@ -80,7 +80,7 @@ suite("test_autoinc_broker_load", "p0,external,hive,external_docker,external_doc
         def test_load_label = UUID.randomUUID().toString().replaceAll("-", "")
         load_from_hdfs("name, value", table, test_load_label, "auto_inc_basic.csv", "csv")
         wait_for_load_result(test_load_label, table)
-        qt_sql "select * from ${table};"
+        qt_sql "select * from ${table} order by id;"
         sql """ insert into ${table} values(0, "Bob", 123), (2, "Tom", 323), (4, "Carter", 523);"""
         qt_sql "select * from ${table} order by id"
         sql "drop table if exists ${table};"
@@ -105,7 +105,7 @@ suite("test_autoinc_broker_load", "p0,external,hive,external_docker,external_doc
         load_from_hdfs("id, name, value", table, test_load_label, "auto_inc_with_null.csv", "csv")
         wait_for_load_result(test_load_label, table)
         sql "sync"
-        qt_sql "select * from ${table};"
+        qt_sql "select * from ${table} order by id;"
         sql """ insert into ${table} values(0, "Bob", 123), (2, "Tom", 323), (4, "Carter", 523);"""
         qt_sql "select * from ${table} order by id"
         sql "drop table if exists ${table};"

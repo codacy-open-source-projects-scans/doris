@@ -34,7 +34,7 @@ Status UnionSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& info) 
     RETURN_IF_ERROR(Base::init(state, info));
     SCOPED_TIMER(exec_time_counter());
     SCOPED_TIMER(_init_timer);
-    _expr_timer = ADD_TIMER(_profile, "ExprTime");
+    _expr_timer = ADD_TIMER(custom_profile(), "ExprTime");
     auto& p = _parent->cast<Parent>();
     _shared_state->data_queue.set_sink_dependency(_dependency, p._cur_child_id);
     return Status::OK();
@@ -53,14 +53,19 @@ Status UnionSinkLocalState::open(RuntimeState* state) {
     return Status::OK();
 }
 
-UnionSinkOperatorX::UnionSinkOperatorX(int child_id, int sink_id, ObjectPool* pool,
+UnionSinkOperatorX::UnionSinkOperatorX(int child_id, int sink_id, int dest_id, ObjectPool* pool,
                                        const TPlanNode& tnode, const DescriptorTbl& descs)
-        : Base(sink_id, tnode.node_id, tnode.node_id),
+        : Base(sink_id, tnode.node_id, dest_id),
           _first_materialized_child_idx(
                   cast_set<int>(tnode.union_node.first_materialized_child_idx)),
           _row_descriptor(descs, tnode.row_tuples, tnode.nullable_tuples),
           _cur_child_id(child_id),
-          _child_size(tnode.num_children) {}
+          _child_size(tnode.num_children),
+          _distribute_exprs(tnode.__isset.distribute_expr_lists
+                                    ? tnode.distribute_expr_lists[child_id]
+                                    : std::vector<TExpr> {}) {
+    DCHECK(!tnode.__isset.distribute_expr_lists || tnode.distribute_expr_lists.size() > child_id);
+}
 
 Status UnionSinkOperatorX::init(const TPlanNode& tnode, RuntimeState* state) {
     RETURN_IF_ERROR(DataSinkOperatorX::init(tnode, state));
@@ -76,10 +81,10 @@ Status UnionSinkOperatorX::init(const TPlanNode& tnode, RuntimeState* state) {
     return Status::OK();
 }
 
-Status UnionSinkOperatorX::open(RuntimeState* state) {
-    RETURN_IF_ERROR(DataSinkOperatorX<UnionSinkLocalState>::open(state));
+Status UnionSinkOperatorX::prepare(RuntimeState* state) {
+    RETURN_IF_ERROR(DataSinkOperatorX<UnionSinkLocalState>::prepare(state));
     RETURN_IF_ERROR(vectorized::VExpr::prepare(_child_expr, state, _child->row_desc()));
-    RETURN_IF_ERROR(vectorized::VExpr::check_expr_output_type(_child_expr, _row_descriptor));
+    RETURN_IF_ERROR(vectorized::VExpr::check_expr_output_type(_child_expr, row_descriptor()));
     // open const expr lists.
     RETURN_IF_ERROR(vectorized::VExpr::open(_const_expr, state));
 
@@ -91,6 +96,9 @@ Status UnionSinkOperatorX::open(RuntimeState* state) {
 
 Status UnionSinkOperatorX::sink(RuntimeState* state, vectorized::Block* in_block, bool eos) {
     auto& local_state = get_local_state(state);
+    if (local_state.low_memory_mode()) {
+        set_low_memory_mode(state);
+    }
     SCOPED_TIMER(local_state.exec_time_counter());
     COUNTER_UPDATE(local_state.rows_input_counter(), (int64_t)in_block->rows());
     if (local_state._output_block == nullptr) {
@@ -100,8 +108,8 @@ Status UnionSinkOperatorX::sink(RuntimeState* state, vectorized::Block* in_block
     if (_cur_child_id < _get_first_materialized_child_idx()) { //pass_through
         if (in_block->rows() > 0) {
             local_state._output_block->swap(*in_block);
-            local_state._shared_state->data_queue.push_block(std::move(local_state._output_block),
-                                                             _cur_child_id);
+            RETURN_IF_ERROR(local_state._shared_state->data_queue.push_block(
+                    std::move(local_state._output_block), _cur_child_id));
         }
     } else if (_get_first_materialized_child_idx() != children_count() &&
                _cur_child_id < children_count()) { //need materialized
@@ -118,8 +126,8 @@ Status UnionSinkOperatorX::sink(RuntimeState* state, vectorized::Block* in_block
         //because maybe sink is eos and queue have none data, if not push block
         //the source can't can_read again and can't set source finished
         if (local_state._output_block) {
-            local_state._shared_state->data_queue.push_block(std::move(local_state._output_block),
-                                                             _cur_child_id);
+            RETURN_IF_ERROR(local_state._shared_state->data_queue.push_block(
+                    std::move(local_state._output_block), _cur_child_id));
         }
 
         local_state._shared_state->data_queue.set_finish(_cur_child_id);
@@ -127,8 +135,8 @@ Status UnionSinkOperatorX::sink(RuntimeState* state, vectorized::Block* in_block
     }
     // not eos and block rows is enough to output,so push block
     if (local_state._output_block && (local_state._output_block->rows() >= state->batch_size())) {
-        local_state._shared_state->data_queue.push_block(std::move(local_state._output_block),
-                                                         _cur_child_id);
+        RETURN_IF_ERROR(local_state._shared_state->data_queue.push_block(
+                std::move(local_state._output_block), _cur_child_id));
     }
     return Status::OK();
 }

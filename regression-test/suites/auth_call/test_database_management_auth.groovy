@@ -24,14 +24,6 @@ suite("test_database_management_auth","p0,auth_call") {
     String pwd = 'C123_567p'
     String dbName = 'test_database_management_auth_db'
     def String error_in_cloud = "denied"
-    //cloud-mode
-    if (isCloudMode()) {
-        def clusters = sql " SHOW CLUSTERS; "
-        assertTrue(!clusters.isEmpty())
-        def validCluster = clusters[0][0]
-        sql """GRANT USAGE_PRIV ON CLUSTER ${validCluster} TO ${user}""";
-        error_in_cloud = "Unsupported"
-    }
 
     try_sql("DROP USER ${user}")
     try_sql """drop database if exists ${dbName}"""
@@ -39,6 +31,15 @@ suite("test_database_management_auth","p0,auth_call") {
     sql """CREATE USER '${user}' IDENTIFIED BY '${pwd}'"""
     sql """grant select_priv on regression_test to ${user}"""
     sql """create database ${dbName}"""
+
+    //cloud-mode
+    if (isCloudMode()) {
+        def clusters = sql " SHOW CLUSTERS; "
+        assertTrue(!clusters.isEmpty())
+        def validCluster = clusters[0][0]
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
+        error_in_cloud = "Unsupported"
+    }
 
     connect(user, "${pwd}", context.config.jdbcUrl) {
         test {

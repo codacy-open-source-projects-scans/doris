@@ -37,16 +37,16 @@ import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.persist.Storage;
 import org.apache.doris.qe.ConnectContext;
 
-import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.servlet.view.RedirectView;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -54,8 +54,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 @RestController
 public class ShowAction extends RestBaseController {
@@ -105,6 +103,9 @@ public class ShowAction extends RestBaseController {
     //http://username:password@192.168.1.1:8030/api/show_proc?path=/
     @RequestMapping(path = "/api/show_proc", method = RequestMethod.GET)
     public Object show_proc(HttpServletRequest request, HttpServletResponse response) {
+        if (needRedirect(request.getScheme())) {
+            return redirectToHttps(request);
+        }
         executeCheckPassword(request, response);
         // check authority
         checkGlobalAuth(ConnectContext.get().getCurrentUserIdentity(), PrivPredicate.ADMIN);
@@ -117,14 +118,8 @@ public class ShowAction extends RestBaseController {
         }
 
         // forward to master if necessary
-        if (!Env.getCurrentEnv().isMaster() && isForward) {
-            try {
-                RedirectView redirectView = redirectToMasterOrException(request, response);
-                Preconditions.checkNotNull(redirectView);
-                return redirectView;
-            } catch (Exception e) {
-                return ResponseEntityBuilder.okWithCommonError(e.getMessage());
-            }
+        if (checkForwardToMaster(request) && isForward) {
+            return forwardToMaster(request);
         } else {
             ProcNodeInterface procNode = null;
             ProcService instance = ProcService.getInstance();

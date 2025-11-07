@@ -19,6 +19,8 @@ import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("routine_load_mapping") {
 
+    // this mv rewrite would not be rewritten in RBO phase, so set TRY_IN_RBO explicitly to make case stable
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
     sql """ DROP TABLE IF EXISTS test; """
 
     sql """
@@ -36,7 +38,7 @@ suite ("routine_load_mapping") {
 
     sql """insert into test(event_id,time_stamp,device_id) values('ad_sdk_request','2024-03-04 00:00:00','a');"""
 
-    createMV("""create materialized view m_view as select time_stamp, count(device_id) from test group by time_stamp;""")
+    createMV("""create materialized view m_view as select time_stamp as a1, count(device_id) from test group by time_stamp;""")
 
     streamLoad {
         table "test"
@@ -96,23 +98,16 @@ PROPERTIES (
 
          createMV("""CREATE MATERIALIZED VIEW location_rt_mv AS
         SELECT
-        battery_id,
-        create_time
+        battery_id as a1,
+        create_time as a2
         FROM
         rt_new
         WHERE
         heart_type = 1
         ;""")
 
-    sql """ ALTER TABLE rt_new MODIFY COLUMN event_id VARCHAR(51) NULL;"""
-    Thread.sleep(1000)
-
-    streamLoad {
-        table "rt_new"
-        set 'column_separator', ','
-        set 'columns', '`battery_id`,`create_time`,`imei`,`event_id`,`event_name`,`heart_type`'
-
-        file './test2'
-        time 10000 // limit inflight 10s
+    test {
+        sql """ ALTER TABLE rt_new MODIFY COLUMN event_id VARCHAR(51) NULL;"""
+        exception "Can not modify column contained by mv"
     }
 }

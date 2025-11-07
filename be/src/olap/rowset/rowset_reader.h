@@ -40,7 +40,7 @@ struct RowSetSplits {
     // if segment_offsets is not empty, means we only scan
     // [pair.first, pair.second) segment in rs_reader, only effective in dup key
     // and pipeline
-    std::pair<int, int> segment_offsets;
+    std::pair<int64_t, int64_t> segment_offsets;
 
     // RowRanges of each segment.
     std::vector<RowRanges> segment_row_ranges;
@@ -61,10 +61,10 @@ public:
                                          bool use_cache = false) = 0;
     virtual void reset_read_options() = 0;
 
-    virtual Status next_block(vectorized::Block* block) = 0;
-
-    virtual Status next_block_view(vectorized::BlockView* block_view) = 0;
-    virtual bool support_return_data_by_ref() { return false; }
+    virtual Status next_batch(vectorized::Block* block) = 0;
+    virtual Status next_batch(vectorized::BlockView* block_view) = 0;
+    virtual Status next_batch(BlockWithSameBit* block_view) = 0;
+    virtual bool is_merge_iterator() const { return false; }
 
     virtual bool delete_flag() = 0;
 
@@ -83,11 +83,7 @@ public:
         return Status::NotSupported("to be implemented");
     }
 
-    virtual Status get_segment_num_rows(std::vector<uint32_t>* segment_num_rows) {
-        return Status::NotSupported("to be implemented");
-    }
-
-    virtual bool update_profile(RuntimeProfile* profile) = 0;
+    virtual void update_profile(RuntimeProfile* profile) = 0;
 
     virtual RowsetReaderSharedPtr clone() = 0;
 

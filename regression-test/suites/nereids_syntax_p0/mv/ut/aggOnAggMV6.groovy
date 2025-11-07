@@ -18,6 +18,8 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("aggOnAggMV6") {
+    // this mv rewrite would not be rewritten in RBO phase, so set TRY_IN_RBO explicitly to make case stable
+    sql "set pre_materialized_view_rewrite_strategy = TRY_IN_RBO"
     sql "SET experimental_enable_nereids_planner=true"
     sql "SET enable_fallback_to_original_planner=false"
     sql """ DROP TABLE IF EXISTS aggOnAggMV6; """
@@ -34,16 +36,21 @@ suite ("aggOnAggMV6") {
         """
 
     sql """insert into aggOnAggMV6 values("2020-01-01",1,"a",1,1,1);"""
+    sql """insert into aggOnAggMV6 values("2020-01-01",1,"a",1,1,1);"""
+    sql """insert into aggOnAggMV6 values("2020-01-02",2,"b",2,2,2);"""
     sql """insert into aggOnAggMV6 values("2020-01-02",2,"b",2,2,2);"""
     sql """insert into aggOnAggMV6 values("2020-01-03",3,"c",3,3,3);"""
+    sql """insert into aggOnAggMV6 values("2020-01-03",3,"c",3,3,3);"""
 
-    createMV("create materialized view aggOnAggMV6_mv as select deptno, commission, sum(salary) from aggOnAggMV6 group by deptno, commission;")
+    createMV("create materialized view aggOnAggMV6_mv as select deptno as a1, commission as a2, sum(salary) from aggOnAggMV6 group by deptno, commission;")
 
     sleep(3000)
 
     sql """insert into aggOnAggMV6 values("2020-01-01",1,"a",1,1,1);"""
 
     sql "analyze table aggOnAggMV6 with sync;"
+    sql """alter table aggOnAggMV6 modify column time_col set stats ('row_count'='6');"""
+
     sql """set enable_stats=false;"""
 
     mv_rewrite_fail("select * from aggOnAggMV6 order by empid;", "aggOnAggMV6_mv")
@@ -54,7 +61,6 @@ suite ("aggOnAggMV6") {
     order_qt_select_mv "select * from (select deptno, sum(salary) as sum_salary from aggOnAggMV6 where deptno>=20 group by deptno) a where sum_salary>10 order by 1;"
 
     sql """set enable_stats=true;"""
-    sql """alter table aggOnAggMV6 modify column time_col set stats ('row_count'='4');"""
     mv_rewrite_fail("select * from aggOnAggMV6 order by empid;", "aggOnAggMV6_mv")
 
     mv_rewrite_success("select * from (select deptno, sum(salary) as sum_salary from aggOnAggMV6 where deptno>=20 group by deptno) a where sum_salary>10;",
