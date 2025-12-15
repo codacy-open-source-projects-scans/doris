@@ -214,6 +214,12 @@ public class Config extends ConfigBase {
                     + "In each cycle, the expired history load job will be cleaned"})
     public static int label_clean_interval_second = 1 * 3600; // 1 hours
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "Insert Overwrite 任务失败后清理废弃临时分区的时间间隔，单位为毫秒",
+            "Time interval for cleaning up discarded temporary "
+                    + "partitions after Insert Overwrite task fails, in milliseconds"})
+    public static int overwrite_clean_interval_ms = 10000;
+
     @ConfField(description = {"元数据的存储目录", "The directory to save Doris meta data"})
     public static String meta_dir =  EnvUtils.getDorisHome() + "/doris-meta";
 
@@ -3303,9 +3309,6 @@ public class Config extends ConfigBase {
 
     @ConfField(mutable = true, masterOnly = true)
     public static boolean enable_light_index_change = true;
-
-    @ConfField(mutable = true, masterOnly = true)
-    public static boolean enable_create_bitmap_index_as_inverted_index = true;
 
     // The original meta read lock is not enough to keep a snapshot of partition versions,
     // so the execution of `createScanRangeLocations` are delayed to `Coordinator::exec`,

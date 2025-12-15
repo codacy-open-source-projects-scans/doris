@@ -271,8 +271,8 @@ Status ParquetReader::_open_file() {
             const auto& file_meta_cache_key =
                     FileMetaCache::get_key(_tracing_file_reader, _file_description);
             if (!_meta_cache->lookup(file_meta_cache_key, &_meta_cache_handle)) {
-                RETURN_IF_ERROR(parse_thrift_footer(_file_reader, &_file_metadata_ptr, &meta_size,
-                                                    _io_ctx, enable_mapping_varbinary));
+                RETURN_IF_ERROR(parse_thrift_footer(_tracing_file_reader, &_file_metadata_ptr,
+                                                    &meta_size, _io_ctx, enable_mapping_varbinary));
                 // _file_metadata_ptr.release() : move control of _file_metadata to _meta_cache_handle
                 _meta_cache->insert(file_meta_cache_key, _file_metadata_ptr.release(),
                                     &_meta_cache_handle);
@@ -327,13 +327,16 @@ void ParquetReader::_init_file_description() {
 }
 
 Status ParquetReader::init_reader(
-        const std::vector<std::string>& all_column_names, const VExprContextSPtrs& conjuncts,
-        const TupleDescriptor* tuple_descriptor, const RowDescriptor* row_descriptor,
+        const std::vector<std::string>& all_column_names,
+        std::unordered_map<std::string, uint32_t>* col_name_to_block_idx,
+        const VExprContextSPtrs& conjuncts, const TupleDescriptor* tuple_descriptor,
+        const RowDescriptor* row_descriptor,
         const std::unordered_map<std::string, int>* colname_to_slot_id,
         const VExprContextSPtrs* not_single_slot_filter_conjuncts,
         const std::unordered_map<int, VExprContextSPtrs>* slot_id_to_filter_conjuncts,
         std::shared_ptr<TableSchemaChangeHelper::Node> table_info_node_ptr, bool filter_groups,
         const std::set<uint64_t>& column_ids, const std::set<uint64_t>& filter_column_ids) {
+    _col_name_to_block_idx = col_name_to_block_idx;
     _tuple_descriptor = tuple_descriptor;
     _row_descriptor = row_descriptor;
     _colname_to_slot_id = colname_to_slot_id;
@@ -375,6 +378,7 @@ Status ParquetReader::init_reader(
         if (required_file_columns.contains(name)) {
             _read_file_columns.emplace_back(name);
             _read_table_columns.emplace_back(required_file_columns[name]);
+            _read_table_columns_set.insert(required_file_columns[name]);
         }
     }
     // build column predicates for column lazy read
@@ -383,7 +387,13 @@ Status ParquetReader::init_reader(
 }
 
 bool ParquetReader::_exists_in_file(const VSlotRef* slot_ref) const {
-    return _table_info_node_ptr->children_column_exists(slot_ref->expr_name());
+    // `_read_table_columns_set` is used to ensure that only columns actually read are subject to min-max filtering.
+    // This primarily handles cases where partition columns also exist in a file. The reason it's not modified
+    // in `_table_info_node_ptr` is that Iceberg、Hudi has inconsistent requirements for this node;
+    // Iceberg partition evolution need read partition columns from a file.
+    // hudi set `hoodie.datasource.write.drop.partition.columns=false` not need read partition columns from a file.
+    return _table_info_node_ptr->children_column_exists(slot_ref->expr_name()) &&
+           _read_table_columns_set.contains(slot_ref->expr_name());
 }
 
 bool ParquetReader::_type_matches(const VSlotRef* slot_ref) const {
@@ -792,6 +802,7 @@ Status ParquetReader::_next_row_group_reader() {
 
     _current_group_reader->set_current_row_group_idx(_current_row_group_index);
     _current_group_reader->set_row_id_column_iterator(_row_id_column_iterator_pair);
+    _current_group_reader->set_col_name_to_block_idx(_col_name_to_block_idx);
 
     _current_group_reader->_table_info_node_ptr = _table_info_node_ptr;
     return _current_group_reader->init(_file_metadata->schema(), candidate_row_ranges, _col_offsets,
@@ -967,6 +978,12 @@ Status ParquetReader::_process_page_index_filter(
             // complex type, not support page index yet.
             return false;
         }
+        if (!_col_offsets.contains(parquet_col_id)) {
+            // If the file contains partition columns and the query applies filters on those
+            // partition columns, then reading the page index is unnecessary.
+            return false;
+        }
+
         auto& column_chunk = row_group.columns[parquet_col_id];
         if (column_chunk.column_index_length == 0 || column_chunk.offset_index_length == 0) {
             // column no page index.
