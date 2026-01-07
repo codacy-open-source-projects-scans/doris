@@ -513,6 +513,12 @@ public class SessionVariable implements Serializable, Writable {
     // Split size for ExternalFileScanNode. Default value 0 means use the block size of HDFS/S3.
     public static final String FILE_SPLIT_SIZE = "file_split_size";
 
+    public static final String MAX_INITIAL_FILE_SPLIT_SIZE = "max_initial_file_split_size";
+
+    public static final String MAX_FILE_SPLIT_SIZE = "max_file_split_size";
+
+    public static final String MAX_INITIAL_FILE_SPLIT_NUM = "max_initial_file_split_num";
+
     // Target file size in bytes for Iceberg write operations
     public static final String ICEBERG_WRITE_TARGET_FILE_SIZE_BYTES = "iceberg_write_target_file_size_bytes";
 
@@ -800,6 +806,8 @@ public class SessionVariable implements Serializable, Writable {
 
     public static final String READ_HIVE_JSON_IN_ONE_COLUMN = "read_hive_json_in_one_column";
 
+    public static final String CTE_MAX_RECURSION_DEPTH = "cte_max_recursion_depth";
+
     /**
      * Inserting overwrite for auto partition table allows creating partition for
      * datas which cannot find partition to overwrite.
@@ -1020,6 +1028,11 @@ public class SessionVariable implements Serializable, Writable {
             + "default 0 means use twice the number of Scan thread pool threads"
     }, varType = VariableAnnotation.DEPRECATED)
     public int minScanSchedulerConcurrency = 0;
+
+    @VariableMgr.VarAttr(name = CTE_MAX_RECURSION_DEPTH, needForward = true, description = {
+            "CTE递归的最大深度，默认值100",
+            "The maximum depth of CTE recursion. Default is 100" })
+    public int cteMaxRecursionDepth = 100;
 
     // By default, the number of Limit items after OrderBy is changed from 65535 items
     // before v1.2.0 (not included), to return all items by default
@@ -2181,6 +2194,36 @@ public class SessionVariable implements Serializable, Writable {
 
     @VariableMgr.VarAttr(name = FILE_SPLIT_SIZE, needForward = true)
     public long fileSplitSize = 0;
+
+    @VariableMgr.VarAttr(
+            name = MAX_INITIAL_FILE_SPLIT_SIZE,
+            description = {"对于每个 table scan，最大文件分片初始大小。"
+                    + "初始化使用 MAX_INITIAL_FILE_SPLIT_SIZE，一旦超过了 MAX_INITIAL_FILE_SPLIT_NUM，则使用 MAX_FILE_SPLIT_SIZE。",
+                    "For each table scan, The maximum initial file split size. "
+                            + "Initialize using MAX_INITIAL_FILE_SPLIT_SIZE,"
+                            + " and once MAX_INITIAL_FILE_SPLIT_NUM is exceeded, use MAX_FILE_SPLIT_SIZE instead."},
+            needForward = true)
+    public long maxInitialSplitSize = 32L * 1024L * 1024L;
+
+    @VariableMgr.VarAttr(
+            name = MAX_FILE_SPLIT_SIZE,
+            description = {"对于每个 table scan，最大文件分片大小。"
+                    + "初始化使用 MAX_INITIAL_FILE_SPLIT_SIZE，一旦超过了 MAX_INITIAL_FILE_SPLIT_NUM，则使用 MAX_FILE_SPLIT_SIZE。",
+                    "For each table scan, the maximum initial file split size. "
+                            + "Initialize using MAX_INITIAL_FILE_SPLIT_SIZE,"
+                            + " and once MAX_INITIAL_FILE_SPLIT_NUM is exceeded, use MAX_FILE_SPLIT_SIZE instead."},
+            needForward = true)
+    public long maxSplitSize = 64L * 1024L * 1024L;
+
+    @VariableMgr.VarAttr(
+            name = MAX_INITIAL_FILE_SPLIT_NUM,
+            description = {"对于每个 table scan，最大文件分片初始数目。"
+                    + "初始化使用 MAX_INITIAL_FILE_SPLIT_SIZE，一旦超过了 MAX_INITIAL_FILE_SPLIT_NUM，则使用 MAX_FILE_SPLIT_SIZE。",
+                    "For each table scan, the maximum initial file split number. "
+                            + "Initialize using MAX_INITIAL_FILE_SPLIT_SIZE,"
+                            + " and once MAX_INITIAL_FILE_SPLIT_NUM is exceeded, use MAX_FILE_SPLIT_SIZE instead."},
+            needForward = true)
+    public int maxInitialSplitNum = 200;
 
     // Target file size for Iceberg write operations
     // Default 0 means use config::iceberg_sink_max_file_size
@@ -4236,6 +4279,30 @@ public class SessionVariable implements Serializable, Writable {
         this.fileSplitSize = fileSplitSize;
     }
 
+    public long getMaxInitialSplitSize() {
+        return maxInitialSplitSize;
+    }
+
+    public void setMaxInitialSplitSize(long maxInitialSplitSize) {
+        this.maxInitialSplitSize = maxInitialSplitSize;
+    }
+
+    public long getMaxSplitSize() {
+        return maxSplitSize;
+    }
+
+    public void setMaxSplitSize(long maxSplitSize) {
+        this.maxSplitSize = maxSplitSize;
+    }
+
+    public int getMaxInitialSplitNum() {
+        return maxInitialSplitNum;
+    }
+
+    public void setMaxInitialSplitNum(int maxInitialSplitNum) {
+        this.maxInitialSplitNum = maxInitialSplitNum;
+    }
+
     public long getIcebergWriteTargetFileSizeBytes() {
         return icebergWriteTargetFileSizeBytes;
     }
@@ -4907,7 +4974,7 @@ public class SessionVariable implements Serializable, Writable {
         tResult.setInvertedIndexSkipThreshold(invertedIndexSkipThreshold);
 
         tResult.setInvertedIndexCompatibleRead(invertedIndexCompatibleRead);
-
+        tResult.setCteMaxRecursionDepth(cteMaxRecursionDepth);
         tResult.setEnableParallelScan(enableParallelScan);
         tResult.setParallelScanMaxScannersCount(parallelScanMaxScannersCount);
         tResult.setParallelScanMinRowsPerScanner(parallelScanMinRowsPerScanner);
