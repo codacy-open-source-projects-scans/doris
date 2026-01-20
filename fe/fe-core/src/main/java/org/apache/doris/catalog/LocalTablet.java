@@ -17,16 +17,30 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.clone.TabletSchedCtx;
+import org.apache.doris.clone.TabletSchedCtx.Priority;
+import org.apache.doris.common.Config;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
+import org.apache.doris.system.Backend;
+import org.apache.doris.system.SystemInfoService;
 
 import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
 
 public class LocalTablet extends Tablet {
     private static final Logger LOG = LogManager.getLogger(LocalTablet.class);
+
+    @SerializedName(value = "rs", alternate = {"replicas"})
+    private List<Replica> replicas;
+    @SerializedName(value = "lastCheckTime")
+    private long lastCheckTime;
 
     // cooldown conf
     @SerializedName(value = "cri", alternate = {"cooldownReplicaId"})
@@ -35,11 +49,36 @@ public class LocalTablet extends Tablet {
     private long cooldownTerm = -1;
     private final Object cooldownConfLock = new Object();
 
+    @SerializedName(value = "cv", alternate = {"checkedVersion"})
+    private long checkedVersion;
+    @SerializedName(value = "ic", alternate = {"isConsistent"})
+    private boolean isConsistent;
+
+    // last time that the tablet checker checks this tablet.
+    // no need to persist
+    private long lastStatusCheckTime = -1;
+
+    // last time for load data fail
+    private long lastLoadFailedTime = -1;
+
+    // if tablet want to add a new replica, but cann't found any backend to locate the new replica.
+    // then mark this tablet. For later repair, even try and try to repair this tablet, sched will always fail.
+    // For example, 1 tablet contains 3 replicas, if 1 backend is dead, then tablet's healthy status
+    // is REPLICA_MISSING. But since no other backend can held the new replica, then sched always fail.
+    // So don't increase this tablet's sched priority if it has no path for new replica.
+    private long lastTimeNoPathForNewReplica = -1;
+
     public LocalTablet() {
+        this(0);
     }
 
     public LocalTablet(long tabletId) {
         super(tabletId);
+        if (this.replicas == null) {
+            this.replicas = new ArrayList<>();
+        }
+        checkedVersion = -1L;
+        isConsistent = true;
     }
 
     @Override
@@ -65,7 +104,6 @@ public class LocalTablet extends Tablet {
     @Override
     public long getRemoteDataSize() {
         // if CooldownReplicaId is not init
-        // [fix](fe) move some variables from Tablet to LocalTablet which are not used in CloudTablet
         if (cooldownReplicaId <= 0) {
             return 0;
         }
@@ -76,5 +114,214 @@ public class LocalTablet extends Tablet {
         }
         // return replica with max remoteDataSize
         return replicas.stream().max(Comparator.comparing(Replica::getRemoteDataSize)).get().getRemoteDataSize();
+    }
+
+    @Override
+    public long getCheckedVersion() {
+        return this.checkedVersion;
+    }
+
+    @Override
+    public void setCheckedVersion(long checkedVersion) {
+        this.checkedVersion = checkedVersion;
+    }
+
+    @Override
+    public void setIsConsistent(boolean good) {
+        this.isConsistent = good;
+    }
+
+    @Override
+    public boolean isConsistent() {
+        return isConsistent;
+    }
+
+    @Override
+    protected long getLastStatusCheckTime() {
+        return lastStatusCheckTime;
+    }
+
+    @Override
+    public void setLastStatusCheckTime(long lastStatusCheckTime) {
+        this.lastStatusCheckTime = lastStatusCheckTime;
+    }
+
+    @Override
+    public long getLastLoadFailedTime() {
+        return lastLoadFailedTime;
+    }
+
+    @Override
+    public void setLastLoadFailedTime(long lastLoadFailedTime) {
+        this.lastLoadFailedTime = lastLoadFailedTime;
+    }
+
+    @Override
+    protected long getLastTimeNoPathForNewReplica() {
+        return lastTimeNoPathForNewReplica;
+    }
+
+    @Override
+    public void setLastTimeNoPathForNewReplica(long lastTimeNoPathForNewReplica) {
+        this.lastTimeNoPathForNewReplica = lastTimeNoPathForNewReplica;
+    }
+
+    @Override
+    public long getLastCheckTime() {
+        return lastCheckTime;
+    }
+
+    @Override
+    public void setLastCheckTime(long lastCheckTime) {
+        this.lastCheckTime = lastCheckTime;
+    }
+
+    private boolean isLatestReplicaAndDeleteOld(Replica newReplica) {
+        boolean delete = false;
+        boolean hasBackend = false;
+        long version = newReplica.getVersion();
+        Iterator<Replica> iterator = replicas.iterator();
+        while (iterator.hasNext()) {
+            Replica replica = iterator.next();
+            if (replica.getBackendIdWithoutException() == newReplica.getBackendIdWithoutException()) {
+                hasBackend = true;
+                if (replica.getVersion() <= version) {
+                    iterator.remove();
+                    delete = true;
+                }
+            }
+        }
+
+        return delete || !hasBackend;
+    }
+
+    @Override
+    public void addReplica(Replica replica, boolean isRestore) {
+        if (isLatestReplicaAndDeleteOld(replica)) {
+            replicas.add(replica);
+            if (!isRestore) {
+                Env.getCurrentInvertedIndex().addReplica(id, replica);
+            }
+        }
+    }
+
+    @Override
+    public List<Replica> getReplicas() {
+        return this.replicas;
+    }
+
+    @Override
+    public Replica getReplicaByBackendId(long backendId) {
+        for (Replica replica : replicas) {
+            if (replica.getBackendIdWithoutException() == backendId) {
+                return replica;
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public boolean deleteReplica(Replica replica) {
+        if (replicas.contains(replica)) {
+            replicas.remove(replica);
+            Env.getCurrentInvertedIndex().deleteReplica(id, replica.getBackendIdWithoutException());
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public boolean deleteReplicaByBackendId(long backendId) {
+        Iterator<Replica> iterator = replicas.iterator();
+        while (iterator.hasNext()) {
+            Replica replica = iterator.next();
+            if (replica.getBackendIdWithoutException() == backendId) {
+                iterator.remove();
+                Env.getCurrentInvertedIndex().deleteReplica(id, backendId);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (this == obj) {
+            return true;
+        }
+        if (!(obj instanceof LocalTablet)) {
+            return false;
+        }
+
+        LocalTablet tablet = (LocalTablet) obj;
+
+        if (replicas != tablet.replicas) {
+            if (replicas.size() != tablet.replicas.size()) {
+                return false;
+            }
+            int size = replicas.size();
+            for (int i = 0; i < size; i++) {
+                if (!tablet.replicas.contains(replicas.get(i))) {
+                    return false;
+                }
+            }
+        }
+        return id == tablet.id;
+    }
+
+    /**
+     * check if this tablet is ready to be repaired, based on priority.
+     * VERY_HIGH: repair immediately
+     * HIGH:    delay Config.tablet_repair_delay_factor_second * 1;
+     * NORMAL:  delay Config.tablet_repair_delay_factor_second * 2;
+     * LOW:     delay Config.tablet_repair_delay_factor_second * 3;
+     */
+    @Override
+    public boolean readyToBeRepaired(SystemInfoService infoService, TabletSchedCtx.Priority priority) {
+        if (FeConstants.runningUnitTest) {
+            return true;
+        }
+
+        if (priority == Priority.VERY_HIGH) {
+            return true;
+        }
+
+        boolean allBeAliveOrDecommissioned = true;
+        for (Replica replica : replicas) {
+            Backend backend = infoService.getBackend(replica.getBackendIdWithoutException());
+            if (backend == null || (!backend.isAlive() && !backend.isDecommissioned())) {
+                allBeAliveOrDecommissioned = false;
+                break;
+            }
+        }
+
+        if (allBeAliveOrDecommissioned) {
+            return true;
+        }
+
+        long currentTime = System.currentTimeMillis();
+
+        // first check, wait for next round
+        if (getLastStatusCheckTime() == -1) {
+            setLastStatusCheckTime(currentTime);
+            return false;
+        }
+
+        boolean ready = false;
+        switch (priority) {
+            case HIGH:
+                ready = currentTime - getLastStatusCheckTime() > Config.tablet_repair_delay_factor_second * 1000 * 1;
+                break;
+            case NORMAL:
+                ready = currentTime - getLastStatusCheckTime() > Config.tablet_repair_delay_factor_second * 1000 * 2;
+                break;
+            case LOW:
+                ready = currentTime - getLastStatusCheckTime() > Config.tablet_repair_delay_factor_second * 1000 * 3;
+                break;
+            default:
+                break;
+        }
+
+        return ready;
     }
 }
