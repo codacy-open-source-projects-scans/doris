@@ -168,6 +168,7 @@ public class SessionVariable implements Serializable, Writable {
             "enable_distinct_streaming_agg_force_passthrough";
     public static final String ENABLE_BROADCAST_JOIN_FORCE_PASSTHROUGH = "enable_broadcast_join_force_passthrough";
     public static final String DISABLE_COLOCATE_PLAN = "disable_colocate_plan";
+    public static final String COLOCATE_MAX_PARALLEL_NUM = "colocate_max_parallel_num";
     public static final String ENABLE_BUCKET_SHUFFLE_JOIN = "enable_bucket_shuffle_join";
     public static final String PARALLEL_FRAGMENT_EXEC_INSTANCE_NUM = "parallel_fragment_exec_instance_num";
     public static final String PARALLEL_PIPELINE_TASK_NUM = "parallel_pipeline_task_num";
@@ -314,6 +315,7 @@ public class SessionVariable implements Serializable, Writable {
     public static final String USE_SERIAL_EXCHANGE = "use_serial_exchange";
 
     public static final String ENABLE_PARALLEL_SCAN = "enable_parallel_scan";
+    public static final String ENABLE_AGGREGATE_FUNCTION_NULL_V2 = "enable_aggregate_function_null_v2";
 
     public static final String ENABLE_NEW_SHUFFLE_HASH_METHOD = "enable_new_shuffle_hash_method";
 
@@ -1301,6 +1303,9 @@ public class SessionVariable implements Serializable, Writable {
                         setter = "setFragmentInstanceNum", varType = VariableAnnotation.DEPRECATED)
     public int parallelExecInstanceNum = 8;
 
+    @VariableMgr.VarAttr(name = COLOCATE_MAX_PARALLEL_NUM, needForward = true, fuzzy = false)
+    public int colocateMaxParallelNum = 128;
+
     @VariableMgr.VarAttr(name = PARALLEL_PIPELINE_TASK_NUM, fuzzy = true, needForward = true,
                         setter = "setPipelineTaskNum")
     public int parallelPipelineTaskNum = 0;
@@ -1497,6 +1502,9 @@ public class SessionVariable implements Serializable, Writable {
     @VariableMgr.VarAttr(name = ENABLE_PARALLEL_SCAN, fuzzy = true, varType = VariableAnnotation.EXPERIMENTAL,
             needForward = true)
     private boolean enableParallelScan = true;
+
+    @VariableMgr.VarAttr(name = ENABLE_AGGREGATE_FUNCTION_NULL_V2, fuzzy = true, needForward = true)
+    private boolean enableAggregateFunctionNullV2 = true;
 
     @VariableMgr.VarAttr(name = OPTIMIZE_INDEX_SCAN_PARALLELISM,
             needForward = true,
@@ -5193,6 +5201,7 @@ public class SessionVariable implements Serializable, Writable {
         tResult.setCteMaxRecursionDepth(cteMaxRecursionDepth);
         tResult.setEnableParallelScan(enableParallelScan);
         tResult.setEnableLeftSemiDirectReturnOpt(enableLeftSemiDirectReturnOpt);
+        tResult.setEnableAggregateFunctionNullV2(enableAggregateFunctionNullV2);
         tResult.setParallelScanMaxScannersCount(parallelScanMaxScannersCount);
         tResult.setParallelScanMinRowsPerScanner(parallelScanMinRowsPerScanner);
         tResult.setOptimizeIndexScanParallelism(optimizeIndexScanParallelism);
@@ -5591,6 +5600,10 @@ public class SessionVariable implements Serializable, Writable {
 
     public boolean getEnableParallelScan() {
         return enableParallelScan;
+    }
+
+    public boolean getEnableAggregateFunctionNullV2() {
+        return enableAggregateFunctionNullV2;
     }
 
     public boolean enableParallelResultSink() {
