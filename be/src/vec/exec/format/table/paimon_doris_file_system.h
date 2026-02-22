@@ -15,19 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "iceberg_table_sink_operator.h"
+#pragma once
 
-#include "common/status.h"
+namespace doris::vectorized {
 
-namespace doris::pipeline {
-#include "common/compile_check_begin.h"
-Status IcebergTableSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& info) {
-    RETURN_IF_ERROR(Base::init(state, info));
-    SCOPED_TIMER(exec_time_counter());
-    SCOPED_TIMER(_init_timer);
-    auto& p = _parent->cast<Parent>();
-    RETURN_IF_ERROR(_writer->init_properties(p._pool, p._row_desc));
-    return Status::OK();
-}
+// Force-link helper so the paimon-cpp file system factory registration is kept.
+void register_paimon_doris_file_system();
 
-} // namespace doris::pipeline
+} // namespace doris::vectorized
