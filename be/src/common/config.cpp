@@ -1129,6 +1129,9 @@ DEFINE_String(python_venv_interpreter_paths, "");
 // max python processes in global shared pool, each version can have up to this many processes
 // 0 means use CPU core count as default, otherwise use the specified value
 DEFINE_mInt32(max_python_process_num, "0");
+// Memory limit in bytes for all Python UDF processes; warning is logged when exceeded
+// default is 10GB
+DEFINE_mInt64(python_udf_processes_memory_limit_bytes, "10737418240");
 
 // Set config randomly to check more issues in github workflow
 DEFINE_Bool(enable_fuzzy_mode, "false");
@@ -1149,6 +1152,10 @@ DEFINE_mInt32(variant_max_json_key_length, "255");
 DEFINE_mBool(variant_throw_exeception_on_invalid_json, "false");
 DEFINE_mBool(enable_vertical_compact_variant_subcolumns, "true");
 DEFINE_mBool(enable_variant_doc_sparse_write_subcolumns, "true");
+// Maximum depth of nested arrays to track with NestedGroup
+// Reserved for future use when NestedGroup expansion moves to storage layer
+// Deeper arrays will be stored as JSONB
+DEFINE_mInt32(variant_nested_group_max_depth, "3");
 
 DEFINE_Validator(variant_max_json_key_length,
                  [](const int config) -> bool { return config > 0 && config <= 65535; });
@@ -1719,6 +1726,8 @@ DEFINE_String(test_s3_prefix, "prefix");
 
 std::map<std::string, Register::Field>* Register::_s_field_map = nullptr;
 std::map<std::string, std::function<bool()>>* RegisterConfValidator::_s_field_validator = nullptr;
+std::map<std::string, RegisterConfUpdateCallback::CallbackFunc>*
+        RegisterConfUpdateCallback::_s_field_update_callback = nullptr;
 std::map<std::string, std::string>* full_conf_map = nullptr;
 
 std::mutex custom_conf_lock;
@@ -2076,6 +2085,13 @@ bool init(const char* conf_file, bool fill_conf_map, bool must_exist, bool set_t
         }                                                                                          \
         if (PERSIST) {                                                                             \
             RETURN_IF_ERROR(persist_config(std::string((FIELD).name), VALUE));                     \
+        }                                                                                          \
+        if (RegisterConfUpdateCallback::_s_field_update_callback != nullptr) {                     \
+            auto callback_it =                                                                     \
+                    RegisterConfUpdateCallback::_s_field_update_callback->find((FIELD).name);      \
+            if (callback_it != RegisterConfUpdateCallback::_s_field_update_callback->end()) {      \
+                callback_it->second(&old_value, &new_value);                                       \
+            }                                                                                      \
         }                                                                                          \
         update_config(std::string((FIELD).name), VALUE);                                           \
         return Status::OK();                                                                       \

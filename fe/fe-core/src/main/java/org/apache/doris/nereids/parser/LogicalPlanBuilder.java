@@ -26,7 +26,6 @@ import org.apache.doris.analysis.ColumnPosition;
 import org.apache.doris.analysis.DbName;
 import org.apache.doris.analysis.EncryptKeyName;
 import org.apache.doris.analysis.FunctionName;
-import org.apache.doris.analysis.LockTable;
 import org.apache.doris.analysis.PassVar;
 import org.apache.doris.analysis.PasswordOptions;
 import org.apache.doris.analysis.ResourceDesc;
@@ -836,6 +835,8 @@ import org.apache.doris.nereids.trees.plans.commands.ShowPluginsCommand;
 import org.apache.doris.nereids.trees.plans.commands.ShowPrivilegesCommand;
 import org.apache.doris.nereids.trees.plans.commands.ShowProcCommand;
 import org.apache.doris.nereids.trees.plans.commands.ShowProcessListCommand;
+import org.apache.doris.nereids.trees.plans.commands.ShowPythonPackagesCommand;
+import org.apache.doris.nereids.trees.plans.commands.ShowPythonVersionsCommand;
 import org.apache.doris.nereids.trees.plans.commands.ShowQueryProfileCommand;
 import org.apache.doris.nereids.trees.plans.commands.ShowQueryStatsCommand;
 import org.apache.doris.nereids.trees.plans.commands.ShowQueuedAnalyzeJobsCommand;
@@ -1576,6 +1577,9 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
             Map<String, Expression> staticValues = Maps.newLinkedHashMap();
             for (DorisParser.PartitionKeyValueContext kvCtx : ctx.partitionKeyValue()) {
                 String colName = kvCtx.identifier().getText();
+                if (staticValues.containsKey(colName)) {
+                    throw new AnalysisException("Duplicate partition column: " + colName);
+                }
                 Expression valueExpr = typedVisit(kvCtx.expression());
                 staticValues.put(colName, valueExpr);
             }
@@ -5088,7 +5092,8 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
                 // TODO use function binder to check function exists
                 throw new ParseException("Can not found function '" + functionName + "'", ctx);
             }
-            return new AggStateType(functionName, dataTypes, nullables);
+            return new AggStateType(functionName, dataTypes, nullables,
+                    BuiltinAggregateFunctions.INSTANCE.aggFuncNameNullableMap.get(functionName));
         });
     }
 
@@ -6507,6 +6512,17 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
             return new ShowTrashCommand();
         }
         return new ShowTrashCommand();
+    }
+
+    @Override
+    public LogicalPlan visitShowPythonVersions(DorisParser.ShowPythonVersionsContext ctx) {
+        return new ShowPythonVersionsCommand();
+    }
+
+    @Override
+    public LogicalPlan visitShowPythonPackages(DorisParser.ShowPythonPackagesContext ctx) {
+        String version = stripQuotes(ctx.STRING_LITERAL().getText());
+        return new ShowPythonPackagesCommand(version);
     }
 
     @Override
@@ -7936,12 +7952,13 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
             TableNameInfo tableNameInfo = new TableNameInfo(visitMultipartIdentifier(lockTableCtx.name));
             String alias = lockTableCtx.alias != null ? lockTableCtx.alias.getText() : null;
 
-            LockTable.LockType lockType;
+            LockTableInfo.LockType lockType;
             if (lockTableCtx.READ() != null) {
-                lockType = lockTableCtx.LOCAL() != null ? LockTable.LockType.READ_LOCAL : LockTable.LockType.READ;
+                lockType = lockTableCtx.LOCAL() != null
+                        ? LockTableInfo.LockType.READ_LOCAL : LockTableInfo.LockType.READ;
             } else if (lockTableCtx.WRITE() != null) {
-                lockType = lockTableCtx.LOW_PRIORITY() != null ? LockTable.LockType.LOW_PRIORITY_WRITE
-                        : LockTable.LockType.WRITE;
+                lockType = lockTableCtx.LOW_PRIORITY() != null
+                        ? LockTableInfo.LockType.LOW_PRIORITY_WRITE : LockTableInfo.LockType.WRITE;
             } else {
                 throw new IllegalArgumentException("Invalid lock type in LOCK TABLES command.");
             }

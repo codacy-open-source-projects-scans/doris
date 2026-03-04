@@ -46,6 +46,7 @@ import org.apache.doris.common.util.Util;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.datasource.FileQueryScanNode;
 import org.apache.doris.datasource.doris.RemoteDorisExternalTable;
+import org.apache.doris.datasource.doris.RemoteOlapTable;
 import org.apache.doris.datasource.doris.source.RemoteDorisScanNode;
 import org.apache.doris.datasource.es.EsExternalTable;
 import org.apache.doris.datasource.es.source.EsScanNode;
@@ -146,6 +147,7 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalLazyMaterialize;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalLazyMaterializeOlapScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalLazyMaterializeTVFScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalLimit;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalMaxComputeTableSink;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalNestedLoopJoin;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalOdbcScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalOlapScan;
@@ -201,6 +203,7 @@ import org.apache.doris.planner.IcebergTableSink;
 import org.apache.doris.planner.IntersectNode;
 import org.apache.doris.planner.JoinNodeBase;
 import org.apache.doris.planner.MaterializationNode;
+import org.apache.doris.planner.MaxComputeTableSink;
 import org.apache.doris.planner.MultiCastDataSink;
 import org.apache.doris.planner.MultiCastPlanFragment;
 import org.apache.doris.planner.NestedLoopJoinNode;
@@ -211,6 +214,7 @@ import org.apache.doris.planner.PlanFragment;
 import org.apache.doris.planner.PlanNode;
 import org.apache.doris.planner.RecursiveCteNode;
 import org.apache.doris.planner.RecursiveCteScanNode;
+import org.apache.doris.planner.RemoteOlapTableSink;
 import org.apache.doris.planner.RepeatNode;
 import org.apache.doris.planner.ResultFileSink;
 import org.apache.doris.planner.ResultSink;
@@ -535,20 +539,29 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             syncMvWhereClauses.put(entry.getKey(), ExpressionTranslator.translate(entry.getValue(), context));
         }
         OlapTableSink sink;
-        // This statement is only used in the group_commit mode
-        if (context.getConnectContext().isGroupCommit()) {
-            sink = new GroupCommitBlockSink(olapTableSink.getTargetTable(), olapTuple,
-                    olapTableSink.getTargetTable().getPartitionIds(), olapTableSink.isSingleReplicaLoad(),
+        OlapTable targetTable = olapTableSink.getTargetTable();
+        if (targetTable instanceof RemoteOlapTable) {
+            if (context.getConnectContext().isGroupCommit()) {
+                throw new RuntimeException("remote olap table do not support group commit");
+            }
+            sink = new RemoteOlapTableSink(
+                    (RemoteOlapTable) targetTable,
+                    olapTuple,
+                    olapTableSink.getPartitionIds().isEmpty() ? null : olapTableSink.getPartitionIds(),
+                    olapTableSink.isSingleReplicaLoad(), partitionExprs, syncMvWhereClauses);
+        } else if (context.getConnectContext().isGroupCommit()) {
+            sink = new GroupCommitBlockSink(targetTable, olapTuple,
+                    targetTable.getPartitionIds(), olapTableSink.isSingleReplicaLoad(),
                     partitionExprs, syncMvWhereClauses,
                     context.getSessionVariable().getGroupCommit(),
                     ConnectContext.get().getSessionVariable().getEnableInsertStrict() ? 0
                             : ConnectContext.get().getSessionVariable().getInsertMaxFilterRatio());
         } else {
             sink = new OlapTableSink(
-                olapTableSink.getTargetTable(),
-                olapTuple,
-                olapTableSink.getPartitionIds().isEmpty() ? null : olapTableSink.getPartitionIds(),
-                olapTableSink.isSingleReplicaLoad(), partitionExprs, syncMvWhereClauses
+                    targetTable,
+                    olapTuple,
+                    olapTableSink.getPartitionIds().isEmpty() ? null : olapTableSink.getPartitionIds(),
+                    olapTableSink.isSingleReplicaLoad(), partitionExprs, syncMvWhereClauses
             );
         }
         sink.setPartialUpdateInputColumns(isPartialUpdate, partialUpdateCols);
@@ -581,6 +594,17 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         IcebergTableSink sink = new IcebergTableSink((IcebergExternalTable) icebergTableSink.getTargetTable());
         rootFragment.setSink(sink);
         sink.setOutputExprs(outputExprs);
+        return rootFragment;
+    }
+
+    @Override
+    public PlanFragment visitPhysicalMaxComputeTableSink(PhysicalMaxComputeTableSink<? extends Plan> mcTableSink,
+                                                          PlanTranslatorContext context) {
+        PlanFragment rootFragment = mcTableSink.child().accept(this, context);
+        rootFragment.setOutputPartition(DataPartition.UNPARTITIONED);
+        MaxComputeTableSink sink = new MaxComputeTableSink(
+                (MaxComputeExternalTable) mcTableSink.getTargetTable());
+        rootFragment.setSink(sink);
         return rootFragment;
     }
 
@@ -892,6 +916,9 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         }
         if (olapScan.getScoreLimit().isPresent()) {
             olapScanNode.setScoreSortLimit(olapScan.getScoreLimit().get());
+        }
+        if (olapScan.getScoreRangeInfo().isPresent()) {
+            olapScanNode.setScoreRangeInfo(olapScan.getScoreRangeInfo().get());
         }
 
         // translate ann topn info
@@ -2391,13 +2418,14 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             setOperationNode.setColocate(true);
         }
 
-        for (Plan child : setOperation.children()) {
-            PhysicalPlan childPhysicalPlan = (PhysicalPlan) child;
-            if (JoinUtils.isStorageBucketed(childPhysicalPlan.getPhysicalProperties())) {
-                setOperationNode.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
-                break;
-            }
-        }
+        // TODO: open comment when support `enable_local_shuffle_planner`
+        // for (Plan child : setOperation.children()) {
+        //     PhysicalPlan childPhysicalPlan = (PhysicalPlan) child;
+        //     if (JoinUtils.isStorageBucketed(childPhysicalPlan.getPhysicalProperties())) {
+        //         setOperationNode.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        //         break;
+        //     }
+        // }
 
         return setOperationFragment;
     }

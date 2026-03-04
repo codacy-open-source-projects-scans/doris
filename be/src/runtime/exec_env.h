@@ -61,6 +61,7 @@ struct RuntimeFilterTimerQueue;
 } // namespace pipeline
 class WorkloadGroupMgr;
 struct WriteCooldownMetaExecutors;
+class S3RateLimiterHolder;
 namespace io {
 class FileCacheFactory;
 class HdfsMgr;
@@ -309,6 +310,7 @@ public:
     io::HdfsMgr* hdfs_mgr() { return _hdfs_mgr; }
     io::PackedFileManager* packed_file_manager() { return _packed_file_manager; }
     IndexPolicyMgr* index_policy_mgr() { return _index_policy_mgr; }
+    S3RateLimiterHolder* warmup_download_rate_limiter() { return _warmup_download_rate_limiter; }
 
 #ifdef BE_TEST
     void set_tmp_file_dir(std::unique_ptr<segment_v2::TmpFileDirs> tmp_file_dirs) {
@@ -328,6 +330,10 @@ public:
     void set_storage_engine(std::unique_ptr<BaseStorageEngine>&& engine);
     void set_inverted_index_searcher_cache(
             segment_v2::InvertedIndexSearcherCache* inverted_index_searcher_cache);
+    void set_inverted_index_query_cache(
+            segment_v2::InvertedIndexQueryCache* inverted_index_query_cache) {
+        _inverted_index_query_cache = inverted_index_query_cache;
+    }
     void set_cache_manager(CacheManager* cm) { this->_cache_manager = cm; }
     void set_process_profile(ProcessProfile* pp) { this->_process_profile = pp; }
     void set_tablet_schema_cache(TabletSchemaCache* c) { this->_tablet_schema_cache = c; }
@@ -569,6 +575,7 @@ private:
     kerberos::KerberosTicketMgr* _kerberos_ticket_mgr = nullptr;
     io::HdfsMgr* _hdfs_mgr = nullptr;
     io::PackedFileManager* _packed_file_manager = nullptr;
+    S3RateLimiterHolder* _warmup_download_rate_limiter = nullptr;
 };
 
 template <>

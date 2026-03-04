@@ -28,6 +28,7 @@
 #include "gen_cpp/Exprs_types.h"
 #include "olap/rowset/segment_v2/index_query_context.h"
 #include "olap/rowset/segment_v2/inverted_index/query_v2/boolean_query/operator_boolean_query.h"
+#include "olap/rowset/segment_v2/inverted_index_cache.h"
 #include "vec/core/block.h"
 #include "vec/core/types.h"
 #include "vec/data_types/data_type.h"
@@ -38,6 +39,8 @@ CL_NS_USE(index)
 namespace doris::vectorized {
 
 using namespace doris::segment_v2;
+
+class IndexExecContext;
 
 struct FieldReaderBinding {
     std::string logical_field_name;
@@ -121,6 +124,9 @@ private:
     std::vector<std::shared_ptr<lucene::index::IndexReader>> _readers;
     std::unordered_map<std::string, std::shared_ptr<lucene::index::IndexReader>> _binding_readers;
     std::unordered_map<std::wstring, std::shared_ptr<lucene::index::IndexReader>> _field_readers;
+    // Keep searcher cache handles alive for the resolver's lifetime.
+    // This pins cached IndexSearcher entries so extracted IndexReaders remain valid.
+    std::vector<segment_v2::InvertedIndexCacheHandle> _searcher_cache_handles;
 };
 
 class FunctionSearch : public IFunction {
@@ -163,7 +169,23 @@ public:
             const std::unordered_map<std::string, vectorized::IndexFieldNameAndTypePair>&
                     data_type_with_names,
             std::unordered_map<std::string, IndexIterator*> iterators, uint32_t num_rows,
-            InvertedIndexResultBitmap& bitmap_result) const;
+            InvertedIndexResultBitmap& bitmap_result, bool enable_cache = true) const;
+
+    Status evaluate_inverted_index_with_search_param(
+            const TSearchParam& search_param,
+            const std::unordered_map<std::string, vectorized::IndexFieldNameAndTypePair>&
+                    data_type_with_names,
+            std::unordered_map<std::string, IndexIterator*> iterators, uint32_t num_rows,
+            InvertedIndexResultBitmap& bitmap_result, bool enable_cache,
+            const IndexExecContext* index_exec_ctx,
+            const std::unordered_map<std::string, int>& field_name_to_column_id) const;
+
+    Status evaluate_nested_query(
+            const TSearchParam& search_param, const TSearchClause& nested_clause,
+            const std::shared_ptr<IndexQueryContext>& context, FieldReaderResolver& resolver,
+            uint32_t num_rows, const IndexExecContext* index_exec_ctx,
+            const std::unordered_map<std::string, int>& field_name_to_column_id,
+            std::shared_ptr<roaring::Roaring>& result_bitmap) const;
 
     // Public methods for testing
     enum class ClauseTypeCategory {
@@ -193,10 +215,6 @@ public:
                             FieldReaderResolver& resolver, inverted_index::query_v2::QueryPtr* out,
                             std::string* binding_key, const std::string& default_operator,
                             int32_t minimum_should_match) const;
-
-    Status collect_all_field_nulls(const TSearchClause& clause,
-                                   const std::unordered_map<std::string, IndexIterator*>& iterators,
-                                   std::shared_ptr<roaring::Roaring>& null_bitmap) const;
 };
 
 } // namespace doris::vectorized

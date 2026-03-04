@@ -6245,6 +6245,8 @@ public class Env {
                 }
 
                 defaultDistributionInfo.setBucketNum(bucketNum);
+                defaultDistributionInfo.setAutoBucket(distributionInfo.getAutoBucket());
+                olapTable.setIsAutoBucket(distributionInfo.getAutoBucket());
 
                 ModifyTableDefaultDistributionBucketNumOperationLog info
                         = new ModifyTableDefaultDistributionBucketNumOperationLog(db.getId(), olapTable.getId(),
@@ -6270,6 +6272,8 @@ public class Env {
         try {
             DistributionInfo defaultDistributionInfo = olapTable.getDefaultDistributionInfo();
             defaultDistributionInfo.setBucketNum(bucketNum);
+            defaultDistributionInfo.setAutoBucket(info.getAutoBucket());
+            olapTable.setIsAutoBucket(info.getAutoBucket());
         } finally {
             olapTable.writeUnlock();
         }
@@ -7083,6 +7087,22 @@ public class Env {
 
     public static boolean isTableNamesCaseSensitive() {
         return GlobalVariable.lowerCaseTableNames == 0;
+    }
+
+    public static int getLowerCaseTableNames(String catalogName) {
+        if (catalogName == null) {
+            return GlobalVariable.lowerCaseTableNames;
+        }
+        CatalogIf<?> catalog = getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
+        return catalog != null ? catalog.getLowerCaseTableNames() : GlobalVariable.lowerCaseTableNames;
+    }
+
+    public static int getLowerCaseDatabaseNames(String catalogName) {
+        if (catalogName == null) {
+            return 0;  // InternalCatalog default: case-sensitive
+        }
+        CatalogIf<?> catalog = getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
+        return catalog != null ? catalog.getLowerCaseDatabaseNames() : 0;
     }
 
     private static void getTableMeta(OlapTable olapTable, TGetMetaDBMeta dbMeta) {

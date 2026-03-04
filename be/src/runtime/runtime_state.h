@@ -47,6 +47,7 @@
 #include "runtime/workload_group/workload_group.h"
 #include "util/debug_util.h"
 #include "util/runtime_profile.h"
+#include "util/timezone_utils.h"
 #include "vec/runtime/vector_search_user_params.h"
 
 namespace doris {
@@ -181,6 +182,10 @@ public:
     // if possible, use timezone_obj() rather than timezone()
     const std::string& timezone() const { return _timezone; }
     const cctz::time_zone& timezone_obj() const { return _timezone_obj; }
+    void set_timezone(const std::string& timezone) {
+        _timezone = timezone;
+        TimezoneUtils::find_cctz_time_zone(_timezone, _timezone_obj);
+    }
     const std::string& lc_time_names() const { return _lc_time_names; }
     const std::string& user() const { return _user; }
     const TUniqueId& query_id() const { return _query_id; }
@@ -504,6 +509,16 @@ public:
     void add_iceberg_commit_datas(const TIcebergCommitData& iceberg_commit_data) {
         std::lock_guard<std::mutex> lock(_iceberg_commit_datas_mutex);
         _iceberg_commit_datas.emplace_back(iceberg_commit_data);
+    }
+
+    std::vector<TMCCommitData> mc_commit_datas() const {
+        std::lock_guard<std::mutex> lock(_mc_commit_datas_mutex);
+        return _mc_commit_datas;
+    }
+
+    void add_mc_commit_datas(const TMCCommitData& mc_commit_data) {
+        std::lock_guard<std::mutex> lock(_mc_commit_datas_mutex);
+        _mc_commit_datas.emplace_back(mc_commit_data);
     }
 
     // local runtime filter mgr, the runtime filter do not have remote target or
@@ -862,6 +877,9 @@ private:
 
     mutable std::mutex _iceberg_commit_datas_mutex;
     std::vector<TIcebergCommitData> _iceberg_commit_datas;
+
+    mutable std::mutex _mc_commit_datas_mutex;
+    std::vector<TMCCommitData> _mc_commit_datas;
 
     std::vector<std::unique_ptr<doris::pipeline::PipelineXLocalStateBase>> _op_id_to_local_state;
 

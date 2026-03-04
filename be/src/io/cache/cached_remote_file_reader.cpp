@@ -35,8 +35,10 @@
 #include <vector>
 
 #include "cloud/cloud_warm_up_manager.h"
+#include "cloud/config.h"
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/config.h"
+#include "cpp/s3_rate_limiter.h"
 #include "cpp/sync_point.h"
 #include "io/cache/block_file_cache.h"
 #include "io/cache/block_file_cache_factory.h"
@@ -435,6 +437,15 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
         size_t size = empty_end - empty_start + 1;
         std::unique_ptr<char[]> buffer(new char[size]);
 
+        // Apply rate limiting for warmup download tasks (node level)
+        // Rate limiting is applied before remote read to limit both S3 read and local cache write
+        if (io_ctx->is_warmup) {
+            auto* rate_limiter = ExecEnv::GetInstance()->warmup_download_rate_limiter();
+            if (rate_limiter != nullptr) {
+                rate_limiter->add(size);
+            }
+        }
+
         // Determine read type and execute remote read
         RETURN_IF_ERROR(
                 _execute_remote_read(empty_blocks, empty_start, size, buffer, stats, io_ctx));
@@ -535,18 +546,23 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
                 }
             }
             if (!st || block_state != FileBlock::State::DOWNLOADED) {
-                LOG(WARNING) << "Read data failed from file cache downloaded by others. err="
-                             << st.msg() << ", block state=" << block_state;
-                size_t nest_bytes_read {0};
-                stats.hit_cache = false;
-                stats.from_peer_cache = false;
-                s3_read_counter << 1;
-                SCOPED_RAW_TIMER(&stats.remote_read_timer);
-                RETURN_IF_ERROR(_remote_file_reader->read_at(
-                        current_offset, Slice(result.data + (current_offset - offset), read_size),
-                        &nest_bytes_read));
-                indirect_read_bytes += read_size;
-                DCHECK(nest_bytes_read == read_size);
+                if (is_dryrun) [[unlikely]] {
+                    // dryrun mode uses a null buffer, skip actual remote IO
+                } else {
+                    LOG(WARNING) << "Read data failed from file cache downloaded by others. err="
+                                 << st.msg() << ", block state=" << block_state;
+                    size_t nest_bytes_read {0};
+                    stats.hit_cache = false;
+                    stats.from_peer_cache = false;
+                    s3_read_counter << 1;
+                    SCOPED_RAW_TIMER(&stats.remote_read_timer);
+                    RETURN_IF_ERROR(_remote_file_reader->read_at(
+                            current_offset,
+                            Slice(result.data + (current_offset - offset), read_size),
+                            &nest_bytes_read));
+                    indirect_read_bytes += read_size;
+                    DCHECK(nest_bytes_read == read_size);
+                }
             }
         }
         *bytes_read += read_size;
