@@ -40,6 +40,7 @@ import org.apache.doris.catalog.MetaIdGenerator.IdGeneratorBuffer;
 import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Replica.ReplicaStatus;
 import org.apache.doris.catalog.TableIf.TableType;
+import org.apache.doris.catalog.info.PartitionNamesInfo;
 import org.apache.doris.clone.ColocateTableCheckerAndBalancer;
 import org.apache.doris.clone.DynamicPartitionScheduler;
 import org.apache.doris.clone.TabletChecker;
@@ -113,7 +114,6 @@ import org.apache.doris.httpv2.entity.ResponseBody;
 import org.apache.doris.httpv2.meta.MetaBaseAction;
 import org.apache.doris.httpv2.rest.RestApiStatusCode;
 import org.apache.doris.indexpolicy.IndexPolicyMgr;
-import org.apache.doris.info.PartitionNamesInfo;
 import org.apache.doris.info.TableNameInfo;
 import org.apache.doris.insertoverwrite.InsertOverwriteManager;
 import org.apache.doris.job.base.AbstractJob;
@@ -6799,6 +6799,13 @@ public class Env {
         if (Config.isNotCloudMode()) {
             version = olapTable.getNextVersion();
             olapTable.updateVisibleVersionAndTime(version, versionTime);
+        } else {
+            // Invalidate sorted partition cache for this table to avoid stale cache after partition replacement.
+            // In non-cloud mode, the version update above would also trigger cache invalidation on next query,
+            // but in cloud mode, getVisibleVersion() fetches version from meta service via RPC,
+            // so the local version update may not be reflected. Explicit invalidation is needed.
+            Env.getCurrentEnv().getSortedPartitionsCacheManager()
+                    .invalidateTable(db.getCatalog().getName(), db.getFullName(), olapTable.getName());
         }
         // Here, we only wait for the EventProcessor to finish processing the event,
         // but regardless of the success or failure of the result,
@@ -6841,6 +6848,13 @@ public class Env {
             if (Config.isNotCloudMode()) {
                 olapTable.updateVisibleVersionAndTime(replaceTempPartitionLog.getVersion(),
                         replaceTempPartitionLog.getVersionTime());
+            } else {
+                // Invalidate sorted partition cache for this table to avoid stale cache after partition replacement.
+                // In non-cloud mode, the version update above would also trigger cache invalidation on next query,
+                // but in cloud mode, getVisibleVersion() fetches version from meta service via RPC,
+                // so the local version update may not be reflected. Explicit invalidation is needed.
+                Env.getCurrentEnv().getSortedPartitionsCacheManager()
+                        .invalidateTable(db.getCatalog().getName(), db.getFullName(), olapTable.getName());
             }
         } catch (DdlException e) {
             throw new MetaNotFoundException(e);
