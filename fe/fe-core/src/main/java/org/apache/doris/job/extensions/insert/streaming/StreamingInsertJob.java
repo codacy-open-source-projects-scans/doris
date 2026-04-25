@@ -109,6 +109,7 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
     private long dbId;
     // Streaming job statistics, all persisted in txn attachment
     // when checkpoint image replay need Serialized
+    @Getter
     @SerializedName("jstc")
     private StreamingJobStatistic jobStatistic = new StreamingJobStatistic();
     // Non-txn persisted statistics, used for streaming multi task
@@ -173,6 +174,10 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
     private long sampleWindowScannedRows;
     private long sampleWindowFilteredRows;
 
+    protected StreamingInsertJob() {
+        // for testing and gson deserialization
+    }
+
     public StreamingInsertJob(String jobName,
             JobStatus jobStatus,
             String dbName,
@@ -230,6 +235,8 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
                 String includeTables = String.join(",", createTbls);
                 sourceProperties.put(DataSourceConfigKeys.INCLUDE_TABLES, includeTables);
             }
+            StreamingJobUtils.resolveAndValidateSource(
+                    dataSourceType, sourceProperties, String.valueOf(getJobId()), createTbls);
             this.offsetProvider = new JdbcSourceOffsetProvider(getJobId(), dataSourceType,
                     StreamingJobUtils.convertCertFile(getDbId(), sourceProperties));
             JdbcSourceOffsetProvider rdsOffsetProvider = (JdbcSourceOffsetProvider) this.offsetProvider;
@@ -305,6 +312,9 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
             this.originTvfProps = currentTvf.getProperties().getMap();
             this.offsetProvider = SourceOffsetProviderFactory.createSourceOffsetProvider(currentTvf.getFunctionName());
             this.offsetProvider.ensureInitialized(getJobId(), originTvfProps);
+            // Validate source-side resources (e.g. PG slot/publication ownership) once at job
+            // creation so conflicts fail fast. No-op for standalone cdc_stream TVF (no job).
+            StreamingJobUtils.validateTvfSource(tvfType, originTvfProps, String.valueOf(getJobId()));
             this.offsetProvider.initOnCreate();
             // validate offset props, only for s3 cause s3 tvf no offset prop
             if (jobProperties.getOffsetProperty() != null
@@ -356,6 +366,17 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
             makeConnectContext();
             LogicalPlan logicalPlan = new NereidsParser().parseSingle(getExecuteSql());
             this.baseCommand = (InsertIntoTableCommand) logicalPlan;
+        }
+    }
+
+    /**
+     * Validate the offset format for ALTER JOB, delegating to the provider.
+     */
+    public void validateAlterOffset(String offset) throws AnalysisException {
+        try {
+            offsetProvider.validateAlterOffset(offset);
+        } catch (Exception ex) {
+            throw new AnalysisException(ex.getMessage());
         }
     }
 
@@ -430,6 +451,18 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
         this.setFailureReason(reason);
         // Currently, only delayMsg is present here, which needs to be cleared when the status changes.
         this.setJobRuntimeMsg("");
+        // Clearing the failure (reason == null) means either a task just succeeded
+        // or the user is RESUME-ing the job — in both cases, the retry budget should
+        // be restored so exponential backoff starts fresh, aligning with the
+        // semantics of a fresh job's first failure.
+        if (reason == null) {
+            this.setAutoResumeCount(0);
+            this.setLatestAutoResumeTimestamp(0);
+        }
+    }
+
+    public long getMaxAutoResumeCount() {
+        return Config.streaming_job_max_auto_resume_count;
     }
 
     @Override
@@ -638,6 +671,7 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
         try {
             resetFailureInfo(null);
             succeedTaskCount.incrementAndGet();
+            lastTaskSuccessTime = System.currentTimeMillis();
             //update metric
             if (MetricRepo.isInit) {
                 MetricRepo.COUNTER_STREAMING_JOB_TASK_EXECUTE_COUNT.increase(1L);
@@ -776,6 +810,7 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
         setSucceedTaskCount(replayJob.getSucceedTaskCount());
         setFailedTaskCount(replayJob.getFailedTaskCount());
         setCanceledTaskCount(replayJob.getCanceledTaskCount());
+        setLastTaskSuccessTime(replayJob.getLastTaskSuccessTime());
     }
 
     /**
@@ -783,11 +818,12 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
      */
     private void modifyPropertiesInternal(Map<String, String> inputProperties) throws AnalysisException, JobException {
         StreamingJobProperties inputStreamProps = new StreamingJobProperties(inputProperties);
-        if (StringUtils.isNotEmpty(inputStreamProps.getOffsetProperty())
-                && S3TableValuedFunction.NAME.equalsIgnoreCase(this.tvfType)) {
+        if (StringUtils.isNotEmpty(inputStreamProps.getOffsetProperty())) {
             Offset offset = validateOffset(inputStreamProps.getOffsetProperty());
             this.offsetProvider.updateOffset(offset);
             this.offsetProviderPersist = offsetProvider.getPersistInfo();
+            log.info("modifyPropertiesInternal: offset updated to {}, job {}",
+                    inputStreamProps.getOffsetProperty(), getJobId());
             if (Config.isCloudMode()) {
                 resetCloudProgress(offset);
             }
@@ -868,10 +904,19 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
             trow.addToColumnValue(new TCell().setStringVal(
                     nonTxnJobStatistic == null ? "" : nonTxnJobStatistic.toJson()));
         }
+        // ErrorMsg column returns the full FailureReason as JSON ({"code":"...","msg":"..."})
+        // for streaming insert jobs only, so the frontend can switch on the structured code
+        // instead of grepping the message. One-time insert jobs (InsertJob.getTvfInfo) keep
+        // returning the plain FailMsg.msg string — they use a different error taxonomy
+        // (FailMsg/CancelType) that is out of scope for this PR.
         trow.addToColumnValue(new TCell().setStringVal(failureReason == null
-                ? "" : failureReason.getMsg()));
+                ? "" : GsonUtils.GSON.toJson(failureReason)));
         trow.addToColumnValue(new TCell().setStringVal(jobRuntimeMsg == null
                 ? "" : jobRuntimeMsg));
+        trow.addToColumnValue(new TCell().setStringVal(
+                offsetProvider != null ? offsetProvider.getLag() : ""));
+        trow.addToColumnValue(new TCell().setStringVal(lastTaskSuccessTime > 0
+                ? TimeUtils.longToTimeString(lastTaskSuccessTime) : ""));
         return trow;
     }
 
@@ -1257,6 +1302,16 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
             return;
         }
 
+        // Roll the window before accumulating, otherwise a boundary batch is merged into the expired window.
+        long now = System.currentTimeMillis();
+        if ((now - sampleStartTime) > sampleWindowMs) {
+            this.sampleStartTime = now;
+            this.sampleWindowScannedRows = 0L;
+            this.sampleWindowFilteredRows = 0L;
+            log.info("streaming multi table job {} enter next sample window, startTime={}",
+                    getJobId(), TimeUtils.longToTimeString(sampleStartTime));
+        }
+
         this.sampleWindowScannedRows += offsetRequest.getScannedRows();
         this.sampleWindowFilteredRows += offsetRequest.getFilteredRows();
 
@@ -1278,16 +1333,6 @@ public class StreamingInsertJob extends AbstractJob<StreamingJobSchedulerTask, M
             this.setFailureReason(failureReason);
             this.updateJobStatus(JobStatus.PAUSED);
             throw new JobException(failureReason.getMsg());
-        }
-
-        long now = System.currentTimeMillis();
-
-        if ((now - sampleStartTime) > sampleWindowMs) {
-            this.sampleStartTime = now;
-            this.sampleWindowScannedRows = 0L;
-            this.sampleWindowFilteredRows = 0L;
-            log.info("streaming multi table job {} enter next sample window, startTime={}",
-                    getJobId(), TimeUtils.longToTimeString(sampleStartTime));
         }
     }
 
