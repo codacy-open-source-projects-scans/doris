@@ -18,12 +18,14 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <vector>
 
 #include "common/status.h"
 #include "storage/rowset/beta_rowset_writer.h"
-#include "storage/segment/segment_writer.h"
+#include "storage/segment/segment_index_file_cache_loader.h"
+#include "storage/segment/vertical_segment_writer.h"
 
 namespace doris {
 class Block;
@@ -31,7 +33,7 @@ class Block;
 // for vertical compaction
 template <class T>
     requires std::is_base_of_v<BaseBetaRowsetWriter, T>
-class VerticalBetaRowsetWriter final : public T {
+class VerticalBetaRowsetWriter : public T {
 public:
     template <class... Args>
     explicit VerticalBetaRowsetWriter(Args&&... args) : T(std::forward<Args>(args)...) {}
@@ -47,18 +49,24 @@ public:
     // flush when all column finished, flush column footer
     Status final_flush() override;
 
+    Status build(RowsetSharedPtr& rowset) override;
+
     int64_t num_rows() const override { return _total_key_group_rows; }
 
     Status _close_file_writers() override;
 
 private:
-    Status _flush_columns(segment_v2::SegmentWriter* segment_writer, bool is_key = false);
+    Status _flush_columns(segment_v2::VerticalSegmentWriter* segment_writer, bool is_key = false);
     Status _create_segment_writer(const std::vector<uint32_t>& column_ids, bool is_key,
-                                  std::unique_ptr<segment_v2::SegmentWriter>* writer);
+                                  std::unique_ptr<segment_v2::VerticalSegmentWriter>* writer);
+    void _record_segment_index_file_cache_preload(
+            uint32_t segment_id, const segment_v2::SegmentIndexFileCacheInfo& info);
+    Status _preload_segment_indexes_to_file_cache();
 
-    std::vector<std::unique_ptr<segment_v2::SegmentWriter>> _segment_writers;
+    std::vector<std::unique_ptr<segment_v2::VerticalSegmentWriter>> _segment_writers;
     size_t _cur_writer_idx = 0;
     size_t _total_key_group_rows = 0;
+    std::mutex _segment_index_file_cache_preloads_lock;
+    std::vector<segment_v2::SegmentIndexFileCachePreloadTask> _segment_index_file_cache_preloads;
 };
-
 } // namespace doris

@@ -32,6 +32,7 @@
 #include "core/column/column.h"
 #include "core/column/column_const.h"
 #include "core/data_type/define_primitive_type.h"
+#include "core/data_type/storage_field_type.h"
 #include "core/data_type_serde/data_type_serde.h"
 #include "core/field.h"
 
@@ -44,6 +45,10 @@ namespace doris {
 IDataType::IDataType() = default;
 
 IDataType::~IDataType() = default;
+
+doris::FieldType IDataType::get_storage_field_type() const {
+    return primitive_type_to_storage_field_type(get_primitive_type());
+}
 
 String IDataType::get_name() const {
     return do_get_name();
@@ -60,7 +65,9 @@ ColumnPtr IDataType::create_column_const(size_t size, const Field& field) const 
 }
 
 ColumnPtr IDataType::create_column_const_with_default_value(size_t size) const {
-    return create_column_const(size, get_default());
+    auto column = create_column();
+    column->insert_default();
+    return ColumnConst::create(std::move(column), size);
 }
 
 size_t IDataType::get_size_of_value_in_memory() const {
@@ -71,6 +78,14 @@ size_t IDataType::get_size_of_value_in_memory() const {
 
 void IDataType::to_pb_column_meta(PColumnMeta* col_meta) const {
     col_meta->set_type(get_pdata_type(this));
+}
+
+void IDataType::to_protobuf(PTypeDesc* ptype) const {
+    auto node = ptype->add_types();
+    node->set_type(TTypeNodeType::SCALAR);
+    auto scalar_type = node->mutable_scalar_type();
+    scalar_type->set_type(doris::to_thrift(get_primitive_type()));
+    to_protobuf(ptype, node, scalar_type);
 }
 
 PGenericType_TypeId IDataType::get_pdata_type(const IDataType* data_type) {
@@ -91,6 +106,8 @@ PGenericType_TypeId IDataType::get_pdata_type(const IDataType* data_type) {
         return PGenericType::IPV4;
     case PrimitiveType::TYPE_IPV6:
         return PGenericType::IPV6;
+    case PrimitiveType::TYPE_UUID:
+        return PGenericType::UUID;
     case PrimitiveType::TYPE_FLOAT:
         return PGenericType::FLOAT;
     case PrimitiveType::TYPE_DOUBLE:
@@ -119,6 +136,8 @@ PGenericType_TypeId IDataType::get_pdata_type(const IDataType* data_type) {
         return PGenericType::VARIANT;
     case PrimitiveType::TYPE_DATETIMEV2:
         return PGenericType::DATETIMEV2;
+    case PrimitiveType::TYPE_TIMESTAMP_NS:
+        return PGenericType::TIMESTAMP_NS;
     case PrimitiveType::TYPE_TIMESTAMPTZ:
         return PGenericType::TIMESTAMPTZ;
     case PrimitiveType::TYPE_BITMAP:

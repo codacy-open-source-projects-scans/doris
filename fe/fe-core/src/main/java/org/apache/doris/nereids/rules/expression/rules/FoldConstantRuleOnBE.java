@@ -33,6 +33,7 @@ import org.apache.doris.nereids.rules.expression.ExpressionMatchingContext;
 import org.apache.doris.nereids.rules.expression.ExpressionPatternMatcher;
 import org.apache.doris.nereids.rules.expression.ExpressionPatternRuleFactory;
 import org.apache.doris.nereids.rules.expression.ExpressionRuleType;
+import org.apache.doris.nereids.rules.expression.check.CheckCast;
 import org.apache.doris.nereids.trees.expressions.Alias;
 import org.apache.doris.nereids.trees.expressions.ArrayItemReference;
 import org.apache.doris.nereids.trees.expressions.Cast;
@@ -68,6 +69,7 @@ import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.SmallIntLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.StringLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.StructLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.TimeStampNsLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.TinyIntLiteral;
 import org.apache.doris.nereids.types.ArrayType;
 import org.apache.doris.nereids.types.DataType;
@@ -76,6 +78,7 @@ import org.apache.doris.nereids.types.DecimalV3Type;
 import org.apache.doris.nereids.types.MapType;
 import org.apache.doris.nereids.types.StructField;
 import org.apache.doris.nereids.types.StructType;
+import org.apache.doris.nereids.types.TimeStampNsType;
 import org.apache.doris.proto.InternalService;
 import org.apache.doris.proto.InternalService.PConstantExprResult;
 import org.apache.doris.proto.Types.PScalarType;
@@ -107,6 +110,7 @@ import java.net.Inet4Address;
 import java.time.DateTimeException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -125,6 +129,7 @@ public class FoldConstantRuleOnBE implements ExpressionPatternRuleFactory {
 
     public static final FoldConstantRuleOnBE INSTANCE = new FoldConstantRuleOnBE();
     private static final Logger LOG = LogManager.getLogger(FoldConstantRuleOnBE.class);
+    private static final long NANOS_PER_SECOND = 1_000_000_000L;
 
     @Override
     public List<ExpressionPatternMatcher<? extends Expression>> buildRules() {
@@ -229,6 +234,11 @@ public class FoldConstantRuleOnBE implements ExpressionPatternRuleFactory {
 
     // Some expressions should not do constant folding
     private static boolean shouldSkipFold(Expression expr) {
+        // getResultExpression cannot decode UUID PValues, including UUID inside complex types.
+        if (containsUuid(expr.getDataType())) {
+            return true;
+        }
+
         // Frontend can not represent those types
         if (expr.getDataType().isAggStateType() || expr.getDataType().isObjectType()
                 || expr.getDataType().isVariantType() || expr.getDataType().isTimeType()
@@ -279,10 +289,15 @@ public class FoldConstantRuleOnBE implements ExpressionPatternRuleFactory {
             return true;
         }
 
-        // Do not constant fold cast(null as dataType) because we cannot preserve the
-        // cast-to-types and that can lead to query failures, e.g., CTAS
-        if (expr instanceof Cast && ((Cast) expr).child().isNullLiteral()) {
-            return true;
+        if (expr instanceof Cast) {
+            Cast cast = (Cast) expr;
+            // Do not fold unsupported type pairs because CheckCast must report them after
+            // expression normalization. Folding them can turn an analysis error into NULL or a
+            // literal. Also preserve cast(null as dataType) for callers such as CTAS.
+            if (!CheckCast.check(cast.child().getDataType(), cast.getDataType(),
+                    cast.isStrict() || SessionVariable.enableStrictCast()) || cast.child().isNullLiteral()) {
+                return true;
+            }
         }
 
         // This kind of function is often used to change the attributes of columns.
@@ -292,6 +307,21 @@ public class FoldConstantRuleOnBE implements ExpressionPatternRuleFactory {
         }
 
         return false;
+    }
+
+    private static boolean containsUuid(DataType type) {
+        if (type instanceof ArrayType) {
+            return containsUuid(((ArrayType) type).getItemType());
+        }
+        if (type instanceof MapType) {
+            MapType mapType = (MapType) type;
+            return containsUuid(mapType.getKeyType()) || containsUuid(mapType.getValueType());
+        }
+        if (type instanceof StructType) {
+            return ((StructType) type).getFields().stream()
+                    .anyMatch(field -> containsUuid(field.getDataType()));
+        }
+        return type.isUuidType();
     }
 
     private static Map<String, Expression> evalOnBE(Map<String, Map<String, TExpr>> paramMap,
@@ -322,6 +352,7 @@ public class FoldConstantRuleOnBE implements ExpressionPatternRuleFactory {
             tQueryOptions.setEnableDecimal256(context.getSessionVariable().isEnableDecimal256());
             tQueryOptions.setNewVersionUnixTimestamp(true);
             tQueryOptions.setNewVersionPercentile(true);
+            tQueryOptions.setNewVersionBitmapOpCount(true);
             tQueryOptions.setEnableStrictCast(SessionVariable.enableStrictCast());
 
             TFoldConstantParams tParams = new TFoldConstantParams(paramMap, queryGlobals);
@@ -469,6 +500,15 @@ public class FoldConstantRuleOnBE implements ExpressionPatternRuleFactory {
                 BigDecimal bigDecimal = new BigDecimal(value, decimalV3Type.getScale());
                 Literal literal = new DecimalV3Literal(decimalV3Type, bigDecimal);
                 res.add(literal);
+            }
+        } else if (type instanceof TimeStampNsType) {
+            // TIMESTAMP_NS crosses the BE-folding protobuf boundary as signed epoch nanoseconds.
+            // Keep it separate from DATETIMEV2, whose uint64 payload uses packed civil fields.
+            int num = resultContent.getInt64ValueCount();
+            for (int i = 0; i < num; ++i) {
+                LocalDateTime dateTime = convertEpochNanosToJavaDateTime(
+                        resultContent.getInt64Value(i));
+                res.add(TimeStampNsLiteral.fromJavaDateType(dateTime));
             }
         } else if (type.isDateTimeV2Type()) {
             int num = resultContent.getUint64ValueCount();
@@ -630,13 +670,13 @@ public class FoldConstantRuleOnBE implements ExpressionPatternRuleFactory {
 
     private static Pair<DataType, Integer> convertToNereidsType(List<PTypeNode> typeNodes, int start) {
         PScalarType pScalarType = typeNodes.get(start).getScalarType();
-        boolean containsNull = typeNodes.get(start).getContainsNull();
         TPrimitiveType tPrimitiveType = TPrimitiveType.findByValue(pScalarType.getType());
         DataType type;
         int parsedNodes;
         if (tPrimitiveType == TPrimitiveType.ARRAY) {
             Pair<DataType, Integer> itemType = convertToNereidsType(typeNodes, start + 1);
-            type = ArrayType.of(itemType.key(), containsNull);
+            // Array elements are always nullable
+            type = ArrayType.of(itemType.key());
             parsedNodes = 1 + itemType.value();
         } else if (tPrimitiveType == TPrimitiveType.MAP) {
             Pair<DataType, Integer> keyType = convertToNereidsType(typeNodes, start + 1);
@@ -685,6 +725,12 @@ public class FoldConstantRuleOnBE implements ExpressionPatternRuleFactory {
         } catch (DateTimeException e) {
             return null;
         }
+    }
+
+    private static LocalDateTime convertEpochNanosToJavaDateTime(long epochNanos) {
+        long epochSecond = Math.floorDiv(epochNanos, NANOS_PER_SECOND);
+        int nanoOfSecond = (int) Math.floorMod(epochNanos, NANOS_PER_SECOND);
+        return LocalDateTime.ofEpochSecond(epochSecond, nanoOfSecond, ZoneOffset.UTC);
     }
 
     private static LocalDate convertToJavaDateV2(int date) {

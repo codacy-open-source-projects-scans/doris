@@ -25,7 +25,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.qe.AutoCloseConnectContext;
 import org.apache.doris.qe.StmtExecutor;
-import org.apache.doris.statistics.ResultRow;
+import org.apache.doris.statistics.repository.ResultRow;
 import org.apache.doris.statistics.util.StatisticsUtil;
 
 import com.github.benmanes.caffeine.cache.AsyncCacheLoader;
@@ -315,6 +315,18 @@ public class SimpleAggCacheMgr {
      */
     public void removeStats(ColumnMinMaxKey key) {
         cache.synchronous().invalidate(key);
+    }
+
+    /**
+     * Evict all cached simple aggregate values for a table.
+     */
+    public void invalidateTable(long tableId) {
+        if (rowCountCache != null) {
+            rowCountCache.synchronous().invalidate(tableId);
+        }
+        if (cache != null) {
+            cache.synchronous().asMap().keySet().removeIf(key -> key.getTableId() == tableId);
+        }
     }
 
     /**

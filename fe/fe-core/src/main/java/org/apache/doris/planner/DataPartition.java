@@ -26,6 +26,8 @@ import org.apache.doris.analysis.ExprToThriftVisitor;
 import org.apache.doris.analysis.ToSqlParams;
 import org.apache.doris.thrift.TDataPartition;
 import org.apache.doris.thrift.TExplainLevel;
+import org.apache.doris.thrift.TExternalTableSinkHashPartitionInfo;
+import org.apache.doris.thrift.TExternalTableSinkWriterAssignment;
 import org.apache.doris.thrift.TIcebergPartitionField;
 import org.apache.doris.thrift.TMergePartitionInfo;
 import org.apache.doris.thrift.TPartitionType;
@@ -33,9 +35,11 @@ import org.apache.doris.thrift.TPartitionType;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Specification of the partition of a single stream of data.
@@ -55,6 +59,9 @@ public class DataPartition {
     // for hash partition: exprs used to compute hash value
     private ImmutableList<Expr> partitionExprs;
     private MergePartitionInfo mergePartitionInfo;
+    private String externalPartitionFunction;
+    private ImmutableMap<String, String> externalPartitionFunctionOptions = ImmutableMap.of();
+    private TExternalTableSinkWriterAssignment externalWriterAssignment;
 
     public DataPartition(TPartitionType type, List<Expr> exprs) {
         Preconditions.checkNotNull(exprs);
@@ -62,15 +69,27 @@ public class DataPartition {
         Preconditions.checkState(type == TPartitionType.HASH_PARTITIONED
                 || type == TPartitionType.RANGE_PARTITIONED
                 || type == TPartitionType.HIVE_TABLE_SINK_HASH_PARTITIONED
+                || type == TPartitionType.EXTERNAL_TABLE_SINK_HASH_PARTITIONED
                 || type == TPartitionType.BUCKET_SHFFULE_HASH_PARTITIONED);
         this.type = type;
         this.partitionExprs = ImmutableList.copyOf(exprs);
+    }
+
+    public DataPartition(TPartitionType type, List<Expr> exprs, String partitionFunction,
+            Map<String, String> partitionFunctionOptions,
+            TExternalTableSinkWriterAssignment writerAssignment) {
+        this(type, exprs);
+        Preconditions.checkState(type == TPartitionType.EXTERNAL_TABLE_SINK_HASH_PARTITIONED);
+        this.externalPartitionFunction = Preconditions.checkNotNull(partitionFunction);
+        this.externalPartitionFunctionOptions = ImmutableMap.copyOf(partitionFunctionOptions);
+        this.externalWriterAssignment = Preconditions.checkNotNull(writerAssignment);
     }
 
     public DataPartition(TPartitionType type) {
         Preconditions.checkState(type == TPartitionType.UNPARTITIONED
                 || type == TPartitionType.RANDOM
                 || type == TPartitionType.HIVE_TABLE_SINK_UNPARTITIONED
+                || type == TPartitionType.EXTERNAL_TABLE_SINK_UNPARTITIONED
                 || type == TPartitionType.OLAP_TABLE_SINK_HASH_PARTITIONED);
         this.type = type;
         this.partitionExprs = ImmutableList.of();
@@ -78,7 +97,7 @@ public class DataPartition {
 
     public DataPartition(TPartitionType type, Expr operationExpr, List<Expr> insertPartitionExprs,
             List<Expr> deletePartitionExprs, boolean insertRandom,
-            List<IcebergPartitionField> insertPartitionFields, Integer partitionSpecId) {
+            List<MergePartitionField> insertPartitionFields, Integer partitionSpecId) {
         Preconditions.checkState(type == TPartitionType.MERGE_PARTITIONED);
         this.type = type;
         this.partitionExprs = ImmutableList.of();
@@ -110,6 +129,13 @@ public class DataPartition {
         if (mergePartitionInfo != null) {
             result.setMergePartitionInfo(mergePartitionInfo.toThrift());
         }
+        if (externalPartitionFunction != null) {
+            TExternalTableSinkHashPartitionInfo info = new TExternalTableSinkHashPartitionInfo();
+            info.setPartitionFunction(externalPartitionFunction);
+            info.setPartitionFunctionOptions(externalPartitionFunctionOptions);
+            info.setWriterAssignment(externalWriterAssignment);
+            result.setExternalTableSinkHashPartitionInfo(info);
+        }
         return result;
     }
 
@@ -132,7 +158,7 @@ public class DataPartition {
                 str.append(", insert=").append(Joiner.on(", ").join(insertExprs));
             } else if (!mergePartitionInfo.insertPartitionFields.isEmpty()) {
                 List<String> insertFields = Lists.newArrayList();
-                for (IcebergPartitionField field : mergePartitionInfo.insertPartitionFields) {
+                for (MergePartitionField field : mergePartitionInfo.insertPartitionFields) {
                     insertFields.add(field.toSql());
                 }
                 str.append(", insert=").append(Joiner.on(", ").join(insertFields));
@@ -155,20 +181,27 @@ public class DataPartition {
         return str.toString();
     }
 
-    public static class IcebergPartitionField {
+    public static class MergePartitionField {
         private final Expr sourceExpr;
         private final String transform;
         private final Integer param;
         private final String name;
         private final Integer sourceId;
+        private final ImmutableList<Integer> sourceFieldPath;
 
-        public IcebergPartitionField(Expr sourceExpr, String transform, Integer param,
+        public MergePartitionField(Expr sourceExpr, String transform, Integer param,
                 String name, Integer sourceId) {
+            this(sourceExpr, transform, param, name, sourceId, ImmutableList.of());
+        }
+
+        public MergePartitionField(Expr sourceExpr, String transform, Integer param,
+                String name, Integer sourceId, List<Integer> sourceFieldPath) {
             this.sourceExpr = Preconditions.checkNotNull(sourceExpr, "sourceExpr should not be null");
             this.transform = Preconditions.checkNotNull(transform, "transform should not be null");
             this.param = param;
             this.name = name;
             this.sourceId = sourceId;
+            this.sourceFieldPath = ImmutableList.copyOf(sourceFieldPath);
         }
 
         public TIcebergPartitionField toThrift() {
@@ -184,6 +217,9 @@ public class DataPartition {
             if (sourceId != null) {
                 field.setSourceId(sourceId);
             }
+            if (!sourceFieldPath.isEmpty()) {
+                field.setSourceFieldPath(sourceFieldPath);
+            }
             return field;
         }
 
@@ -197,12 +233,12 @@ public class DataPartition {
         private final ImmutableList<Expr> insertPartitionExprs;
         private final ImmutableList<Expr> deletePartitionExprs;
         private final boolean insertRandom;
-        private final ImmutableList<IcebergPartitionField> insertPartitionFields;
+        private final ImmutableList<MergePartitionField> insertPartitionFields;
         private final Integer partitionSpecId;
 
         private MergePartitionInfo(Expr operationExpr, List<Expr> insertPartitionExprs,
                 List<Expr> deletePartitionExprs, boolean insertRandom,
-                List<IcebergPartitionField> insertPartitionFields, Integer partitionSpecId) {
+                List<MergePartitionField> insertPartitionFields, Integer partitionSpecId) {
             this.operationExpr = Preconditions.checkNotNull(operationExpr, "operationExpr should not be null");
             this.insertPartitionExprs = ImmutableList.copyOf(
                     Preconditions.checkNotNull(insertPartitionExprs, "insertPartitionExprs should not be null"));
@@ -226,7 +262,7 @@ public class DataPartition {
             info.setInsertRandom(insertRandom);
             if (!insertPartitionFields.isEmpty()) {
                 List<TIcebergPartitionField> fields = Lists.newArrayList();
-                for (IcebergPartitionField field : insertPartitionFields) {
+                for (MergePartitionField field : insertPartitionFields) {
                     fields.add(field.toThrift());
                 }
                 info.setInsertPartitionFields(fields);

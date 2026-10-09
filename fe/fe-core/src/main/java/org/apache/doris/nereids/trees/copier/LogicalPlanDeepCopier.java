@@ -38,8 +38,6 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalCTEAnchor;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEConsumer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEProducer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCatalogRelation;
-import org.apache.doris.nereids.trees.plans.logical.LogicalDeferMaterializeOlapScan;
-import org.apache.doris.nereids.trees.plans.logical.LogicalDeferMaterializeTopN;
 import org.apache.doris.nereids.trees.plans.logical.LogicalEmptyRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalExcept;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
@@ -58,6 +56,7 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalRecursiveUnionAnchor;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRecursiveUnionProducer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRepeat;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSchemaScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSink;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSort;
 import org.apache.doris.nereids.trees.plans.logical.LogicalTopN;
@@ -110,6 +109,9 @@ public class LogicalPlanDeepCopier extends DefaultPlanRewriter<DeepCopierContext
         }
         LogicalCatalogRelation newRelation =
                 catalogRelation.withRelationId(StatementScopeIdGenerator.newRelationId());
+        if (context.shouldInvalidatePartitionPruning() && newRelation instanceof LogicalOlapScan) {
+            newRelation = ((LogicalOlapScan) newRelation).withPartitionPruned(false);
+        }
         updateReplaceMapWithOutput(catalogRelation, newRelation, context.exprIdReplaceMap);
         List<NamedExpression> virtualColumns = catalogRelation.getVirtualColumns().stream()
                 .map(e -> {
@@ -127,6 +129,16 @@ public class LogicalPlanDeepCopier extends DefaultPlanRewriter<DeepCopierContext
                 .map(o -> (NamedExpression) ExpressionDeepCopier.INSTANCE.deepCopy(o, context))
                 .collect(ImmutableList.toImmutableList());
         newRelation = newRelation.withVirtualColumns(virtualColumns);
+        if (catalogRelation instanceof LogicalSchemaScan
+                && ((LogicalSchemaScan) catalogRelation).isFilterPushed()) {
+            LogicalSchemaScan oldSchemaScan = (LogicalSchemaScan) catalogRelation;
+            List<Expression> frontendConjuncts = oldSchemaScan.getFrontendConjuncts().stream()
+                    .map(expression -> ExpressionDeepCopier.INSTANCE.deepCopy(expression, context))
+                    .collect(ImmutableList.toImmutableList());
+            newRelation = ((LogicalSchemaScan) newRelation).withFrontendConjuncts(
+                    oldSchemaScan.getSchemaCatalog(), oldSchemaScan.getSchemaDatabase(), oldSchemaScan.getSchemaTable(),
+                    frontendConjuncts);
+        }
         context.putRelation(catalogRelation.getRelationId(), newRelation);
         return updateOperativeSlots(catalogRelation, newRelation);
     }
@@ -220,6 +232,10 @@ public class LogicalPlanDeepCopier extends DefaultPlanRewriter<DeepCopierContext
                 .collect(ImmutableList.toImmutableList());
         SlotReference groupingId = (SlotReference) ExpressionDeepCopier.INSTANCE
                 .deepCopy(repeat.getGroupingId().get(), context);
+        if (repeat.getGroupingIdValues().isPresent()) {
+            return new LogicalRepeat<>(groupingSets, outputExpressions, groupingId,
+                    repeat.getGroupingIdValues().get(), repeat.getRepeatType(), child);
+        }
         return new LogicalRepeat<>(groupingSets, outputExpressions, groupingId, repeat.getRepeatType(), child);
     }
 
@@ -233,25 +249,15 @@ public class LogicalPlanDeepCopier extends DefaultPlanRewriter<DeepCopierContext
     }
 
     @Override
-    public Plan visitLogicalDeferMaterializeOlapScan(LogicalDeferMaterializeOlapScan deferMaterializeOlapScan,
-            DeepCopierContext context) {
-        LogicalOlapScan newScan = (LogicalOlapScan) visitLogicalOlapScan(
-                deferMaterializeOlapScan.getLogicalOlapScan(), context);
-        Set<ExprId> newSlotIds = deferMaterializeOlapScan.getDeferMaterializeSlotIds().stream()
-                .map(context.exprIdReplaceMap::get)
-                .collect(ImmutableSet.toImmutableSet());
-        SlotReference newRowId = (SlotReference) ExpressionDeepCopier.INSTANCE
-                .deepCopy(deferMaterializeOlapScan.getColumnIdSlot(), context);
-        return new LogicalDeferMaterializeOlapScan(newScan, newSlotIds, newRowId);
-    }
-
-    @Override
     public Plan visitLogicalProject(LogicalProject<? extends Plan> project, DeepCopierContext context) {
         Plan child = project.child().accept(this, context);
         List<NamedExpression> newProjects = project.getProjects().stream()
                 .map(p -> (NamedExpression) ExpressionDeepCopier.INSTANCE.deepCopy(p, context))
                 .collect(ImmutableList.toImmutableList());
-        return new LogicalProject<>(newProjects, project.isDistinct(), child);
+        List<NamedExpression> newAsteriskOutputs = project.getAsteriskOutputs().stream()
+                .map(p -> (NamedExpression) ExpressionDeepCopier.INSTANCE.deepCopy(p, context))
+                .collect(ImmutableList.toImmutableList());
+        return new LogicalProject<>(newProjects, project.isDistinct(), newAsteriskOutputs, child);
     }
 
     @Override
@@ -272,19 +278,6 @@ public class LogicalPlanDeepCopier extends DefaultPlanRewriter<DeepCopierContext
                         o.isAsc(), o.isNullFirst()))
                 .collect(ImmutableList.toImmutableList());
         return new LogicalTopN<>(orderKeys, topN.getLimit(), topN.getOffset(), child);
-    }
-
-    @Override
-    public Plan visitLogicalDeferMaterializeTopN(LogicalDeferMaterializeTopN<? extends Plan> topN,
-            DeepCopierContext context) {
-        LogicalTopN<? extends Plan> newTopN
-                = (LogicalTopN<? extends Plan>) visitLogicalTopN(topN.getLogicalTopN(), context);
-        Set<ExprId> newSlotIds = topN.getDeferMaterializeSlotIds().stream()
-                .map(context.exprIdReplaceMap::get)
-                .collect(ImmutableSet.toImmutableSet());
-        SlotReference newRowId = (SlotReference) ExpressionDeepCopier.INSTANCE
-                .deepCopy(topN.getColumnIdSlot(), context);
-        return new LogicalDeferMaterializeTopN<>(newTopN, newSlotIds, newRowId);
     }
 
     @Override
@@ -511,7 +504,7 @@ public class LogicalPlanDeepCopier extends DefaultPlanRewriter<DeepCopierContext
     private Plan updateOperativeSlots(LogicalCatalogRelation oldRelation, LogicalCatalogRelation newRelation) {
         List<Slot> oldOperativeSlots = oldRelation.getOperativeSlots();
         List<Slot> newOperativeSlots = new ArrayList<>(oldOperativeSlots.size());
-        int outputSize = oldOperativeSlots.size();
+        int outputSize = oldRelation.getOutput().size();
         for (Slot opSlot : oldOperativeSlots) {
             int idx;
             for (idx = 0; idx < outputSize; idx++) {

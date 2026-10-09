@@ -489,11 +489,11 @@ TEST(TEST_VEXPR, LITERALTEST) {
     }
     // float
     {
-        VLiteral literal(create_literal<TYPE_FLOAT, float>(1024.0f));
+        VLiteral literal(create_literal<TYPE_FLOAT, float>(1024.0F));
         ColumnPtr result_column;
         static_cast<void>(literal.execute_column(nullptr, nullptr, nullptr, 1, result_column));
         auto v = (*result_column)[0].get<TYPE_FLOAT>();
-        EXPECT_FLOAT_EQ(v, 1024.0f);
+        EXPECT_FLOAT_EQ(v, 1024.0F);
         EXPECT_EQ("1024", literal.value());
 
         auto node = std::make_shared<VLiteral>(
@@ -709,6 +709,28 @@ TEST(TEST_VEXPR, LITERALTEST) {
                 create_texpr_node_from((*result_column)[0], TYPE_STRING, 0, 0), true);
         EXPECT_EQ(s, node->value());
     }
+    // varbinary
+    {
+        const std::vector<std::string> values = {std::string("bin\0ary", 7),
+                                                 std::string("0123456789abc\0xyz", 17)};
+        for (const auto& value : values) {
+            auto field = Field::create_field<TYPE_VARBINARY>(
+                    StringView(value.data(), cast_set<uint32_t>(value.size())));
+            auto texpr_node = create_texpr_node_from(field, TYPE_VARBINARY, 0, 0);
+            EXPECT_EQ(TExprNodeType::VARBINARY_LITERAL, texpr_node.node_type);
+            EXPECT_EQ(value, texpr_node.varbinary_literal.value);
+
+            VLiteral literal(texpr_node);
+            EXPECT_EQ(value, literal.value());
+
+            ColumnPtr result_column;
+            ASSERT_TRUE(literal.execute_column(nullptr, nullptr, nullptr, 1, result_column).ok());
+            // The view borrows the Field's owned bytes, so keep the Field alive for the assertion.
+            const auto result_field = (*result_column)[0];
+            const auto& sv = result_field.get<TYPE_VARBINARY>();
+            EXPECT_EQ(value, std::string(sv.data(), sv.size()));
+        }
+    }
     // decimalv2
     {
         VLiteral literal(create_literal<TYPE_DECIMALV2, std::string>(std::string("1234.56")));
@@ -777,8 +799,8 @@ TEST(TEST_VEXPR, LITERALTEST) {
         auto src_col = ColumnDecimal128V3::create(38, 6);
         auto& src_data = src_col->get_data();
         src_data.resize(0);
-        src_data.push_back(Decimal128V3(123456789012345));
-        src_data.push_back(Decimal128V3(-123456789012345));
+        src_data.push_back(Decimal128V3(int64_t(123456789012345)));
+        src_data.push_back(Decimal128V3(int64_t(-123456789012345)));
         {
             auto node = std::make_shared<VLiteral>(
                     create_texpr_node_from(src_col->operator[](0), TYPE_DECIMAL128I, 38, 6), true);
@@ -871,11 +893,10 @@ TEST(VExprExecuteColumnTest, TypeMismatchFails) {
     EXPECT_FALSE(st.ok());
 }
 
-TEST(VExprExecuteColumnTest, NullableTypeWithNonNullableColumnPasses) {
+TEST(VExprExecuteColumnTest, NullableTypeWithNonNullableColumnIsWrapped) {
     using namespace doris;
     FakeVExpr expr;
-    // Declared type is Nullable(Int32) but result is Int32 (non-nullable).
-    // This mirrors the use_default_implementation_for_nulls optimization and must pass.
+    // Declared type is Nullable(Int32), so the result must carry a nullable column wrapper.
     expr.set_data_type(std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt32>()));
 
     auto col = ColumnInt32::create();
@@ -885,6 +906,7 @@ TEST(VExprExecuteColumnTest, NullableTypeWithNonNullableColumnPasses) {
     ColumnPtr result;
     auto st = expr.execute_column(nullptr, nullptr, nullptr, 1, result);
     EXPECT_TRUE(st.ok());
+    EXPECT_TRUE(result->is_nullable());
 }
 
 TEST(VExprExecuteColumnTest, ColumnNothingPassesTypeCheck) {
@@ -912,5 +934,5 @@ TEST(VExprExecuteColumnTest, CorrectColumnPasses) {
     ColumnPtr result;
     auto st = expr.execute_column(nullptr, nullptr, nullptr, 1, result);
     EXPECT_TRUE(st.ok());
-    EXPECT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->size(), 1U);
 }

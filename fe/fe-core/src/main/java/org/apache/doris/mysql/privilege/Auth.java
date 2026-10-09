@@ -44,6 +44,7 @@ import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.mysql.MysqlPassword;
 import org.apache.doris.mysql.authenticate.AuthenticateType;
 import org.apache.doris.mysql.authenticate.ldap.LdapManager;
@@ -100,6 +101,8 @@ public class Auth implements Writable {
     // unknown user does not have any privilege, this is just to be compatible with old version.
     public static final String UNKNOWN_USER = "unknown";
     public static final String DEFAULT_CATALOG = InternalCatalog.INTERNAL_CATALOG_NAME;
+    // Placeholder shown in mysql.user for password-derived columns, so no secret material leaks.
+    private static final String PASSWORD_MASK = "***";
 
     // There is no concurrency control logic inside roleManager,userManager,userRoleManage and rpropertyMgr,
     // and it is completely managed by Auth.
@@ -223,6 +226,14 @@ public class Auth implements Writable {
         }
     }
 
+    public boolean requiresCertificateAuth(UserIdentity userIdentity) {
+        return userIdentity != null && userIdentity.hasSanRequirement();
+    }
+
+    public boolean shouldSkipPasswordVerificationAfterCertAuth(UserIdentity userIdentity) {
+        return requiresCertificateAuth(userIdentity) && Config.tls_cert_based_auth_ignore_password;
+    }
+
     public void checkPlainPassword(String remoteUser, String remoteHost, String remotePasswd,
             List<UserIdentity> currentUser) throws AuthenticationException {
         // Check the LDAP password when the user exists in the LDAP service.
@@ -231,6 +242,10 @@ public class Auth implements Writable {
                 throw new AuthenticationException(ErrorCode.ERR_ACCESS_DENIED_ERROR, remoteUser + "@" + remoteHost,
                         Strings.isNullOrEmpty(remotePasswd) ? "NO" : "YES");
             }
+            // an LDAP-accepted credential still does not open a Doris account under ACCOUNT_LOCK
+            if (currentUser != null && !currentUser.isEmpty()) {
+                checkAccountLocked(currentUser.get(0));
+            }
         } else {
             readLock();
             try {
@@ -238,6 +253,35 @@ public class Auth implements Writable {
             } finally {
                 readUnlock();
             }
+        }
+    }
+
+    /**
+     * MySQL-compatible ACCOUNT_LOCK, enforced at authentication for every authenticator: a locked
+     * Doris account is refused whichever path (local password, LDAP, integration, plugin) accepted the
+     * credential. Not a session check -- sessions already authenticated are untouched.
+     */
+    public void checkAccountLocked(UserIdentity userIdentity) throws AuthenticationException {
+        passwdPolicyManager.checkAccountLocked(userIdentity);
+    }
+
+    public void checkPlainPasswordForUserIdentity(UserIdentity userIdentity, String remotePasswd,
+            List<UserIdentity> currentUser) throws AuthenticationException {
+        readLock();
+        try {
+            userManager.checkPlainPasswordForUserIdentity(userIdentity, remotePasswd, currentUser);
+        } finally {
+            readUnlock();
+        }
+    }
+
+    public void checkPasswordForUserIdentity(UserIdentity userIdentity, byte[] remotePasswd, byte[] randomString,
+            List<UserIdentity> currentUser) throws AuthenticationException {
+        readLock();
+        try {
+            userManager.checkPasswordForUserIdentity(userIdentity, remotePasswd, randomString, currentUser);
+        } finally {
+            readUnlock();
         }
     }
 
@@ -290,6 +334,10 @@ public class Auth implements Writable {
 
     public boolean doesUserExist(String remoteUser, String remoteHost) {
         return !userManager.getUserIdentityUncheckPasswd(remoteUser, remoteHost).isEmpty();
+    }
+
+    public List<UserIdentity> getCandidateUserIdentities(String remoteUser, String remoteHost) {
+        return userManager.getUserIdentityUncheckPasswd(remoteUser, remoteHost);
     }
 
     // ==== Global ====
@@ -554,6 +602,8 @@ public class Auth implements Writable {
             }
             // other user properties
             propertyMgr.addUserResource(userIdent.getQualifiedUser());
+            MetricRepo.updateUserConnectionMaxMetric(this, userIdent.getQualifiedUser(),
+                    propertyMgr.getMaxConn(userIdent.getQualifiedUser()));
 
             // 5. update password policy
             passwdPolicyManager.updatePolicy(userIdent, password, passwordOptions);
@@ -608,6 +658,7 @@ public class Auth implements Writable {
             userManager.removeUser(userIdent);
             if (CollectionUtils.isEmpty(userManager.getUserByName(userIdent.getQualifiedUser()))) {
                 propertyMgr.dropUser(userIdent);
+                MetricRepo.removeUserConnectionMaxMetric(this, userIdent.getQualifiedUser());
             }
 
             if (!isReplay) {
@@ -875,12 +926,10 @@ public class Auth implements Writable {
 
     // revoke table
     public void revokeTablePrivilegeCommand(RevokeTablePrivilegeCommand command) throws DdlException {
-        if (command.getTablePattern() != null) {
-            PrivBitSet privs = PrivBitSet.of(command.getPrivileges());
-            revokeInternal(command.getUserIdentity().orElse(null), command.getRole().orElse(null),
-                    command.getTablePattern(), privs, command.getColPrivileges(),
-                    true /* err on non exist */, false /* is replay */);
-        }
+        PrivBitSet privs = PrivBitSet.of(command.getPrivileges());
+        revokeInternal(command.getUserIdentity().orElse(null), command.getRole().orElse(null),
+                command.getTablePattern(), privs, command.getColPrivileges(),
+                true /* err on non exist */, false /* is replay */);
     }
 
     public void replayRevoke(PrivInfo info) {
@@ -1161,6 +1210,7 @@ public class Auth implements Writable {
         writeLock();
         try {
             propertyMgr.updateUserProperty(user, properties, isReplay);
+            MetricRepo.updateUserConnectionMaxMetric(this, user, propertyMgr.getMaxConn(user));
             if (!isReplay) {
                 UserPropertyInfo propertyInfo = new UserPropertyInfo(user, properties);
                 Env.getCurrentEnv().getEditLog().logUpdateUserProperty(propertyInfo);
@@ -1181,6 +1231,15 @@ public class Auth implements Writable {
         readLock();
         try {
             return propertyMgr.getMaxConn(qualifiedUser);
+        } finally {
+            readUnlock();
+        }
+    }
+
+    public Map<String, Long> getMaxConnForAllUsers() {
+        readLock();
+        try {
+            return propertyMgr.getMaxConnForAllUsers();
         } finally {
             readUnlock();
         }
@@ -1357,9 +1416,9 @@ public class Auth implements Writable {
         List<String> userAuthInfo = Lists.newArrayList();
         // ================= UserIdentity =======================
         userAuthInfo.add(userIdent.toString());
-        String requireSan = Strings.isNullOrEmpty(userIdent.getSan())
+        String requireSan = Strings.isNullOrEmpty(userIdent.getSanRequirementSql())
                 ? FeConstants.null_string
-                : userIdent.getSan();
+                : userIdent.getSanRequirementSql();
         if (isLdapAuthEnabled() && ldapManager.doesUserExist(userIdent.getQualifiedUser())) {
             // ============== Comment ==============
             userAuthInfo.add(FeConstants.null_string);
@@ -1699,8 +1758,9 @@ public class Auth implements Writable {
             scramble = MysqlPassword.checkPassword(initialRootPassword);
         } catch (AnalysisException e) {
             // Skip set root password if `initial_root_password` is not valid 2-staged SHA-1 encrypted
-            LOG.warn("initial_root_password [{}] is not valid 2-staged SHA-1 encrypted, ignore it",
-                    initialRootPassword);
+            // Do not echo the configured value: this branch is reached precisely when it is not a
+            // 2-staged SHA-1 hash, which usually means a plaintext password was configured.
+            LOG.warn("initial_root_password is not valid 2-staged SHA-1 encrypted, ignore it");
             return;
         }
         UserIdentity rootUser = new UserIdentity(ROOT_USER, "%");
@@ -1913,6 +1973,12 @@ public class Auth implements Writable {
                 case SET_PASSWORD_POLICY:
                     passwdPolicyManager.updatePolicy(userIdent, null, passwordOptions);
                     break;
+                case LOCK_ACCOUNT:
+                    // MySQL-compatible ALTER USER ... ACCOUNT_LOCK: refuses the account's own logins
+                    // from now on (persisted + journaled). Not a session check: existing sessions are
+                    // unaffected, as in MySQL.
+                    passwdPolicyManager.lockUser(userIdent);
+                    break;
                 case UNLOCK_ACCOUNT:
                     passwdPolicyManager.unlockUser(userIdent);
                     break;
@@ -2051,7 +2117,12 @@ public class Auth implements Writable {
     // ====== END CLOUD ======
 
     // for mysql.user table
-    public List<List<String>> getAllUserInfo() {
+    public List<List<String>> getAllUserInfo(UserIdentity currentUser) {
+        // Only role administrators (ADMIN_PRIV or GRANT_PRIV) may see every account. A
+        // non-privileged user may only see their own account, so that mysql.user does not
+        // leak the cluster's account list and privilege topology to arbitrary users.
+        boolean canSeeAll = currentUser != null
+                && Env.getCurrentEnv().getAccessManager().checkGlobalPriv(currentUser, PrivPredicate.GRANT);
         List<List<String>> userInfos = Lists.newArrayList();
         readLock();
         try {
@@ -2059,8 +2130,18 @@ public class Auth implements Writable {
             for (List<User> users : nameToUsers.values()) {
                 for (User user : users) {
                     if (!user.isSetByDomainResolver()) {
-                        List<String> userInfo = Lists.newArrayList(Collections.nCopies(32, ""));
                         UserIdentity userIdent = user.getUserIdentity();
+                        // A non-privileged caller may only see its own account. user@hostA and
+                        // user@hostB are distinct accounts with independent privileges, so match the
+                        // exact identity (name and host) rather than the name alone; otherwise another
+                        // same-named account's host and privilege state would leak. The caller identity
+                        // carried here is ConnectContext.currentUserIdentity, i.e. the account
+                        // definition that authentication resolved to (a domain account resolves back to
+                        // its user@['domain'] identity), so this still matches the caller's own row.
+                        if (!canSeeAll && (currentUser == null || !userIdent.equals(currentUser))) {
+                            continue;
+                        }
+                        List<String> userInfo = Lists.newArrayList(Collections.nCopies(32, ""));
                         userInfo.set(0, userIdent.getHost());
                         userInfo.set(1, userIdent.getQualifiedUser());
                         for (int i = 2; i <= 13; i++) {
@@ -2133,6 +2214,12 @@ public class Auth implements Writable {
                                 userInfo.set(24 + i, passWordPolicyInfo.get(i).get(1));
                             }
                         }
+                        // Never expose password-derived material through mysql.user. The
+                        // authentication_string hash and the password_policy.history_passwords
+                        // digests are always masked, for every caller and even when empty, so no
+                        // secret material (or its presence/absence) leaks.
+                        userInfo.set(23, PASSWORD_MASK);
+                        userInfo.set(27, PASSWORD_MASK);
                         userInfos.add(userInfo);
                     }
                 }

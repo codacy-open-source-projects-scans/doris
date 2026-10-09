@@ -24,7 +24,6 @@
 #include "core/column/column_array.h"
 #include "core/column/column_map.h"
 #include "core/column/column_string.h"
-#include "core/column/column_variant.h"
 #include "core/string_ref.h"
 #include "exec/common/variant_util.h"
 #include "storage/segment/segment.h"
@@ -204,7 +203,7 @@ Status CombineMultipleBinaryColumnIterator::next_batch(size_t* n, MutableColumnP
     _binary_column_data.clear();
     _binary_column_data.reserve(_iters.size());
     for (auto& it : _iters) {
-        MutableColumnPtr m = ColumnVariant::create_binary_column_fn();
+        MutableColumnPtr m = variant_util::create_variant_binary_column();
         RETURN_IF_ERROR(it->next_batch(n, m, has_null));
         _binary_column_data.emplace_back(std::move(m));
     }
@@ -218,7 +217,7 @@ Status CombineMultipleBinaryColumnIterator::read_by_rowids(const rowid_t* rowids
     _binary_column_data.clear();
     _binary_column_data.reserve(_iters.size());
     for (auto& it : _iters) {
-        MutableColumnPtr m = ColumnVariant::create_binary_column_fn();
+        MutableColumnPtr m = variant_util::create_variant_binary_column();
         RETURN_IF_ERROR(it->read_by_rowids(rowids, count, m));
         _binary_column_data.emplace_back(std::move(m));
     }
@@ -236,7 +235,7 @@ void CombineMultipleBinaryColumnIterator::_collect_sparse_data_from_buckets(
     auto& column_map = assert_cast<ColumnMap&>(binary_data_column);
     auto& dst_paths = assert_cast<ColumnString&>(column_map.get_keys());
     auto& dst_values = assert_cast<ColumnString&>(column_map.get_values());
-    auto& dst_offsets = assert_cast<ColumnArray::Offsets64&>(column_map.get_offsets());
+    auto& dst_offsets = column_map.get_offsets();
 
     std::vector<const ColumnString*> src_paths(_binary_column_data.size());
     std::vector<const ColumnString*> src_values(_binary_column_data.size());
@@ -245,7 +244,7 @@ void CombineMultipleBinaryColumnIterator::_collect_sparse_data_from_buckets(
         const auto& src_map = assert_cast<const ColumnMap&>(*_binary_column_data[i]);
         src_paths[i] = assert_cast<const ColumnString*>(&src_map.get_keys());
         src_values[i] = assert_cast<const ColumnString*>(&src_map.get_values());
-        src_offsets[i] = assert_cast<const ColumnArray::Offsets64*>(&src_map.get_offsets());
+        src_offsets[i] = &src_map.get_offsets();
     }
 
     size_t num_rows = _binary_column_data[0]->size();

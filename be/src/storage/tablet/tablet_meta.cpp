@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <ranges>
 #include <set>
 #include <utility>
 
@@ -127,7 +128,8 @@ TabletMetaSharedPtr TabletMeta::create(
             request.tde_algorithm, storage_format,
             request.__isset.vertical_compaction_num_columns_per_group
                     ? request.vertical_compaction_num_columns_per_group
-                    : 5);
+                    : 5,
+            request.__isset.tablet_role ? request.tablet_role : TTabletRole::TABLET_ROLE_DATA);
 }
 
 TabletMeta::~TabletMeta() {
@@ -157,7 +159,8 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
                        TInvertedIndexFileStorageFormat::type inverted_index_file_storage_format,
                        TEncryptionAlgorithm::type tde_algorithm,
                        TStorageFormat::type storage_format,
-                       int32_t vertical_compaction_num_columns_per_group)
+                       int32_t vertical_compaction_num_columns_per_group,
+                       TTabletRole::type tablet_role)
         : _tablet_uid(0, 0),
           _schema(new TabletSchema),
           _delete_bitmap(new DeleteBitmap(tablet_id)),
@@ -192,209 +195,19 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
             time_series_compaction_level_threshold);
     tablet_meta_pb.set_vertical_compaction_num_columns_per_group(
             vertical_compaction_num_columns_per_group);
-    TabletSchemaPB* schema = tablet_meta_pb.mutable_schema();
-    schema->set_num_short_key_columns(tablet_schema.short_key_column_count);
-    schema->set_num_rows_per_row_block(config::default_num_rows_per_column_file_block);
-    schema->set_sequence_col_idx(tablet_schema.sequence_col_idx);
-    auto p_seq_map = schema->mutable_seq_map(); // ColumnGroupsPB
+    tablet_meta_pb.set_tablet_role(tablet_role == TTabletRole::TABLET_ROLE_ROW_BINLOG
+                                           ? TabletRolePB::TABLET_ROLE_ROW_BINLOG
+                                           : TabletRolePB::TABLET_ROLE_DATA);
+    SchemaCreateOptions schema_create_options_for_data = {
+            .col_ordinal_to_unique_id = col_ordinal_to_unique_id,
+            .compression_type = compression_type,
+            .inverted_index_file_storage_format = inverted_index_file_storage_format,
+            .next_unique_id = next_unique_id};
+    TabletSchemaPB* schema_pb_for_data = tablet_meta_pb.mutable_schema();
+    init_schema_from_thrift(tablet_schema, schema_create_options_for_data, schema_pb_for_data);
 
-    for (auto& it : tablet_schema.seq_map) { // std::vector< ::doris::TColumnGroup>
-        uint32_t key = it.sequence_column;
-        ColumnGroupPB* cg_pb = p_seq_map->add_cg(); // ColumnGroupPB {key: {v1, v2, v3}}
-        cg_pb->set_sequence_column(key);
-        for (auto v : it.columns_in_group) {
-            cg_pb->add_columns_in_group(v);
-        }
-    }
-    switch (tablet_schema.keys_type) {
-    case TKeysType::DUP_KEYS:
-        schema->set_keys_type(KeysType::DUP_KEYS);
-        break;
-    case TKeysType::UNIQUE_KEYS:
-        schema->set_keys_type(KeysType::UNIQUE_KEYS);
-        break;
-    case TKeysType::AGG_KEYS:
-        schema->set_keys_type(KeysType::AGG_KEYS);
-        break;
-    default:
-        LOG(WARNING) << "unknown tablet keys type";
-        break;
-    }
-    // compress_kind used to compress segment files
-    schema->set_compress_kind(COMPRESS_LZ4);
-
-    // compression_type used to compress segment page
-    switch (compression_type) {
-    case TCompressionType::NO_COMPRESSION:
-        schema->set_compression_type(segment_v2::NO_COMPRESSION);
-        break;
-    case TCompressionType::SNAPPY:
-        schema->set_compression_type(segment_v2::SNAPPY);
-        break;
-    case TCompressionType::LZ4:
-        schema->set_compression_type(segment_v2::LZ4);
-        break;
-    case TCompressionType::LZ4F:
-        schema->set_compression_type(segment_v2::LZ4F);
-        break;
-    case TCompressionType::ZLIB:
-        schema->set_compression_type(segment_v2::ZLIB);
-        break;
-    case TCompressionType::ZSTD:
-        schema->set_compression_type(segment_v2::ZSTD);
-        break;
-    default:
-        schema->set_compression_type(segment_v2::LZ4F);
-        break;
-    }
-
-    switch (inverted_index_file_storage_format) {
-    case TInvertedIndexFileStorageFormat::V1:
-        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V1);
-        break;
-    case TInvertedIndexFileStorageFormat::V2:
-        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V2);
-        break;
-    case TInvertedIndexFileStorageFormat::V3:
-        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V3);
-        break;
-    default:
-        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V3);
-        break;
-    }
-
-    switch (tablet_schema.sort_type) {
-    case TSortType::type::ZORDER:
-        schema->set_sort_type(SortType::ZORDER);
-        break;
-    default:
-        schema->set_sort_type(SortType::LEXICAL);
-    }
-    schema->set_sort_col_num(tablet_schema.sort_col_num);
-    for (const auto& i : tablet_schema.cluster_key_uids) {
-        schema->add_cluster_key_uids(i);
-    }
     tablet_meta_pb.set_in_restore_mode(false);
 
-    // set column information
-    uint32_t col_ordinal = 0;
-    bool has_bf_columns = false;
-    for (TColumn tcolumn : tablet_schema.columns) {
-        ColumnPB* column = schema->add_column();
-        uint32_t unique_id = -1;
-        if (tcolumn.col_unique_id >= 0) {
-            unique_id = tcolumn.col_unique_id;
-        } else {
-            unique_id = col_ordinal_to_unique_id.at(col_ordinal);
-        }
-        col_ordinal++;
-        init_column_from_tcolumn(unique_id, tcolumn, column);
-
-        if (column->is_bf_column()) {
-            has_bf_columns = true;
-        }
-
-        if (tablet_schema.__isset.indexes) {
-            for (auto& index : tablet_schema.indexes) {
-                if (index.index_type == TIndexType::type::BLOOMFILTER ||
-                    index.index_type == TIndexType::type::NGRAM_BF) {
-                    DCHECK_EQ(index.columns.size(), 1);
-                    if (iequal(tcolumn.column_name, index.columns[0])) {
-                        column->set_is_bf_column(true);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // copy index meta
-    if (tablet_schema.__isset.indexes) {
-        for (auto& index : tablet_schema.indexes) {
-            TabletIndexPB* index_pb = schema->add_index();
-            index_pb->set_index_id(index.index_id);
-            index_pb->set_index_name(index.index_name);
-            // init col_unique_id in index at be side, since col_unique_id may be -1 at fe side
-            // get column unique id by name
-            for (auto column_name : index.columns) {
-                for (auto column : schema->column()) {
-                    if (iequal(column.name(), column_name)) {
-                        index_pb->add_col_unique_id(column.unique_id());
-                    }
-                }
-            }
-            switch (index.index_type) {
-            case TIndexType::BITMAP:
-                index_pb->set_index_type(IndexType::BITMAP);
-                break;
-            case TIndexType::INVERTED:
-                index_pb->set_index_type(IndexType::INVERTED);
-                break;
-            case TIndexType::ANN:
-                index_pb->set_index_type(IndexType::ANN);
-                break;
-            case TIndexType::BLOOMFILTER:
-                index_pb->set_index_type(IndexType::BLOOMFILTER);
-                break;
-            case TIndexType::NGRAM_BF:
-                index_pb->set_index_type(IndexType::NGRAM_BF);
-                break;
-            }
-
-            if (index.__isset.properties) {
-                auto properties = index_pb->mutable_properties();
-                for (auto kv : index.properties) {
-                    (*properties)[kv.first] = kv.second;
-                }
-            }
-        }
-    }
-
-    schema->set_next_column_unique_id(next_unique_id);
-    if (has_bf_columns && tablet_schema.__isset.bloom_filter_fpp) {
-        schema->set_bf_fpp(tablet_schema.bloom_filter_fpp);
-    }
-
-    if (tablet_schema.__isset.is_in_memory) {
-        schema->set_is_in_memory(tablet_schema.is_in_memory);
-    }
-
-    if (tablet_schema.__isset.disable_auto_compaction) {
-        schema->set_disable_auto_compaction(tablet_schema.disable_auto_compaction);
-    }
-
-    // Deprecated legacy flatten-nested switch. Distinct from variant_enable_nested_group.
-    if (tablet_schema.__isset.variant_enable_flatten_nested) {
-        schema->set_enable_variant_flatten_nested(tablet_schema.variant_enable_flatten_nested);
-    }
-
-    if (tablet_schema.__isset.enable_single_replica_compaction) {
-        schema->set_enable_single_replica_compaction(
-                tablet_schema.enable_single_replica_compaction);
-    }
-
-    if (tablet_schema.__isset.delete_sign_idx) {
-        schema->set_delete_sign_idx(tablet_schema.delete_sign_idx);
-    }
-    if (tablet_schema.__isset.store_row_column) {
-        schema->set_store_row_column(tablet_schema.store_row_column);
-    }
-    if (tablet_schema.__isset.row_store_page_size) {
-        schema->set_row_store_page_size(tablet_schema.row_store_page_size);
-    }
-    if (tablet_schema.__isset.storage_page_size) {
-        schema->set_storage_page_size(tablet_schema.storage_page_size);
-    }
-    if (tablet_schema.__isset.storage_dict_page_size) {
-        schema->set_storage_dict_page_size(tablet_schema.storage_dict_page_size);
-    }
-    if (tablet_schema.__isset.skip_write_index_on_load) {
-        schema->set_skip_write_index_on_load(tablet_schema.skip_write_index_on_load);
-    }
-    if (tablet_schema.__isset.row_store_col_cids) {
-        schema->mutable_row_store_column_unique_ids()->Add(tablet_schema.row_store_col_cids.begin(),
-                                                           tablet_schema.row_store_col_cids.end());
-    }
     if (binlog_config.has_value()) {
         BinlogConfig tmp_binlog_config;
         tmp_binlog_config = binlog_config.value();
@@ -421,15 +234,8 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
     case TStorageFormat::V1:
         break;
     case TStorageFormat::V3:
-        schema->set_is_external_segment_column_meta_used(true);
-        _schema->set_external_segment_meta_used_default(true);
-
-        schema->set_integer_type_default_use_plain_encoding(true);
-        _schema->set_integer_type_default_use_plain_encoding(true);
-        schema->set_binary_plain_encoding_default_impl(
-                BinaryPlainEncodingTypePB::BINARY_PLAIN_ENCODING_V2);
-        _schema->set_binary_plain_encoding_default_impl(
-                BinaryPlainEncodingTypePB::BINARY_PLAIN_ENCODING_V2);
+        schema_pb_for_data->set_storage_format(TabletStorageFormatPB::TABLET_STORAGE_FORMAT_V3);
+        _schema->set_storage_format(TabletStorageFormatPB::TABLET_STORAGE_FORMAT_V3);
         break;
     default:
         break;
@@ -462,6 +268,8 @@ TabletMeta::TabletMeta(const TabletMeta& b)
           _enable_unique_key_merge_on_write(b._enable_unique_key_merge_on_write),
           _delete_bitmap(b._delete_bitmap),
           _binlog_config(b._binlog_config),
+          _tablet_role(b._tablet_role),
+          _binlog_tablet_id(b._binlog_tablet_id),
           _compaction_policy(b._compaction_policy),
           _time_series_compaction_goal_size_mbytes(b._time_series_compaction_goal_size_mbytes),
           _time_series_compaction_file_count_threshold(
@@ -471,8 +279,8 @@ TabletMeta::TabletMeta(const TabletMeta& b)
           _time_series_compaction_empty_rowsets_threshold(
                   b._time_series_compaction_empty_rowsets_threshold),
           _time_series_compaction_level_threshold(b._time_series_compaction_level_threshold),
-          _vertical_compaction_num_columns_per_group(
-                  b._vertical_compaction_num_columns_per_group) {};
+          _vertical_compaction_num_columns_per_group(b._vertical_compaction_num_columns_per_group),
+          _inverted_index_storage_format(b._inverted_index_storage_format) {};
 
 void TabletMeta::init_column_from_tcolumn(uint32_t unique_id, const TColumn& tcolumn,
                                           ColumnPB* column) {
@@ -526,6 +334,9 @@ void TabletMeta::init_column_from_tcolumn(uint32_t unique_id, const TColumn& tco
     if (tcolumn.__isset.default_value) {
         column->set_default_value(tcolumn.default_value);
     }
+    if (tcolumn.__isset.default_value_expr) {
+        column->set_default_value_expr(tcolumn.default_value_expr);
+    }
     if (tcolumn.__isset.is_bloom_filter_column) {
         column->set_is_bf_column(tcolumn.is_bloom_filter_column);
     }
@@ -572,6 +383,238 @@ void TabletMeta::init_column_from_tcolumn(uint32_t unique_id, const TColumn& tco
     }
     if (tcolumn.__isset.variant_enable_nested_group) {
         column->set_variant_enable_nested_group(tcolumn.variant_enable_nested_group);
+    }
+}
+
+void TabletMeta::init_schema_from_thrift(const TTabletSchema& tablet_schema,
+                                         const SchemaCreateOptions& schema_create_options,
+                                         TabletSchemaPB* tablet_schema_pb) {
+    const std::unordered_map<uint32_t, uint32_t>& col_ordinal_to_unique_id =
+            schema_create_options.col_ordinal_to_unique_id;
+    TCompressionType::type compression_type = schema_create_options.compression_type;
+    TInvertedIndexFileStorageFormat::type inverted_index_file_storage_format =
+            schema_create_options.inverted_index_file_storage_format;
+    uint32_t next_unique_id = schema_create_options.next_unique_id;
+
+    tablet_schema_pb->set_num_short_key_columns(tablet_schema.short_key_column_count);
+    tablet_schema_pb->set_num_rows_per_row_block(config::default_num_rows_per_column_file_block);
+    tablet_schema_pb->set_sequence_col_idx(tablet_schema.sequence_col_idx);
+    if (tablet_schema.__isset.row_lsn_col_idx) {
+        tablet_schema_pb->set_row_lsn_col_idx(tablet_schema.row_lsn_col_idx);
+    }
+    if (tablet_schema.__isset.binlog_tso_idx) {
+        tablet_schema_pb->set_binlog_tso_col_idx(tablet_schema.binlog_tso_idx);
+    }
+    if (tablet_schema.__isset.binlog_lsn_idx) {
+        tablet_schema_pb->set_binlog_lsn_col_idx(tablet_schema.binlog_lsn_idx);
+    }
+    if (tablet_schema.__isset.binlog_op_idx) {
+        tablet_schema_pb->set_binlog_op_col_idx(tablet_schema.binlog_op_idx);
+    }
+    auto p_seq_map = tablet_schema_pb->mutable_seq_map(); // ColumnGroupsPB
+    for (auto& it : tablet_schema.seq_map) {              // std::vector< ::doris::TColumnGroup>
+        uint32_t key = it.sequence_column;
+        ColumnGroupPB* cg_pb = p_seq_map->add_cg(); // ColumnGroupPB {key: {v1, v2, v3}}
+        cg_pb->set_sequence_column(key);
+        for (auto v : it.columns_in_group) {
+            cg_pb->add_columns_in_group(v);
+        }
+    }
+
+    switch (tablet_schema.keys_type) {
+    case TKeysType::DUP_KEYS:
+        tablet_schema_pb->set_keys_type(KeysType::DUP_KEYS);
+        break;
+    case TKeysType::UNIQUE_KEYS:
+        tablet_schema_pb->set_keys_type(KeysType::UNIQUE_KEYS);
+        break;
+    case TKeysType::AGG_KEYS:
+        tablet_schema_pb->set_keys_type(KeysType::AGG_KEYS);
+        break;
+    default:
+        LOG(WARNING) << "unknown tablet keys type";
+        break;
+    }
+
+    // compress_kind used to compress segment files
+    tablet_schema_pb->set_compress_kind(COMPRESS_LZ4);
+
+    // compression_type used to compress segment page
+    switch (compression_type) {
+    case TCompressionType::NO_COMPRESSION:
+        tablet_schema_pb->set_compression_type(segment_v2::NO_COMPRESSION);
+        break;
+    case TCompressionType::SNAPPY:
+        tablet_schema_pb->set_compression_type(segment_v2::SNAPPY);
+        break;
+    case TCompressionType::LZ4:
+        tablet_schema_pb->set_compression_type(segment_v2::LZ4);
+        break;
+    case TCompressionType::LZ4F:
+        tablet_schema_pb->set_compression_type(segment_v2::LZ4F);
+        break;
+    case TCompressionType::ZLIB:
+        tablet_schema_pb->set_compression_type(segment_v2::ZLIB);
+        break;
+    case TCompressionType::ZSTD:
+        tablet_schema_pb->set_compression_type(segment_v2::ZSTD);
+        break;
+    default:
+        tablet_schema_pb->set_compression_type(segment_v2::LZ4F);
+        break;
+    }
+
+    switch (inverted_index_file_storage_format) {
+    case TInvertedIndexFileStorageFormat::V1:
+        tablet_schema_pb->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V1);
+        break;
+    case TInvertedIndexFileStorageFormat::V2:
+        tablet_schema_pb->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V2);
+        break;
+    case TInvertedIndexFileStorageFormat::V3:
+        tablet_schema_pb->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V3);
+        break;
+    case TInvertedIndexFileStorageFormat::SNII:
+        tablet_schema_pb->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::SNII);
+        break;
+    default:
+        tablet_schema_pb->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V3);
+        break;
+    }
+
+    switch (tablet_schema.sort_type) {
+    case TSortType::type::ZORDER:
+        tablet_schema_pb->set_sort_type(SortType::ZORDER);
+        break;
+    default:
+        tablet_schema_pb->set_sort_type(SortType::LEXICAL);
+    }
+    tablet_schema_pb->set_sort_col_num(tablet_schema.sort_col_num);
+    for (const auto& i : tablet_schema.cluster_key_uids) {
+        tablet_schema_pb->add_cluster_key_uids(i);
+    }
+
+    // set column information
+    uint32_t col_ordinal = 0;
+    bool has_bf_columns = false;
+    for (TColumn tcolumn : tablet_schema.columns) {
+        ColumnPB* column = tablet_schema_pb->add_column();
+        uint32_t unique_id = -1;
+        if (tcolumn.col_unique_id >= 0) {
+            unique_id = tcolumn.col_unique_id;
+        } else {
+            unique_id = col_ordinal_to_unique_id.at(col_ordinal);
+        }
+        init_column_from_tcolumn(unique_id, tcolumn, column);
+
+        col_ordinal++;
+
+        if (column->is_bf_column()) {
+            has_bf_columns = true;
+        }
+
+        if (tablet_schema.__isset.indexes) {
+            for (auto& index : tablet_schema.indexes) {
+                if (index.index_type == TIndexType::type::BLOOMFILTER ||
+                    index.index_type == TIndexType::type::NGRAM_BF) {
+                    DCHECK_EQ(index.columns.size(), 1);
+                    if (iequal(tcolumn.column_name, index.columns[0])) {
+                        column->set_is_bf_column(true);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // copy index meta
+    if (tablet_schema.__isset.indexes) {
+        for (auto& index : tablet_schema.indexes) {
+            TabletIndexPB* index_pb = tablet_schema_pb->add_index();
+            index_pb->set_index_id(index.index_id);
+            index_pb->set_index_name(index.index_name);
+            // init col_unique_id in index at be side, since col_unique_id may be -1 at fe side
+            // get column unique id by name
+            for (auto column_name : index.columns) {
+                for (auto column : tablet_schema_pb->column()) {
+                    if (iequal(column.name(), column_name)) {
+                        index_pb->add_col_unique_id(column.unique_id());
+                    }
+                }
+            }
+            switch (index.index_type) {
+            case TIndexType::BITMAP:
+                index_pb->set_index_type(IndexType::BITMAP);
+                break;
+            case TIndexType::INVERTED:
+                index_pb->set_index_type(IndexType::INVERTED);
+                break;
+            case TIndexType::ANN:
+                index_pb->set_index_type(IndexType::ANN);
+                break;
+            case TIndexType::BLOOMFILTER:
+                index_pb->set_index_type(IndexType::BLOOMFILTER);
+                break;
+            case TIndexType::NGRAM_BF:
+                index_pb->set_index_type(IndexType::NGRAM_BF);
+                break;
+            }
+
+            if (index.__isset.properties) {
+                auto properties = index_pb->mutable_properties();
+                for (auto kv : index.properties) {
+                    (*properties)[kv.first] = kv.second;
+                }
+            }
+        }
+    }
+
+    tablet_schema_pb->set_next_column_unique_id(next_unique_id);
+    if (has_bf_columns && tablet_schema.__isset.bloom_filter_fpp) {
+        tablet_schema_pb->set_bf_fpp(tablet_schema.bloom_filter_fpp);
+    }
+
+    if (tablet_schema.__isset.is_in_memory) {
+        tablet_schema_pb->set_is_in_memory(tablet_schema.is_in_memory);
+    }
+
+    if (tablet_schema.__isset.disable_auto_compaction) {
+        tablet_schema_pb->set_disable_auto_compaction(tablet_schema.disable_auto_compaction);
+    }
+
+    // Deprecated legacy flatten-nested switch. Distinct from variant_enable_nested_group.
+    if (tablet_schema.__isset.variant_enable_flatten_nested) {
+        tablet_schema_pb->set_enable_variant_flatten_nested(
+                tablet_schema.variant_enable_flatten_nested);
+    }
+
+    if (tablet_schema.__isset.delete_sign_idx) {
+        tablet_schema_pb->set_delete_sign_idx(tablet_schema.delete_sign_idx);
+    }
+    if (tablet_schema.__isset.commit_tso_col_idx) {
+        tablet_schema_pb->set_commit_tso_col_idx(tablet_schema.commit_tso_col_idx);
+    }
+    if (tablet_schema.__isset.row_lsn_col_idx) {
+        tablet_schema_pb->set_row_lsn_col_idx(tablet_schema.row_lsn_col_idx);
+    }
+    if (tablet_schema.__isset.store_row_column) {
+        tablet_schema_pb->set_store_row_column(tablet_schema.store_row_column);
+    }
+    if (tablet_schema.__isset.row_store_page_size) {
+        tablet_schema_pb->set_row_store_page_size(tablet_schema.row_store_page_size);
+    }
+    if (tablet_schema.__isset.storage_page_size) {
+        tablet_schema_pb->set_storage_page_size(tablet_schema.storage_page_size);
+    }
+    if (tablet_schema.__isset.storage_dict_page_size) {
+        tablet_schema_pb->set_storage_dict_page_size(tablet_schema.storage_dict_page_size);
+    }
+    if (tablet_schema.__isset.skip_write_index_on_load) {
+        tablet_schema_pb->set_skip_write_index_on_load(tablet_schema.skip_write_index_on_load);
+    }
+    if (tablet_schema.__isset.row_store_col_cids) {
+        tablet_schema_pb->mutable_row_store_column_unique_ids()->Add(
+                tablet_schema.row_store_col_cids.begin(), tablet_schema.row_store_col_cids.end());
     }
 }
 
@@ -673,6 +716,25 @@ Status TabletMeta::save_meta(DataDir* data_dir) {
     return _save_meta(data_dir);
 }
 
+int64_t TabletMeta::file_cache_ttl_expiration_time() const {
+    int64_t ttl = ttl_seconds();
+    int64_t ctime = creation_time();
+    if (ttl <= 0 || ctime <= 0) {
+        return 0;
+    }
+    // FE caps file_cache_ttl_seconds at Long.MAX_VALUE / 2, so this cannot wrap, but a tablet
+    // meta that reached us from anywhere else still must not turn a huge ttl into a past
+    // deadline that silently downgrades the tablet to normal cache.
+    if (ctime > std::numeric_limits<int64_t>::max() - ttl) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    int64_t expiration_time = ctime + ttl;
+    // Already past the deadline: report no TTL at all, so callers stamp the blocks they
+    // create as NORMAL right away instead of putting them in the TTL queue for
+    // BlockFileCacheTtlMgr to take straight back out again.
+    return expiration_time > UnixSeconds() ? expiration_time : 0;
+}
+
 Status TabletMeta::_save_meta(DataDir* data_dir) {
     // check if tablet uid is valid
     if (_tablet_uid.hi == 0 && _tablet_uid.lo == 0) {
@@ -760,6 +822,10 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
     _cumulative_layer_point = tablet_meta_pb.cumulative_layer_point();
     _tablet_uid = TabletUid(tablet_meta_pb.tablet_uid());
     _ttl_seconds = tablet_meta_pb.ttl_seconds();
+    _inverted_index_storage_format.reset();
+    if (tablet_meta_pb.has_inverted_index_storage_format()) {
+        _inverted_index_storage_format = tablet_meta_pb.inverted_index_storage_format();
+    }
     if (tablet_meta_pb.has_tablet_type()) {
         _tablet_type = tablet_meta_pb.tablet_type();
     } else {
@@ -790,7 +856,11 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
 
     // init _schema
     TabletSchemaSPtr schema = std::make_shared<TabletSchema>();
-    schema->init_from_pb(tablet_meta_pb.schema());
+    TabletSchemaPB schema_pb = tablet_meta_pb.schema();
+    if (_inverted_index_storage_format.has_value()) {
+        schema_pb.set_inverted_index_storage_format(*_inverted_index_storage_format);
+    }
+    schema->init_from_pb(schema_pb);
     if (_handle) {
         TabletSchemaCache::instance()->release(_handle);
     }
@@ -854,6 +924,8 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
     if (tablet_meta_pb.has_binlog_config()) {
         _binlog_config = tablet_meta_pb.binlog_config();
     }
+    _tablet_role = tablet_meta_pb.tablet_role();
+    _binlog_tablet_id = tablet_meta_pb.binlog_tablet_id();
     _compaction_policy = tablet_meta_pb.compaction_policy();
     _time_series_compaction_goal_size_mbytes =
             tablet_meta_pb.time_series_compaction_goal_size_mbytes();
@@ -915,6 +987,11 @@ void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb, bool cloud_get_rowset_
     }
 
     _schema->to_schema_pb(tablet_meta_pb->mutable_schema());
+    if (_inverted_index_storage_format.has_value()) {
+        tablet_meta_pb->set_inverted_index_storage_format(*_inverted_index_storage_format);
+        tablet_meta_pb->mutable_schema()->set_inverted_index_storage_format(
+                *_inverted_index_storage_format);
+    }
 
     tablet_meta_pb->set_in_restore_mode(in_restore_mode());
 
@@ -951,6 +1028,10 @@ void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb, bool cloud_get_rowset_
         }
     }
     _binlog_config.to_pb(tablet_meta_pb->mutable_binlog_config());
+    tablet_meta_pb->set_tablet_role(_tablet_role);
+    if (_binlog_tablet_id > 0) {
+        tablet_meta_pb->set_binlog_tablet_id(_binlog_tablet_id);
+    }
     tablet_meta_pb->set_compaction_policy(compaction_policy());
     tablet_meta_pb->set_time_series_compaction_goal_size_mbytes(
             time_series_compaction_goal_size_mbytes());
@@ -1130,10 +1211,14 @@ Status TabletMeta::set_partition_id(int64_t partition_id) {
 }
 
 void TabletMeta::clear_stale_rowset() {
-    _stale_rs_metas.clear();
+    clear_stale_rs_metas();
     if (_enable_unique_key_merge_on_write) {
         _delete_bitmap->clear_rowset_cache_version();
     }
+}
+
+void TabletMeta::clear_stale_rs_metas() {
+    _stale_rs_metas.clear();
 }
 
 void TabletMeta::clear_rowsets() {
@@ -1191,6 +1276,7 @@ bool operator==(const TabletMeta& a, const TabletMeta& b) {
     if (a._in_restore_mode != b._in_restore_mode) return false;
     if (a._preferred_rowset_type != b._preferred_rowset_type) return false;
     if (a._storage_policy_id != b._storage_policy_id) return false;
+    if (a._binlog_tablet_id != b._binlog_tablet_id) return false;
     if (a._compaction_policy != b._compaction_policy) return false;
     if (a._time_series_compaction_goal_size_mbytes != b._time_series_compaction_goal_size_mbytes)
         return false;
@@ -1407,6 +1493,13 @@ bool DeleteBitmap::contains(const BitmapKey& bmk, uint32_t row_id) const {
     return it != delete_bitmap.end() && it->second.contains(row_id);
 }
 
+bool DeleteBitmap::contain_rowsets(const RowsetIdUnorderedSet& rowset_ids) const {
+    std::shared_lock l(lock);
+    return std::any_of(delete_bitmap.begin(), delete_bitmap.end(), [&](const auto& entry) {
+        return rowset_ids.contains(std::get<0>(entry.first));
+    });
+}
+
 bool DeleteBitmap::contains_agg(const BitmapKey& bmk, uint32_t row_id) const {
     return get_agg(bmk)->contains(row_id);
 }
@@ -1543,11 +1636,10 @@ void DeleteBitmap::subset(const BitmapKey& start, const BitmapKey& end,
     }
 }
 
-void DeleteBitmap::subset(std::vector<std::pair<RowsetId, int64_t>>& rowset_ids,
-                          int64_t start_version, int64_t end_version,
-                          DeleteBitmap* subset_delete_map) const {
+void DeleteBitmap::subset(const std::vector<RowsetIdWithSegmentIds>& rowsets, int64_t start_version,
+                          int64_t end_version, DeleteBitmap* subset_delete_map) const {
     DCHECK(start_version <= end_version);
-    for (auto& [rowset_id, _] : rowset_ids) {
+    for (const auto& [rowset_id, _] : rowsets) {
         BitmapKey start {rowset_id, 0, 0};
         BitmapKey end {rowset_id, UINT32_MAX, end_version + 1};
         std::shared_lock l(lock);
@@ -1569,16 +1661,16 @@ void DeleteBitmap::subset(std::vector<std::pair<RowsetId, int64_t>>& rowset_ids,
     }
 }
 
-void DeleteBitmap::subset_and_agg(std::vector<std::pair<RowsetId, int64_t>>& rowset_ids,
+void DeleteBitmap::subset_and_agg(const std::vector<RowsetIdWithSegmentIds>& rowsets,
                                   int64_t start_version, int64_t end_version,
                                   DeleteBitmap* subset_delete_map) const {
     DCHECK(start_version <= end_version);
-    for (auto& [rowset_id, segment_num] : rowset_ids) {
-        for (int64_t seg_id = 0; seg_id < segment_num; ++seg_id) {
-            BitmapKey end {rowset_id, seg_id, end_version};
+    for (const auto& [rowset_id, segment_ids] : rowsets) {
+        for (auto segment_id : segment_ids) {
+            BitmapKey end {rowset_id, segment_id, end_version};
             auto bm = get_agg_without_cache(end, start_version);
             VLOG_DEBUG << "subset delete bitmap, tablet=" << _tablet_id << ", rowset=" << rowset_id
-                       << ", segment=" << seg_id << ", version=[" << start_version << "-"
+                       << ", segment=" << segment_id << ", version=[" << start_version << "-"
                        << end_version << "], cardinality=" << bm->cardinality();
             if (bm->isEmpty()) {
                 continue;

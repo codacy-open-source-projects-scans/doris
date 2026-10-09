@@ -24,8 +24,11 @@ import org.apache.doris.analysis.NullLiteral;
 import org.apache.doris.analysis.PartitionDesc;
 import org.apache.doris.analysis.PartitionValue;
 import org.apache.doris.analysis.SinglePartitionDesc;
+import org.apache.doris.analysis.TimeStampNsLiteral;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.thrift.TInvertedIndexFileStorageFormat;
 import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.thrift.TTabletType;
 
@@ -68,6 +71,9 @@ public class PartitionInfo {
     // partition id -> storage policy
     @SerializedName("IdToStoragePolicy")
     protected Map<Long, String> idToStoragePolicy;
+    // partition id -> resolved base inverted-index storage format
+    @SerializedName("IdToInvertedIndexFileStorageFormat")
+    protected Map<Long, TInvertedIndexFileStorageFormat> idToInvertedIndexFileStorageFormat;
     // partition id -> replication allocation
     @SerializedName("IdToReplicaAllocation")
     protected Map<Long, ReplicaAllocation> idToReplicaAllocation;
@@ -97,6 +103,7 @@ public class PartitionInfo {
         this.idToInMemory = new HashMap<>();
         this.idToTabletType = new HashMap<>();
         this.idToStoragePolicy = new HashMap<>();
+        this.idToInvertedIndexFileStorageFormat = new HashMap<>();
         this.partitionExprs = new ArrayList<>();
     }
 
@@ -107,6 +114,7 @@ public class PartitionInfo {
         this.idToInMemory = new HashMap<>();
         this.idToTabletType = new HashMap<>();
         this.idToStoragePolicy = new HashMap<>();
+        this.idToInvertedIndexFileStorageFormat = new HashMap<>();
         this.partitionExprs = new ArrayList<>();
     }
 
@@ -311,6 +319,19 @@ public class PartitionInfo {
         idToStoragePolicy.put(partitionId, storagePolicy);
     }
 
+    public TInvertedIndexFileStorageFormat getInvertedIndexFileStorageFormat(long partitionId) {
+        return idToInvertedIndexFileStorageFormat == null
+                ? null : idToInvertedIndexFileStorageFormat.get(partitionId);
+    }
+
+    public void setInvertedIndexFileStorageFormat(long partitionId,
+            TInvertedIndexFileStorageFormat invertedIndexFileStorageFormat) {
+        if (idToInvertedIndexFileStorageFormat == null) {
+            idToInvertedIndexFileStorageFormat = new HashMap<>();
+        }
+        idToInvertedIndexFileStorageFormat.put(partitionId, invertedIndexFileStorageFormat);
+    }
+
     public Map<Long, ReplicaAllocation> getPartitionReplicaAllocations() {
         return idToReplicaAllocation;
     }
@@ -358,8 +379,13 @@ public class PartitionInfo {
 
     public void dropPartition(long partitionId) {
         idToDataProperty.remove(partitionId);
+        idToStoragePolicy.remove(partitionId);
         idToReplicaAllocation.remove(partitionId);
         idToInMemory.remove(partitionId);
+        idToTabletType.remove(partitionId);
+        if (idToInvertedIndexFileStorageFormat != null) {
+            idToInvertedIndexFileStorageFormat.remove(partitionId);
+        }
         idToItem.remove(partitionId);
         idToTempItem.remove(partitionId);
     }
@@ -395,7 +421,7 @@ public class PartitionInfo {
         return partitionKey.getKeys().stream().map(expr -> {
             if (expr == MaxLiteral.MAX_VALUE) {
                 return PartitionValue.MAX_VALUE;
-            } else if (expr instanceof DateLiteral) {
+            } else if (expr instanceof DateLiteral || expr instanceof TimeStampNsLiteral) {
                 return new PartitionValue(expr.getStringValue());
             } else if (expr instanceof NullLiteral) {
                 return new PartitionValue("NULL", true);
@@ -420,22 +446,50 @@ public class PartitionInfo {
         Map<Long, PartitionItem> origIdToItem = idToItem;
         Map<Long, Boolean> origIdToInMemory = idToInMemory;
         Map<Long, String> origIdToStoragePolicy = idToStoragePolicy;
+        Map<Long, TInvertedIndexFileStorageFormat> origIdToInvertedIndexFileStorageFormat =
+                idToInvertedIndexFileStorageFormat;
         idToDataProperty = Maps.newHashMap();
         idToReplicaAllocation = Maps.newHashMap();
         idToItem = Maps.newHashMap();
         idToInMemory = Maps.newHashMap();
         idToStoragePolicy = Maps.newHashMap();
+        idToInvertedIndexFileStorageFormat = Maps.newHashMap();
 
         for (Map.Entry<Long, Long> entry : partitionIdMap.entrySet()) {
-            idToDataProperty.put(entry.getKey(), origIdToDataProperty.get(entry.getValue()));
-            idToReplicaAllocation.put(entry.getKey(),
-                    restoreReplicaAlloc == null ? origIdToReplicaAllocation.get(entry.getValue())
+            long newPartId = entry.getKey();
+            long origPartId = entry.getValue();
+
+            if (Config.isCloudMode()) {
+                // In cloud mode, storage_medium, cooldown_time, and storage_policy are not applicable.
+                // Reset DataProperty to default and clear storage policy to avoid carrying over
+                // source cluster's storage settings that have no meaning in cloud mode.
+                DataProperty origDataProperty = origIdToDataProperty.get(origPartId);
+                idToDataProperty.put(newPartId, new DataProperty(
+                        DataProperty.DEFAULT_STORAGE_MEDIUM,
+                        DataProperty.MAX_COOLDOWN_TIME_MS,
+                        "",
+                        origDataProperty != null ? origDataProperty.isMutable() : true));
+                idToStoragePolicy.put(newPartId, "");
+                idToInMemory.put(newPartId, false);
+            } else {
+                idToDataProperty.put(newPartId, origIdToDataProperty.get(origPartId));
+                idToStoragePolicy.put(newPartId, origIdToStoragePolicy.getOrDefault(origPartId, ""));
+                idToInMemory.put(newPartId, origIdToInMemory.get(origPartId));
+            }
+
+            idToReplicaAllocation.put(newPartId,
+                    restoreReplicaAlloc == null ? origIdToReplicaAllocation.get(origPartId)
                             : restoreReplicaAlloc);
             if (!isSinglePartitioned) {
-                idToItem.put(entry.getKey(), origIdToItem.get(entry.getValue()));
+                idToItem.put(newPartId, origIdToItem.get(origPartId));
             }
-            idToInMemory.put(entry.getKey(), origIdToInMemory.get(entry.getValue()));
-            idToStoragePolicy.put(entry.getKey(), origIdToStoragePolicy.getOrDefault(entry.getValue(), ""));
+            if (origIdToInvertedIndexFileStorageFormat != null) {
+                TInvertedIndexFileStorageFormat invertedIndexFileStorageFormat =
+                        origIdToInvertedIndexFileStorageFormat.get(origPartId);
+                if (invertedIndexFileStorageFormat != null) {
+                    idToInvertedIndexFileStorageFormat.put(newPartId, invertedIndexFileStorageFormat);
+                }
+            }
         }
     }
 

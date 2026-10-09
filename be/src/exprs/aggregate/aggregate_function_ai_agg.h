@@ -19,9 +19,11 @@
 
 #include <gen_cpp/PaloInternalService_types.h>
 
+#include <cstdlib>
 #include <memory>
 
 #include "common/status.h"
+#include "core/column/column_string.h"
 #include "core/string_ref.h"
 #include "core/types.h"
 #include "exprs/aggregate/aggregate_function.h"
@@ -117,9 +119,13 @@ public:
         THROW_IF_ERROR(
                 _ai_adapter->build_request_payload(inputs, system_prompt.c_str(), request_body));
         THROW_IF_ERROR(send_request_to_ai(request_body, response));
-        THROW_IF_ERROR(_ai_adapter->parse_response(response, results));
+        THROW_IF_ERROR(_ai_adapter->parse_response(response, results, false /* expand_batch */));
 
-        return results[0];
+        if (results.size() != 1) [[unlikely]] {
+            throw Exception(ErrorCode::INTERNAL_ERROR,
+                            "AI aggregate expected one result but got {}", results.size());
+        }
+        return results.front();
     }
 
     // init task and ai related parameters
@@ -146,7 +152,7 @@ public:
         }
     }
 
-    static void set_query_context(QueryContext* context) { _ctx = context; }
+    void set_query_context(QueryContext* context) { _ctx = context; }
 
     const std::string& get_task() const { return _task; }
 
@@ -158,7 +164,8 @@ private:
     Status send_request_to_ai(const std::string& request_body, std::string& response) const {
         // Mock path for testing
 #ifdef BE_TEST
-        response = "this is a mock response";
+        const char* test_result = std::getenv("AI_TEST_RESULT");
+        response = test_result != nullptr ? test_result : "this is a mock response";
         return Status::OK();
 #endif
 
@@ -197,7 +204,7 @@ private:
         process_current_context();
     }
 
-    static size_t get_ai_context_window_size() {
+    size_t get_ai_context_window_size() const {
         DORIS_CHECK(_ctx);
 
         return static_cast<size_t>(_ctx->query_options().ai_context_window_size);
@@ -247,7 +254,7 @@ private:
         inited = !data.empty();
     }
 
-    static QueryContext* _ctx;
+    QueryContext* _ctx = nullptr;
     AIResource _ai_config;
     std::shared_ptr<AIAdapter> _ai_adapter;
     std::string _task;
@@ -264,7 +271,7 @@ public:
 
     void set_query_context(QueryContext* context) override {
         if (context) {
-            AggregateFunctionAIAggData::set_query_context(context);
+            _ctx = context;
         }
     }
 
@@ -273,6 +280,11 @@ public:
     DataTypePtr get_return_type() const override { return std::make_shared<DataTypeString>(); }
 
     bool is_blockable() const override { return true; }
+
+    void create(AggregateDataPtr __restrict place) const override {
+        new (place) AggregateFunctionAIAggData;
+        data(place).set_query_context(_ctx);
+    }
 
     void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena&) const override {
@@ -303,7 +315,16 @@ public:
         }
     }
 
-    void reset(AggregateDataPtr place) const override { data(place).reset(); }
+    void check_input_columns_type(const IColumn** columns) const override {
+        this->template check_argument_column_type<ColumnString>(columns[0]);
+        this->template check_argument_column_type<ColumnString>(columns[1]);
+        this->template check_argument_column_type<ColumnString>(columns[2]);
+    }
+
+    void reset(AggregateDataPtr place) const override {
+        data(place).reset();
+        data(place).set_query_context(_ctx);
+    }
 
     void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs,
                Arena&) const override {
@@ -317,13 +338,23 @@ public:
     void deserialize(AggregateDataPtr __restrict place, BufferReadable& buf,
                      Arena&) const override {
         data(place).read(buf);
+        data(place).set_query_context(_ctx);
     }
 
     void insert_result_into(ConstAggregateDataPtr __restrict place, IColumn& to) const override {
         std::string result = data(place)._execute_task();
         DCHECK(!result.empty()) << "AI returns an empty result";
-        assert_cast<ColumnString&>(to).insert_data(result.data(), result.size());
+        assert_cast<ColumnString&, TypeCheckOnRelease::DISABLE>(to).insert_data(result.data(),
+                                                                                result.size());
     }
+
+    void check_result_column_type(const IColumn& to) const override {
+        IAggregateFunction::check_result_column_type(to);
+        this->template check_result_column_type_as<ColumnString>(to);
+    }
+
+private:
+    QueryContext* _ctx = nullptr;
 };
 
 } // namespace doris

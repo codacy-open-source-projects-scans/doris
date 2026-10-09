@@ -17,12 +17,17 @@
 
 #include "storage/index/inverted/analyzer/custom_analyzer.h"
 
+#include <algorithm>
+#include <string_view>
+
 #include "common/status.h"
 #include "runtime/exec_env.h"
 #include "storage/index/inverted/analysis_factory_mgr.h"
 #include "storage/index/inverted/token_stream.h"
+#include "storage/index/inverted/tokenizer/ngram/ngram_tokenizer_factory.h"
 
 namespace doris::segment_v2::inverted_index {
+namespace {} // namespace
 
 CustomAnalyzer::CustomAnalyzer(Builder* builder) {
     _tokenizer = builder->_tokenizer;
@@ -66,15 +71,21 @@ ReaderPtr CustomAnalyzer::init_reader(ReaderPtr reader) {
 }
 
 TokenStreamComponentsPtr CustomAnalyzer::create_components() {
-    auto tk = _tokenizer->create();
-    TokenStreamPtr ts = tk;
-    for (const auto& filter : _token_filters) {
-        ts = filter->create(ts);
+    try {
+        auto tk = _tokenizer->create();
+        TokenStreamPtr ts = tk;
+        for (const auto& filter : _token_filters) {
+            ts = filter->create(ts);
+        }
+        return std::make_shared<TokenStreamComponents>(tk, ts);
+    } catch (const CLuceneError& e) {
+        throw Exception(ErrorCode::INVERTED_INDEX_ANALYZER_ERROR,
+                        "Failed to create custom analyzer components: {}", e.what());
     }
-    return std::make_shared<TokenStreamComponents>(tk, ts);
 }
 
-CustomAnalyzerPtr CustomAnalyzer::build_custom_analyzer(const CustomAnalyzerConfigPtr& config) {
+CustomAnalyzerPtr CustomAnalyzer::build_custom_analyzer(
+        const ImmutableCustomAnalyzerConfigPtr& config) {
     if (config == nullptr) {
         throw Exception(ErrorCode::ILLEGAL_STATE, "Null configuration detected.");
     }
@@ -90,6 +101,34 @@ CustomAnalyzerPtr CustomAnalyzer::build_custom_analyzer(const CustomAnalyzerConf
     return builder.build();
 }
 
+CustomAnalyzerProvider::CustomAnalyzerProvider(
+        ImmutableCustomAnalyzerConfigPtr config,
+        std::map<std::string, std::string> /*outer_char_filter_map*/)
+        : _config(std::move(config)), _analyzer(CustomAnalyzer::build_custom_analyzer(_config)) {
+    // Gram-family detection: when the tokenizer is "ngram", hand its Settings to
+    // NGramTokenizerFactory::parse_gram_scheme so the same property mapping is reused (R16,
+    // DRY). build_custom_analyzer() has already constructed that tokenizer successfully above
+    // (otherwise it would have thrown and aborted construction), so re-parsing the same
+    // configuration here cannot fail; should it fail anyway, we fall back to nullopt rather than
+    // rethrowing.
+    //
+    // R22 (fail-safe): an analyzer carrying any char filter or token filter is never treated as
+    // gram family. The whole value of the gram family rests on the row invariant "the stored
+    // term == GramExtractor.extract(raw column value)", which the query side (phase C) uses to
+    // rewrite a regex into a conjunction of grams; a char filter rewrites the text and a token
+    // filter rewrites, adds or removes grams, and either one breaks that equality. Better to
+    // fall back to a full scan than to drop rows on an invariant that no longer holds.
+    const bool has_filters = !_config->get_char_filter_configs().empty() ||
+                             !_config->get_token_filter_configs().empty();
+    if (const auto& tokenizer_config = _config->get_tokenizer_config();
+        !has_filters && tokenizer_config != nullptr && tokenizer_config->get_name() == "ngram") {
+        if (Status st = NGramTokenizerFactory::parse_gram_scheme(tokenizer_config->get_params(),
+                                                                 &_gram_scheme);
+            !st.ok()) {
+            _gram_scheme.reset();
+        }
+    }
+}
 void CustomAnalyzer::Builder::with_tokenizer(const std::string& name, const Settings& params) {
     _tokenizer = AnalysisFactoryMgr::instance().create<TokenizerFactory>(name, params);
 }

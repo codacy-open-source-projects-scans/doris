@@ -45,11 +45,11 @@ public interface SourceOffsetProvider {
     default void ensureInitialized(Long jobId, Map<String, String> originTvfProps) throws JobException {}
 
     /**
-     * Performs one-time initialization that must run only on fresh job creation, not on FE restart.
-     * For example, fetching and persisting snapshot splits to the meta table.
+     * One-time initialization on fresh job creation (not on FE restart). Subclasses may
+     * initialize split progress, fetch initial splits, or open remote readers.
      * Default: no-op (most providers need no extra setup).
      */
-    default void initOnCreate() throws JobException {}
+    default void initOnCreate(List<String> syncTables) throws JobException {}
 
     /**
      * Get next offset to consume
@@ -87,6 +87,15 @@ public interface SourceOffsetProvider {
      * @param offset
      */
     void updateOffset(Offset offset);
+
+    /**
+     * Bind the compute group that should route FE-initiated RPCs.
+     * Default: no-op for providers that do not make BE RPCs.
+     */
+    default void setCloudCluster(String cloudCluster) {}
+
+    /** Bind the BE this job is pinned to in the binlog phase, for reader-reuse heartbeat routing. */
+    default void setBoundBackendId(long boundBackendId) {}
 
     /**
      * Fetch remote meta information, such as listing files in S3 or getting latest offsets in Kafka.
@@ -175,14 +184,44 @@ public interface SourceOffsetProvider {
     }
 
     /**
-     * Get the lag of the data source in seconds.
-     * For CDC sources, lag = (now - last consumed event timestamp) in seconds.
+     * Advance one batch of split fetching, called by scheduler each tick during PENDING/RUNNING.
+     * For providers without async splitting work (e.g. S3, Kafka), default is no-op.
+     * Aligned with flink-cdc SnapshotSplitAssigner naming.
      *
-     * @return lag in seconds as string, empty string if not applicable
+     * @throws JobException if fetching splits fails fatally
      */
+    default void advanceSplits() throws JobException {}
+
+    /**
+     * Returns true if no more splits will be produced.
+     * For providers without splitting concept, always returns true.
+     * Aligned with flink-cdc SnapshotSplitAssigner.noMoreSplits() naming.
+     */
+    default boolean noMoreSplits() {
+        return true;
+    }
+
+    /** Splits produced but not yet consumed (FE-side backlog). */
+    default int pendingSplitCount() {
+        return 0;
+    }
+
+    /** Get the latest successfully observed source-log lag in bytes, or -1 before any observation. */
+    default long getLagBytes() {
+        return -1;
+    }
+
+    /** Get the source event timestamp at the committed offset as Unix seconds, or 0 if unavailable. */
+    default long getLastSourceEventTimestampSeconds() {
+        return 0;
+    }
+
+    /** Discard a lag value that was calculated from an offset explicitly replaced by the user. */
+    default void resetLag() {}
+
+    /** Get source lag as a numeric string for SHOW output. */
     default String getLag() {
-        return "";
+        return String.valueOf(getLagBytes());
     }
 
 }
-

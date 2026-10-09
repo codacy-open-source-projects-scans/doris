@@ -28,6 +28,7 @@ import org.apache.doris.catalog.KeysType;
 import org.apache.doris.common.MarkedCountDownLatch;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.util.ColumnsUtil;
+import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.policy.Policy;
 import org.apache.doris.policy.PolicyTypeEnum;
 import org.apache.doris.thrift.TColumn;
@@ -42,6 +43,7 @@ import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStorageFormat;
 import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.thrift.TStorageType;
+import org.apache.doris.thrift.TTabletRole;
 import org.apache.doris.thrift.TTabletSchema;
 import org.apache.doris.thrift.TTabletType;
 import org.apache.doris.thrift.TTaskType;
@@ -111,8 +113,6 @@ public class CreateReplicaTask extends AgentTask {
 
     private boolean disableAutoCompaction;
 
-    private boolean enableSingleReplicaCompaction;
-
     private boolean skipWriteIndexOnLoad;
 
     private String compactionPolicy;
@@ -132,6 +132,7 @@ public class CreateReplicaTask extends AgentTask {
     private boolean storeRowColumn;
 
     private BinlogConfig binlogConfig;
+    private TTabletRole tabletRole = TTabletRole.TABLET_ROLE_DATA;
     private List<Integer> clusterKeyUids;
 
     private Map<Object, Object> objectPool;
@@ -154,7 +155,6 @@ public class CreateReplicaTask extends AgentTask {
                              TCompressionType compressionType,
                              boolean enableUniqueKeyMergeOnWrite,
                              String storagePolicy, boolean disableAutoCompaction,
-                             boolean enableSingleReplicaCompaction,
                              boolean skipWriteIndexOnLoad,
                              String compactionPolicy,
                              long timeSeriesCompactionGoalSizeMbytes,
@@ -205,7 +205,6 @@ public class CreateReplicaTask extends AgentTask {
             }
         }
         this.disableAutoCompaction = disableAutoCompaction;
-        this.enableSingleReplicaCompaction = enableSingleReplicaCompaction;
         this.skipWriteIndexOnLoad = skipWriteIndexOnLoad;
         this.compactionPolicy = compactionPolicy;
         this.timeSeriesCompactionGoalSizeMbytes = timeSeriesCompactionGoalSizeMbytes;
@@ -284,6 +283,10 @@ public class CreateReplicaTask extends AgentTask {
         this.baseSchemaHash = baseSchemaHash;
     }
 
+    public void setTabletRole(TTabletRole tabletRole) {
+        this.tabletRole = tabletRole;
+    }
+
     public void setStorageFormat(TStorageFormat storageFormat) {
         this.storageFormat = storageFormat;
     }
@@ -312,17 +315,22 @@ public class CreateReplicaTask extends AgentTask {
         int deleteSign = -1;
         int sequenceCol = -1;
         int versionCol = -1;
+        int commitTsoCol = -1;
+        int rowLsnCol = -1;
         List<TColumn> tColumns = null;
         Object tCols = objectPool.get(columns);
         if (tCols != null) {
             tColumns = (List<TColumn>) tCols;
         } else {
             tColumns = new ArrayList<>();
+            Set<String> bfIndexColumns = Index.getBfIndexColumns(indexes);
             for (int i = 0; i < columns.size(); i++) {
                 Column column = columns.get(i);
                 TColumn tColumn = ColumnToThrift.toThrift(column);
+                String nonShadowColumnName = column.getNonShadowName();
                 // is bloom filter column
-                if (bfColumns != null && bfColumns.contains(column.getName())) {
+                if ((bfColumns != null && bfColumns.contains(nonShadowColumnName))
+                        || bfIndexColumns.contains(nonShadowColumnName)) {
                     tColumn.setIsBloomFilterColumn(true);
                 }
                 // when doing schema change, some modified column has a prefix in name.
@@ -347,11 +355,19 @@ public class CreateReplicaTask extends AgentTask {
             if (column.isVersionColumn()) {
                 versionCol = i;
             }
+            if (column.isCommitTsoColumn()) {
+                commitTsoCol = i;
+            }
+            if (column.isRowLsnColumn()) {
+                rowLsnCol = i;
+            }
         }
         tSchema.setColumns(tColumns);
         tSchema.setDeleteSignIdx(deleteSign);
         tSchema.setSequenceColIdx(sequenceCol);
         tSchema.setVersionColIdx(versionCol);
+        tSchema.setCommitTsoColIdx(commitTsoCol);
+        tSchema.setRowLsnColIdx(rowLsnCol);
         tSchema.setRowStoreColCids(rowStoreColumnUniqueIds);
         if (!CollectionUtils.isEmpty(clusterKeyUids)) {
             tSchema.setClusterKeyUids(clusterKeyUids);
@@ -373,13 +389,12 @@ public class CreateReplicaTask extends AgentTask {
             tSchema.setIndexes(tIndexes);
         }
 
-        if (bfColumns != null) {
+        if (bfColumns != null && !bfColumns.isEmpty()) {
             tSchema.setBloomFilterFpp(bfFpp);
         }
         tSchema.setIsInMemory(isInMemory);
         tSchema.setDisableAutoCompaction(disableAutoCompaction);
         tSchema.setVariantEnableFlattenNested(variantEnableFlattenNested);
-        tSchema.setEnableSingleReplicaCompaction(enableSingleReplicaCompaction);
         tSchema.setSkipWriteIndexOnLoad(skipWriteIndexOnLoad);
         tSchema.setStoreRowColumn(storeRowColumn);
         tSchema.setRowStorePageSize(rowStorePageSize);
@@ -443,7 +458,8 @@ public class CreateReplicaTask extends AgentTask {
         createTabletReq.setTabletType(tabletType);
         createTabletReq.setCompressionType(compressionType);
         createTabletReq.setEnableUniqueKeyMergeOnWrite(enableUniqueKeyMergeOnWrite);
-        createTabletReq.setCompactionPolicy(compactionPolicy);
+        createTabletReq.setCompactionPolicy(tabletRole == TTabletRole.TABLET_ROLE_ROW_BINLOG
+                ? PropertyAnalyzer.BINLOG_COMPACTION_POLICY : compactionPolicy);
         createTabletReq.setTimeSeriesCompactionGoalSizeMbytes(timeSeriesCompactionGoalSizeMbytes);
         createTabletReq.setTimeSeriesCompactionFileCountThreshold(timeSeriesCompactionFileCountThreshold);
         createTabletReq.setTimeSeriesCompactionTimeThresholdSeconds(timeSeriesCompactionTimeThresholdSeconds);
@@ -455,6 +471,8 @@ public class CreateReplicaTask extends AgentTask {
         if (binlogConfig != null) {
             createTabletReq.setBinlogConfig(binlogConfig.toThrift());
         }
+
+        createTabletReq.setTabletRole(tabletRole);
 
         return createTabletReq;
     }

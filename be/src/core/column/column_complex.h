@@ -63,11 +63,10 @@ public:
 
     void insert_binary_data(const char* pos, size_t length) {
         insert_default();
-        value_type* pvalue = &get_element(size() - 1);
         if (!length) {
-            *pvalue = *reinterpret_cast<const value_type*>(pos);
             return;
         }
+        value_type* pvalue = &get_element(size() - 1);
 
         if constexpr (T == TYPE_BITMAP) {
             pvalue->deserialize(pos);
@@ -260,7 +259,7 @@ MutableColumnPtr ColumnComplexType<T>::clone_resized(size_t size) const {
     auto res = this->create();
 
     if (size > 0) {
-        auto& new_col = assert_cast<Self&>(*res);
+        auto& new_col = *res;
         size_t count = std::min(size, data.size());
         new_col.insert_range_from(*this, 0, count);
         if (size > count) {

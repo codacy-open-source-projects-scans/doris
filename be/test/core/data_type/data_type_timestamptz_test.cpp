@@ -21,6 +21,7 @@
 #include <gtest/gtest-test-part.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -28,7 +29,9 @@
 #include "core/block/block.h"
 #include "core/data_type/common_data_type_serder_test.h"
 #include "core/data_type/common_data_type_test.h"
+#include "core/data_type/data_type_nullable.h"
 #include "core/data_type/data_type_string.h"
+#include "core/data_type/data_type_struct.h"
 #include "core/data_type/data_type_varbinary.h"
 #include "core/data_type_serde/data_type_serde.h"
 #include "core/types.h"
@@ -61,6 +64,22 @@ TEST_F(DataTypeTimeStampTzTest, test_normal) {
     auto other_type = std::make_shared<DataTypeTimeStampTz>();
     EXPECT_TRUE(type->equals(*other_type));
     EXPECT_TRUE(type->equals_ignore_precision(*other_type));
+}
+
+TEST_F(DataTypeTimeStampTzTest, test_equals_respects_nullable) {
+    auto timestamptz_3 = std::make_shared<DataTypeTimeStampTz>(3);
+    auto timestamptz_6 = std::make_shared<DataTypeTimeStampTz>(6);
+    auto nullable_timestamptz_6 = make_nullable(timestamptz_6);
+
+    EXPECT_FALSE(timestamptz_3->equals(*timestamptz_6));
+    EXPECT_FALSE(timestamptz_6->equals(*nullable_timestamptz_6));
+    EXPECT_FALSE(nullable_timestamptz_6->equals(*timestamptz_6));
+
+    auto struct_timestamptz = std::make_shared<DataTypeStruct>(DataTypes {timestamptz_6});
+    auto struct_nullable_timestamptz =
+            std::make_shared<DataTypeStruct>(DataTypes {nullable_timestamptz_6});
+    EXPECT_FALSE(struct_timestamptz->equals(*struct_nullable_timestamptz));
+    EXPECT_FALSE(struct_nullable_timestamptz->equals(*struct_timestamptz));
 }
 
 TEST_F(DataTypeTimeStampTzTest, test_serder) {
@@ -99,6 +118,17 @@ TEST_F(DataTypeTimeStampTzTest, test_serder) {
         StringRef str {"2024-01-01 12:abc:00 +08:00"};
         EXPECT_FALSE(serder->from_string_strict_mode(str, *column, options).ok());
     }
+}
+
+TEST_F(DataTypeTimeStampTzTest, test_to_string_negative_sub_hour_offset) {
+    cctz::time_zone time_zone = cctz::fixed_time_zone(std::chrono::minutes(-30));
+
+    DateV2Value<DateTimeV2ValueType> local_dt;
+    local_dt.unchecked_set_time(2023, 12, 31, 23, 45, 0, 0);
+
+    TimestampTzValue value;
+    EXPECT_TRUE(value.from_datetime(local_dt, time_zone, 6, 6));
+    EXPECT_EQ(value.to_string(time_zone), "2023-12-31 23:45:00.000000-00:30");
 }
 
 TEST_F(DataTypeTimeStampTzTest, test_sort) {

@@ -21,12 +21,11 @@ import org.apache.doris.nereids.analyzer.UnboundOneRowRelation;
 import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.analyzer.UnboundTVFRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCatalogRelation;
-import org.apache.doris.nereids.trees.plans.logical.LogicalDeferMaterializeOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalEmptyRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan;
-import org.apache.doris.nereids.trees.plans.logical.LogicalHudiScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOdbcScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalOlapTableStreamScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOneRowRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSchemaScan;
@@ -35,10 +34,8 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalTestScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalWorkTableReference;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEConsumer;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCatalogRelation;
-import org.apache.doris.nereids.trees.plans.physical.PhysicalDeferMaterializeOlapScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalEmptyRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalFileScan;
-import org.apache.doris.nereids.trees.plans.physical.PhysicalHudiScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalOdbcScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalOlapScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalOneRowRelation;
@@ -96,21 +93,12 @@ public interface RelationVisitor<R, C> {
         return visitLogicalCatalogRelation(fileScan, context);
     }
 
-    default R visitLogicalHudiScan(LogicalHudiScan fileScan, C context) {
-        return visitLogicalFileScan(fileScan, context);
-    }
-
     default R visitLogicalOdbcScan(LogicalOdbcScan odbcScan, C context) {
         return visitLogicalCatalogRelation(odbcScan, context);
     }
 
     default R visitLogicalOlapScan(LogicalOlapScan olapScan, C context) {
         return visitLogicalCatalogRelation(olapScan, context);
-    }
-
-    default R visitLogicalDeferMaterializeOlapScan(
-            LogicalDeferMaterializeOlapScan deferMaterializeOlapScan, C context) {
-        return visitLogicalCatalogRelation(deferMaterializeOlapScan, context);
     }
 
     default R visitLogicalOneRowRelation(LogicalOneRowRelation oneRowRelation, C context) {
@@ -133,6 +121,10 @@ public interface RelationVisitor<R, C> {
         return visitLogicalRelation(logicalWorkTableReference, context);
     }
 
+    default R visitLogicalOlapTableStreamScan(LogicalOlapTableStreamScan olapScan, C context) {
+        return visitLogicalCatalogRelation(olapScan, context);
+    }
+
     // *******************************
     // physical relations
     // *******************************
@@ -145,21 +137,12 @@ public interface RelationVisitor<R, C> {
         return visitPhysicalCatalogRelation(fileScan, context);
     }
 
-    default R visitPhysicalHudiScan(PhysicalHudiScan hudiScan, C context) {
-        return visitPhysicalFileScan(hudiScan, context);
-    }
-
     default R visitPhysicalOdbcScan(PhysicalOdbcScan odbcScan, C context) {
         return visitPhysicalCatalogRelation(odbcScan, context);
     }
 
     default R visitPhysicalOlapScan(PhysicalOlapScan olapScan, C context) {
         return visitPhysicalCatalogRelation(olapScan, context);
-    }
-
-    default R visitPhysicalDeferMaterializeOlapScan(
-            PhysicalDeferMaterializeOlapScan deferMaterializeOlapScan, C context) {
-        return visitPhysicalCatalogRelation(deferMaterializeOlapScan, context);
     }
 
     default R visitPhysicalWorkTableReference(PhysicalWorkTableReference workTableReference, C context) {

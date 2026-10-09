@@ -18,7 +18,7 @@
 package org.apache.doris.job.offset.s3;
 
 import org.apache.doris.common.util.DebugPointUtil;
-import org.apache.doris.datasource.property.storage.StorageProperties;
+import org.apache.doris.datasource.storage.StorageAdapter;
 import org.apache.doris.filesystem.FileEntry;
 import org.apache.doris.filesystem.FileSystem;
 import org.apache.doris.filesystem.GlobListing;
@@ -49,8 +49,18 @@ import java.util.stream.Collectors;
 
 @Log4j2
 public class S3SourceOffsetProvider implements SourceOffsetProvider {
-    S3Offset currentOffset;
-    String maxEndFile;
+    private final boolean onceMode;
+    private volatile S3Offset noMoreFilesAfterOffset;
+    volatile S3Offset currentOffset;
+    volatile String maxEndFile;
+
+    public S3SourceOffsetProvider() {
+        this.onceMode = false;
+    }
+
+    public S3SourceOffsetProvider(StreamingJobProperties jobProperties) {
+        this.onceMode = jobProperties.isS3OnceMode();
+    }
 
     @Override
     public String getSourceType() {
@@ -64,10 +74,10 @@ public class S3SourceOffsetProvider implements SourceOffsetProvider {
         S3Offset offset = new S3Offset();
         String startFile = currentOffset == null ? null : currentOffset.endFile;
         String filePath = null;
-        StorageProperties storageProperties = StorageProperties.createPrimary(copiedProps);
-        try (FileSystem fileSystem = FileSystemFactory.getFileSystem(storageProperties)) {
-            String uri = storageProperties.validateAndGetUri(copiedProps);
-            filePath = storageProperties.validateAndNormalizeUri(uri);
+        StorageAdapter storageAdapter = StorageAdapter.of(copiedProps);
+        try (FileSystem fileSystem = FileSystemFactory.getFileSystem(storageAdapter)) {
+            String uri = storageAdapter.validateAndGetUri(copiedProps);
+            filePath = storageAdapter.validateAndNormalizeUri(uri);
             GlobListing globListing = fileSystem.globListWithLimit(Location.of(filePath), startFile,
                     jobProps.getS3BatchBytes(), jobProps.getS3BatchFiles());
 
@@ -95,6 +105,7 @@ public class S3SourceOffsetProvider implements SourceOffsetProvider {
                 offset.setEndFile(lastFile);
                 offset.setFileNum(rfiles.size());
                 maxEndFile = globListing.getMaxFile();
+                offset.setLastBatch(onceMode && lastFile.equals(globListing.getMaxFile()));
             } else {
                 throw new RuntimeException("No new files found in path: " + filePath);
             }
@@ -129,7 +140,7 @@ public class S3SourceOffsetProvider implements SourceOffsetProvider {
     public InsertIntoTableCommand rewriteTvfParams(InsertIntoTableCommand originCommand,
             Offset runningOffset, long taskId) {
         S3Offset offset = (S3Offset) runningOffset;
-        Map<String, String> props = new HashMap<>();
+        Map<String, String> props = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
         // rewrite plan
         Plan rewritePlan = originCommand.getParsedPlan().get().rewriteUp(plan -> {
             if (plan instanceof UnboundTVFRelation) {
@@ -158,16 +169,20 @@ public class S3SourceOffsetProvider implements SourceOffsetProvider {
     public void fetchRemoteMeta(Map<String, String> properties) throws Exception {
         Map<String, String> copiedProps = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
         copiedProps.putAll(properties);
-        StorageProperties storageProperties = StorageProperties.createPrimary(copiedProps);
-        String startFile = currentOffset == null ? null : currentOffset.endFile;
-        try (FileSystem fileSystem = FileSystemFactory.getFileSystem(storageProperties)) {
-            String uri = storageProperties.validateAndGetUri(copiedProps);
-            String filePath = storageProperties.validateAndNormalizeUri(uri);
+        StorageAdapter storageAdapter = StorageAdapter.of(copiedProps);
+        S3Offset offsetAtScan = currentOffset;
+        String startFile = offsetAtScan == null ? null : offsetAtScan.endFile;
+        try (FileSystem fileSystem = FileSystemFactory.getFileSystem(storageAdapter)) {
+            String uri = storageAdapter.validateAndGetUri(copiedProps);
+            String filePath = storageAdapter.validateAndNormalizeUri(uri);
             // debug point: simulate globListWithLimit throwing an IOException (e.g. S3 auth error)
             if (DebugPointUtil.isEnable("S3SourceOffsetProvider.fetchRemoteMeta.error")) {
                 throw new java.io.IOException("debug point: simulated S3 auth error");
             }
             GlobListing globListing = fileSystem.globListWithLimit(Location.of(filePath), startFile, 1, 1);
+            if (onceMode) {
+                noMoreFilesAfterOffset = globListing.getFiles().isEmpty() ? offsetAtScan : null;
+            }
             if (!globListing.getFiles().isEmpty() && StringUtils.isNotEmpty(globListing.getMaxFile())) {
                 maxEndFile = globListing.getMaxFile();
             }
@@ -176,6 +191,9 @@ public class S3SourceOffsetProvider implements SourceOffsetProvider {
 
     @Override
     public boolean hasMoreDataToConsume() {
+        if (hasReachedEnd()) {
+            return false;
+        }
         if (currentOffset == null || currentOffset.endFile == null) {
             return true;
         }
@@ -184,6 +202,12 @@ public class S3SourceOffsetProvider implements SourceOffsetProvider {
             return true;
         }
         return false;
+    }
+
+    @Override
+    public boolean hasReachedEnd() {
+        S3Offset offset = currentOffset;
+        return onceMode && offset != null && (offset.isLastBatch() || noMoreFilesAfterOffset == offset);
     }
 
     @Override

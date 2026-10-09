@@ -78,6 +78,7 @@ public class Util {
         TYPE_STRING_MAP.put(PrimitiveType.DATETIME, "datetime");
         TYPE_STRING_MAP.put(PrimitiveType.DATEV2, "datev2");
         TYPE_STRING_MAP.put(PrimitiveType.DATETIMEV2, "datetimev2");
+        TYPE_STRING_MAP.put(PrimitiveType.TIMESTAMP_NS, "timestamp_ns");
         TYPE_STRING_MAP.put(PrimitiveType.TIMESTAMPTZ, "timestamptz");
         TYPE_STRING_MAP.put(PrimitiveType.CHAR, "char(%d)");
         TYPE_STRING_MAP.put(PrimitiveType.VARCHAR, "varchar(%d)");
@@ -111,6 +112,21 @@ public class Util {
                 return r;
             }
         };
+    }
+
+    public static void updateMessageDigest(MessageDigest digest, byte value) {
+        digest.update(value);
+    }
+
+    public static void updateMessageDigest(MessageDigest digest, long value) {
+        digest.update((byte) (value >>> 56));
+        digest.update((byte) (value >>> 48));
+        digest.update((byte) (value >>> 40));
+        digest.update((byte) (value >>> 32));
+        digest.update((byte) (value >>> 24));
+        digest.update((byte) (value >>> 16));
+        digest.update((byte) (value >>> 8));
+        digest.update((byte) value);
     }
 
 
@@ -237,6 +253,32 @@ public class Util {
         } catch (NumberFormatException e) {
             throw new AnalysisException(hintMsg);
         }
+    }
+
+    public static boolean getBooleanPropertyOrDefault(Map<String, String> properties,
+            String propertyName, boolean defaultValue) throws AnalysisException {
+        if (!properties.containsKey(propertyName)) {
+            return defaultValue;
+        }
+        return parseBooleanProperty(properties.get(propertyName), propertyName);
+    }
+
+    public static Boolean getOptionalBooleanProperty(Map<String, String> properties,
+            String propertyName) throws AnalysisException {
+        if (!properties.containsKey(propertyName)) {
+            return null;
+        }
+        return parseBooleanProperty(properties.get(propertyName), propertyName);
+    }
+
+    public static boolean parseBooleanProperty(String value, String propertyName) throws AnalysisException {
+        if ("true".equalsIgnoreCase(value)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(value)) {
+            return false;
+        }
+        throw new AnalysisException(propertyName + " should be a boolean");
     }
 
     // not support encode negative value now
@@ -389,9 +431,6 @@ public class Util {
             return TFileFormatType.FORMAT_WAL;
         } else if (lowerFileFormat.equals(FileFormatConstants.FORMAT_ARROW)) {
             return TFileFormatType.FORMAT_ARROW;
-        } else if (lowerFileFormat.equals(FileFormatConstants.FORMAT_NATIVE)) {
-            // Doris Native binary columnar format
-            return TFileFormatType.FORMAT_NATIVE;
         } else {
             return TFileFormatType.FORMAT_UNKNOWN;
         }
@@ -462,6 +501,16 @@ public class Util {
                 || fileFormatType == TFileFormatType.FORMAT_CSV_LZO
                 || fileFormatType == TFileFormatType.FORMAT_CSV_LZOP
                 || fileFormatType == TFileFormatType.FORMAT_CSV_PLAIN;
+    }
+
+    public static boolean isCasePreservingFormat(String formatName) {
+        return !Strings.isNullOrEmpty(formatName)
+                && isCasePreservingFormat(getFileFormatTypeFromName(formatName));
+    }
+
+    public static boolean isCasePreservingFormat(TFileFormatType fileFormatType) {
+        return fileFormatType == TFileFormatType.FORMAT_JSON
+                || fileFormatType == TFileFormatType.FORMAT_ARROW;
     }
 
     public static void logAndThrowRuntimeException(Logger logger, String msg, Throwable e) {

@@ -41,6 +41,7 @@ import org.apache.doris.qe.StmtExecutor;
 import com.google.common.base.Preconditions;
 import org.apache.commons.lang3.StringUtils;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -200,6 +201,13 @@ public class AlterJobCommand extends AlterCommand implements ForwardWithSync, Ne
                     "The database property cannot be modified in ALTER JOB");
         }
 
+        if (sourceProperties.containsKey(DataSourceConfigKeys.SCHEMA)) {
+            Preconditions.checkArgument(Objects.equals(
+                    originSourceProperties.get(DataSourceConfigKeys.SCHEMA),
+                    sourceProperties.get(DataSourceConfigKeys.SCHEMA)),
+                    "The schema property cannot be modified in ALTER JOB");
+        }
+
         if (sourceProperties.containsKey(DataSourceConfigKeys.INCLUDE_TABLES)) {
             Preconditions.checkArgument(Objects.equals(
                     originSourceProperties.get(DataSourceConfigKeys.INCLUDE_TABLES),
@@ -270,11 +278,19 @@ public class AlterJobCommand extends AlterCommand implements ForwardWithSync, Ne
     }
 
     private void validateProps(StreamingInsertJob streamingJob) throws AnalysisException {
-        StreamingJobProperties jobProperties = new StreamingJobProperties(properties);
-        jobProperties.validate();
-        if (jobProperties.getOffsetProperty() != null) {
-            streamingJob.validateAlterOffset(jobProperties.getOffsetProperty());
-            streamingJob.validateOffset(jobProperties.getOffsetProperty());
+        StreamingJobProperties originJobProperties =
+                new StreamingJobProperties(streamingJob.getProperties());
+        Map<String, String> mergedProperties = new HashMap<>(streamingJob.getProperties());
+        mergedProperties.putAll(properties);
+        StreamingJobProperties updatedJobProperties = new StreamingJobProperties(mergedProperties);
+        updatedJobProperties.validate();
+        if (!originJobProperties.getS3IngestionMode().equals(updatedJobProperties.getS3IngestionMode())) {
+            throw new AnalysisException("s3.ingestion_mode cannot be altered");
+        }
+        String offset = properties.get(StreamingJobProperties.OFFSET_PROPERTY);
+        if (offset != null) {
+            streamingJob.validateAlterOffset(offset);
+            streamingJob.validateOffset(offset);
         }
     }
 
@@ -301,7 +317,8 @@ public class AlterJobCommand extends AlterCommand implements ForwardWithSync, Ne
                         "The uri property cannot be modified in ALTER JOB");
                 break;
             case "cdc_stream":
-                // type, jdbc_url, database, schema, table identify the source and cannot be changed.
+                // type, jdbc_url, database, schema, and table identify the source and cannot be changed.
+                // snapshot_* are materialized into split metadata on first fetch and never re-read.
                 // slot_name / publication_name are fixed at create time to keep ownership stable.
                 // user, password, driver_url, driver_class, etc. are modifiable (credential rotation).
                 for (String unmodifiable : new String[] {
@@ -310,6 +327,9 @@ public class AlterJobCommand extends AlterCommand implements ForwardWithSync, Ne
                         DataSourceConfigKeys.DATABASE,
                         DataSourceConfigKeys.SCHEMA,
                         DataSourceConfigKeys.TABLE,
+                        DataSourceConfigKeys.SNAPSHOT_SPLIT_KEY,
+                        DataSourceConfigKeys.SNAPSHOT_SPLIT_SIZE,
+                        DataSourceConfigKeys.SNAPSHOT_PARALLELISM,
                         DataSourceConfigKeys.SLOT_NAME,
                         DataSourceConfigKeys.PUBLICATION_NAME}) {
                     Preconditions.checkArgument(
@@ -327,7 +347,7 @@ public class AlterJobCommand extends AlterCommand implements ForwardWithSync, Ne
     private Pair<List<String>, UnboundTVFRelation> getTargetTableAndTvf(String sql) throws AnalysisException {
         LogicalPlan logicalPlan = new NereidsParser().parseSingle(sql);
         if (!(logicalPlan instanceof InsertIntoTableCommand)) {
-            throw new AnalysisException("Only support insert command");
+            throw new AnalysisException("Streaming jobs only support INSERT statements");
         }
         LogicalPlan logicalQuery = ((InsertIntoTableCommand) logicalPlan).getLogicalQuery();
         List<String> targetTable = InsertUtils.getTargetTableQualified(logicalQuery, ConnectContext.get());

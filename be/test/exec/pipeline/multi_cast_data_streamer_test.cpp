@@ -24,6 +24,7 @@
 
 #include "exec/pipeline/dependency.h"
 #include "exec/spill/spill_file_manager.h"
+#include "io/fs/local_file_system.h"
 #include "runtime/runtime_profile.h"
 #include "storage/olap_define.h"
 #include "testutil/column_helper.h"
@@ -64,8 +65,6 @@ public:
             ADD_COUNTER_WITH_LEVEL(custom_profile.get(), "SpillReadRows", TUnit::UNIT, 1);
             ADD_COUNTER_WITH_LEVEL(custom_profile.get(), "SpillReadFileCount", TUnit::UNIT, 1);
             ADD_COUNTER_WITH_LEVEL(custom_profile.get(), "SpillWriteFileTotalCount", TUnit::UNIT,
-                                   1);
-            ADD_COUNTER_WITH_LEVEL(custom_profile.get(), "SpillWriteFileCurrentCount", TUnit::UNIT,
                                    1);
             ADD_COUNTER_WITH_LEVEL(custom_profile.get(), "SpillWriteFileCurrentBytes", TUnit::UNIT,
                                    1);
@@ -111,8 +110,6 @@ public:
                                    TUnit::UNIT, 1);
             ADD_COUNTER_WITH_LEVEL(source_custom_profiles[i].get(), "SpillWriteFileCurrentBytes",
                                    TUnit::BYTES, 1);
-            ADD_COUNTER_WITH_LEVEL(source_custom_profiles[i].get(), "SpillWriteFileCurrentCount",
-                                   TUnit::UNIT, 1);
             multi_cast_data_streamer->set_source_profile(i, source_profiles[i].get());
         }
 
@@ -316,13 +313,16 @@ TEST_F(MultiCastDataStreamerTest, SpillTest) {
     output2.join();
     output3.join();
 
-    ASSERT_EQ(multi_cast_data_streamer->_multi_cast_blocks.size(), 0);
-    ASSERT_EQ(multi_cast_data_streamer->_cached_blocks[0].size(), 0);
-    ASSERT_EQ(multi_cast_data_streamer->_cached_blocks[1].size(), 0);
-    ASSERT_EQ(multi_cast_data_streamer->_cached_blocks[2].size(), 0);
-    ASSERT_EQ(multi_cast_data_streamer->_spill_readers[0].size(), 0);
-    ASSERT_EQ(multi_cast_data_streamer->_spill_readers[1].size(), 0);
-    ASSERT_EQ(multi_cast_data_streamer->_spill_readers[2].size(), 0);
+    {
+        LockGuard l(multi_cast_data_streamer->_mutex);
+        ASSERT_EQ(multi_cast_data_streamer->_multi_cast_blocks.size(), 0);
+        ASSERT_EQ(multi_cast_data_streamer->_cached_blocks[0].size(), 0);
+        ASSERT_EQ(multi_cast_data_streamer->_cached_blocks[1].size(), 0);
+        ASSERT_EQ(multi_cast_data_streamer->_cached_blocks[2].size(), 0);
+        ASSERT_EQ(multi_cast_data_streamer->_spill_readers[0].size(), 0);
+        ASSERT_EQ(multi_cast_data_streamer->_spill_readers[1].size(), 0);
+        ASSERT_EQ(multi_cast_data_streamer->_spill_readers[2].size(), 0);
+    }
 
     auto debug_string = multi_cast_data_streamer->debug_string();
     EXPECT_TRUE(debug_string.find("MemSize:") != std::string::npos);

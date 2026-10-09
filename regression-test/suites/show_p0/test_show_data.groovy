@@ -22,10 +22,10 @@ suite("test_show_data") {
 
     def jdbcUrlWithoutDbStr = (context.config.jdbcUrl).split(context.config.defaultDb)
     logger.info("jdbcUrlWithoutDbStr:${jdbcUrlWithoutDbStr}");
-    def result2 = connect(context.config.jdbcUser, context.config.jdbcPassword, jdbcUrlWithoutDbStr[0]) {
+    def result2 = connectToDoris(context.config.jdbcUser, context.config.jdbcPassword, jdbcUrlWithoutDbStr[0]) {
         sql """show data;"""
     }
 
     assertTrue(result2.size() > 0);
-    assertTrue(result2[0].size() == 6);
+    assertTrue(result2[0].size() == 7);
 }

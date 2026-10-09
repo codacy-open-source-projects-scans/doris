@@ -30,7 +30,9 @@ suite("nereids_scalar_fn_U") {
 	qt_sql_unix_timestamp_Date "select unix_timestamp(kdt) from fn_test order by kdt"
 	qt_sql_unix_timestamp_Date_notnull "select unix_timestamp(kdt) from fn_test_not_nullable order by kdt"
 	qt_sql_unix_timestamp_DateTimeV2 "select unix_timestamp(kdtmv2s1) from fn_test order by kdtmv2s1"
+	qt_sql_unix_timestamp_TimestampNs "select unix_timestamp(ktsns) from fn_test order by ktsns"
 	qt_sql_unix_timestamp_DateTimeV2_notnull "select unix_timestamp(kdtmv2s1) from fn_test_not_nullable order by kdtmv2s1"
+	qt_sql_unix_timestamp_TimestampNs_notnull "select unix_timestamp(ktsns) from fn_test_not_nullable order by ktsns"
 	qt_sql_unix_timestamp_DateV2 "select unix_timestamp(kdtv2) from fn_test order by kdtv2"
 	qt_sql_unix_timestamp_DateV2_notnull "select unix_timestamp(kdtv2) from fn_test_not_nullable order by kdtv2"
 	test {
@@ -62,6 +64,8 @@ suite("nereids_scalar_fn_U") {
 
 	def result = sql """select uniform(1, 100, random()*10000) from numbers("number" = "10");"""
 	assertTrue(result.size() == 10)
+	def doubleResult = sql """select uniform(1.23, 100.100, random()*10000) from numbers("number" = "10");"""
+	assertTrue(doubleResult.size() == 10)
 	test {
 		sql """select uniform(100, 1, random()*10000) from numbers("number" = "10");"""
 		exception "uniform's min should be less than max"

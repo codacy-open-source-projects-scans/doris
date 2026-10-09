@@ -40,8 +40,10 @@ import java.util.stream.Collectors;
 public class VariantType extends PrimitiveType {
 
     public static final VariantType INSTANCE = new VariantType(0);
-
     public static final int WIDTH = 24;
+
+    public static final String UNSUPPORTED_ORDERING_COMPARISON_MESSAGE =
+            "Variant does not support ordering/comparison, CAST to a concrete type first";
 
     private final int variantMaxSubcolumnsCount;
 
@@ -117,6 +119,11 @@ public class VariantType extends PrimitiveType {
     }
 
     @Override
+    public boolean isInjectiveCastTo(DataType target) {
+        return target instanceof VariantType;
+    }
+
+    @Override
     public DataType conversion() {
         return new VariantType(predefinedFields.stream().map(VariantField::conversion)
                                 .collect(Collectors.toList()), variantMaxSubcolumnsCount, enableTypedPathsToSparse,
@@ -181,9 +188,15 @@ public class VariantType extends PrimitiveType {
                                     .append(String.valueOf(variantMaxSparseColumnStatisticsSize))
                                     .append("\"");
             sb.append(",");
+            // Output at least 1 for backward compatibility: old data without this parameter defaults to 0
             sb.append("\"variant_sparse_hash_shard_count\" = \"")
-                                    .append(String.valueOf(variantSparseHashShardCount))
+                                    .append(String.valueOf(Math.max(1, variantSparseHashShardCount)))
                                     .append("\"");
+        }
+        if (enableNestedGroup) {
+            sb.append(",");
+            sb.append("\"variant_enable_nested_group\" = \"")
+                    .append(String.valueOf(enableNestedGroup)).append("\"");
         }
         sb.append(")>");
         return sb.toString();
@@ -287,4 +300,35 @@ public class VariantType extends PrimitiveType {
     public int getVariantDocShardCount() {
         return variantDocShardCount;
     }
+
+    public boolean getEnableNestedGroup() {
+        return enableNestedGroup;
+    }
+
+    /** Whether the Variant V2 execution kernel can convert this source type. */
+    public static boolean isSupportedComputeV2CastSource(DataType dataType) {
+        if (dataType.isNullType() || dataType.isJsonType()) {
+            return true;
+        }
+        if (dataType instanceof VariantType) {
+            // Master is V2-only. Ordinary Variant and the connector execution marker share the
+            // same runtime representation, regardless of storage-layout properties.
+            return true;
+        }
+        if (dataType instanceof ArrayType) {
+            return isSupportedComputeV2CastSource(((ArrayType) dataType).getItemType());
+        }
+        if (dataType instanceof DecimalV3Type) {
+            return ((DecimalV3Type) dataType).getPrecision()
+                    <= DecimalV3Type.MAX_DECIMAL128_PRECISION;
+        }
+        return dataType.isBooleanType()
+                || dataType.isIntegralType()
+                || dataType.isFloatLikeType()
+                || dataType.isDecimalV2Type()
+                || dataType.isDateLikeType()
+                || dataType.isStringLikeType()
+                || dataType.isIPType();
+    }
+
 }

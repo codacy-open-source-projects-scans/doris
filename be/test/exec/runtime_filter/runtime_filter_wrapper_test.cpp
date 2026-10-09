@@ -20,13 +20,13 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "core/data_type/data_type_bitmap.h"
+#include "core/data_type/data_type_date.h"
 #include "core/data_type/data_type_number.h"
-#include "exprs/bitmapfilter_predicate.h"
 #include "exprs/bloom_filter_func.h"
 #include "exprs/hybrid_set.h"
 #include "exprs/minmax_predicate.h"
 #include "testutil/column_helper.h"
+#include "util/raw_value.h"
 
 namespace doris {
 
@@ -53,8 +53,6 @@ TEST_F(RuntimeFilterWrapperTest, TestIn) {
     int64_t bloom_filter_size = 0;
     bool bloom_filter_size_calculated_by_ndv = true;
 
-    bool bitmap_filter_not_in = false;
-
     PMergeFilterRequest valid_request;
     RuntimeFilterParams params {
             .filter_id = filter_id,
@@ -66,13 +64,11 @@ TEST_F(RuntimeFilterWrapperTest, TestIn) {
             .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
             .bloom_filter_size = bloom_filter_size,
             .build_bf_by_runtime_size = build_bf_by_runtime_size,
-            .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-            .bitmap_filter_not_in = bitmap_filter_not_in};
+            .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
 
     auto wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
     EXPECT_EQ(wrapper->minmax_func(), nullptr);
     EXPECT_EQ(wrapper->bloom_filter_func(), nullptr);
-    EXPECT_EQ(wrapper->bitmap_filter_func(), nullptr);
     EXPECT_NE(wrapper->hybrid_set(), nullptr);
     EXPECT_FALSE(wrapper->build_bf_by_runtime_size());
     {
@@ -193,8 +189,6 @@ TEST_F(RuntimeFilterWrapperTest, TestInAssign) {
     int64_t bloom_filter_size = 0;
     bool bloom_filter_size_calculated_by_ndv = true;
 
-    bool bitmap_filter_not_in = false;
-
 #define APPLY_FOR_PRIMITIVE_TYPE(TYPE, value1, value2)                                             \
     {                                                                                              \
         static constexpr PrimitiveType column_return_type = PrimitiveType::TYPE;                   \
@@ -208,9 +202,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInAssign) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,                    \
                 .bloom_filter_size = bloom_filter_size,                                            \
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,                              \
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,        \
-                                                                                                   \
-                .bitmap_filter_not_in = bitmap_filter_not_in};                                     \
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};       \
         auto wrapper = std::make_shared<RuntimeFilterWrapper>(&params);                            \
         PMergeFilterRequest valid_request;                                                         \
         auto* in_filter = valid_request.mutable_in_filter();                                       \
@@ -240,6 +232,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInAssign) {
     APPLY_FOR_PRIMITIVE_BASE_TYPE(TYPE_DOUBLE);
     APPLY_FOR_PRIMITIVE_BASE_TYPE(TYPE_DATEV2);
     APPLY_FOR_PRIMITIVE_BASE_TYPE(TYPE_DATETIMEV2);
+    APPLY_FOR_PRIMITIVE_BASE_TYPE(TYPE_TIMESTAMP_NS);
     APPLY_FOR_PRIMITIVE_TYPE(TYPE_DATETIME, VecDateTimeValue(0, 3, 0, 0, 0, 2020, 1, 1),
                              VecDateTimeValue(0, 3, 0, 0, 0, 2020, 1, 2));
     APPLY_FOR_PRIMITIVE_TYPE(TYPE_DATE, VecDateTimeValue(0, 2, 0, 0, 0, 2020, 1, 1),
@@ -258,6 +251,35 @@ TEST_F(RuntimeFilterWrapperTest, TestInAssign) {
 #undef APPLY_FOR_PRIMITIVE_BASE_TYPE
 }
 
+TEST_F(RuntimeFilterWrapperTest, DateInFilterRoundTripPreservesBucketHash) {
+    RuntimeFilterParams params {.filter_id = 0,
+                                .filter_type = RuntimeFilterType::IN_FILTER,
+                                .column_return_type = TYPE_DATE,
+                                .null_aware = false,
+                                .max_in_num = 1};
+
+    VecDateTimeValue date(0, TIME_DATE, 0, 0, 0, 2026, 8, 30);
+    auto producer = std::make_shared<RuntimeFilterWrapper>(&params);
+    producer->hybrid_set()->insert(&date);
+
+    PMergeFilterRequest request;
+    ASSERT_TRUE(producer->to_protobuf(request.mutable_in_filter()).ok());
+    request.set_contain_null(false);
+    request.set_filter_type(PFilterType::IN_FILTER);
+
+    auto consumer = std::make_shared<RuntimeFilterWrapper>(&params);
+    ASSERT_TRUE(consumer->assign(request, nullptr).ok());
+    auto* iter = consumer->hybrid_set()->begin();
+    ASSERT_TRUE(iter->has_next());
+    const auto* assigned_date = static_cast<const VecDateTimeValue*>(iter->get_value());
+    EXPECT_EQ(assigned_date->type(), TIME_DATE);
+    EXPECT_EQ(*assigned_date, date);
+
+    auto hashes = consumer->get_or_compute_bucket_prune_hashes(std::make_shared<DataTypeDate>());
+    ASSERT_EQ(hashes->size(), 1);
+    EXPECT_EQ(hashes->front(), RawValue::zlib_crc32(&date, sizeof(date), TYPE_DATE, 0));
+}
+
 TEST_F(RuntimeFilterWrapperTest, TestMinMaxAssign) {
     int32_t filter_id = 0;
     RuntimeFilterType filter_type = RuntimeFilterType::MINMAX_FILTER;
@@ -270,8 +292,6 @@ TEST_F(RuntimeFilterWrapperTest, TestMinMaxAssign) {
     bool build_bf_by_runtime_size = true;
     int64_t bloom_filter_size = 0;
     bool bloom_filter_size_calculated_by_ndv = true;
-
-    bool bitmap_filter_not_in = false;
 
 #define APPLY_FOR_PRIMITIVE_TYPE(TYPE, value1, value2)                                       \
     {                                                                                        \
@@ -286,9 +306,7 @@ TEST_F(RuntimeFilterWrapperTest, TestMinMaxAssign) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,              \
                 .bloom_filter_size = bloom_filter_size,                                      \
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,                        \
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,  \
-                                                                                             \
-                .bitmap_filter_not_in = bitmap_filter_not_in};                               \
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv}; \
         auto wrapper = std::make_shared<RuntimeFilterWrapper>(&params);                      \
         PMergeFilterRequest valid_request;                                                   \
         auto* minmax_filter = valid_request.mutable_minmax_filter();                         \
@@ -323,6 +341,7 @@ TEST_F(RuntimeFilterWrapperTest, TestMinMaxAssign) {
     APPLY_FOR_PRIMITIVE_BASE_TYPE(TYPE_DOUBLE);
     APPLY_FOR_PRIMITIVE_BASE_TYPE(TYPE_DATEV2);
     APPLY_FOR_PRIMITIVE_BASE_TYPE(TYPE_DATETIMEV2);
+    APPLY_FOR_PRIMITIVE_BASE_TYPE(TYPE_TIMESTAMP_NS);
     APPLY_FOR_PRIMITIVE_TYPE(TYPE_DATETIME, VecDateTimeValue(0, 3, 0, 0, 0, 2020, 1, 1),
                              VecDateTimeValue(0, 3, 0, 0, 0, 2020, 1, 2));
     APPLY_FOR_PRIMITIVE_TYPE(TYPE_DATE, VecDateTimeValue(0, 2, 0, 0, 0, 2020, 1, 1),
@@ -359,8 +378,6 @@ TEST_F(RuntimeFilterWrapperTest, TestBloom) {
     int64_t bloom_filter_size = 0;
     bool bloom_filter_size_calculated_by_ndv = true;
 
-    bool bitmap_filter_not_in = false;
-
     std::shared_ptr<RuntimeFilterWrapper> wrapper;
     {
         bloom_filter_size = 256;
@@ -374,9 +391,7 @@ TEST_F(RuntimeFilterWrapperTest, TestBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_FALSE(wrapper->build_bf_by_runtime_size());
         EXPECT_EQ(wrapper->bloom_filter_func()->_bloom_filter_length,
@@ -394,9 +409,7 @@ TEST_F(RuntimeFilterWrapperTest, TestBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_EQ(wrapper->bloom_filter_func()->_bloom_filter_length,
                   runtime_bloom_filter_min_size);
@@ -420,9 +433,7 @@ TEST_F(RuntimeFilterWrapperTest, TestBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_TRUE(wrapper->build_bf_by_runtime_size());
         EXPECT_EQ(wrapper->bloom_filter_func()->_bloom_filter_length,
@@ -450,9 +461,7 @@ TEST_F(RuntimeFilterWrapperTest, TestBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_EQ(wrapper->bloom_filter_func()->_bloom_filter_length,
                   runtime_bloom_filter_min_size);
@@ -502,9 +511,7 @@ TEST_F(RuntimeFilterWrapperTest, TestBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         auto new_wrapper = std::make_shared<RuntimeFilterWrapper>(&new_params);
         EXPECT_TRUE(new_wrapper->assign(valid_request, &stream).ok());
 
@@ -524,9 +531,7 @@ TEST_F(RuntimeFilterWrapperTest, TestBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         auto new_wrapper = std::make_shared<RuntimeFilterWrapper>(&new_params);
         EXPECT_TRUE(new_wrapper->init(runtime_size).ok());
         EXPECT_EQ(new_wrapper->get_state(), RuntimeFilterWrapper::State::UNINITED);
@@ -574,8 +579,6 @@ TEST_F(RuntimeFilterWrapperTest, TestMinMax) {
     int64_t bloom_filter_size = 0;
     bool bloom_filter_size_calculated_by_ndv = true;
 
-    bool bitmap_filter_not_in = false;
-
     std::shared_ptr<RuntimeFilterWrapper> wrapper;
     // MinMax
     {
@@ -589,9 +592,7 @@ TEST_F(RuntimeFilterWrapperTest, TestMinMax) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         {
             wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
             EXPECT_TRUE(wrapper->init(80).ok());
@@ -658,9 +659,7 @@ TEST_F(RuntimeFilterWrapperTest, TestMinMax) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         {
             wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
             EXPECT_TRUE(wrapper->init(80).ok());
@@ -727,9 +726,7 @@ TEST_F(RuntimeFilterWrapperTest, TestMinMax) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         {
             wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
             EXPECT_TRUE(wrapper->init(80).ok());
@@ -785,115 +782,44 @@ TEST_F(RuntimeFilterWrapperTest, TestMinMax) {
     }
 }
 
-TEST_F(RuntimeFilterWrapperTest, TestBitMap) {
-    int32_t filter_id = 0;
-    RuntimeFilterType filter_type = RuntimeFilterType::BITMAP_FILTER;
-    bool null_aware = false;
-    PrimitiveType column_return_type = PrimitiveType::TYPE_INT;
-
-    int32_t max_in_num = 0;
-
-    int64_t runtime_bloom_filter_min_size = 64;
-    int64_t runtime_bloom_filter_max_size = 128;
-    bool build_bf_by_runtime_size = false;
-    int64_t bloom_filter_size = 0;
-    bool bloom_filter_size_calculated_by_ndv = true;
-
-    bool bitmap_filter_not_in = false;
-
-    RuntimeFilterParams params {
-            .filter_id = filter_id,
-            .filter_type = filter_type,
-            .column_return_type = column_return_type,
-            .null_aware = null_aware,
-            .max_in_num = max_in_num,
-            .runtime_bloom_filter_min_size = runtime_bloom_filter_min_size,
-            .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
-            .bloom_filter_size = bloom_filter_size,
-            .build_bf_by_runtime_size = build_bf_by_runtime_size,
-            .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-            .bitmap_filter_not_in = bitmap_filter_not_in};
-
-    std::shared_ptr<RuntimeFilterWrapper> wrapper;
-    {
-        wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
-        EXPECT_TRUE(wrapper->init(80).ok());
-        EXPECT_EQ(wrapper->get_state(), RuntimeFilterWrapper::State::UNINITED);
-        wrapper->check_state({RuntimeFilterWrapper::State::UNINITED});
-        EXPECT_EQ(wrapper->bitmap_filter_func()->size(), 0);
-    }
-    {
-        // Insert
-        DataTypePtr bitmap_data_type(std::make_shared<DataTypeBitMap>());
-        auto bitmap_column = bitmap_data_type->create_column();
-        std::vector<BitmapValue>& container = ((ColumnBitmap*)bitmap_column.get())->get_data();
-        for (int i = 0; i < 1024; ++i) {
-            BitmapValue bv;
-            bv.add(i);
-            container.push_back(bv);
+TEST_F(RuntimeFilterWrapperTest, TestInOrBloomLazyInitialization) {
+    for (bool build_by_runtime_size : {false, true}) {
+        RuntimeFilterParams params {.filter_id = 0,
+                                    .filter_type = RuntimeFilterType::IN_OR_BLOOM_FILTER,
+                                    .column_return_type = TYPE_INT,
+                                    .null_aware = false,
+                                    .max_in_num = 16,
+                                    .runtime_bloom_filter_min_size = 64,
+                                    .runtime_bloom_filter_max_size = 128,
+                                    .bloom_filter_size = 64,
+                                    .build_bf_by_runtime_size = build_by_runtime_size,
+                                    .bloom_filter_size_calculated_by_ndv = false};
+        for (size_t runtime_size : {0, 1, 16, 17}) {
+            SCOPED_TRACE(runtime_size);
+            SCOPED_TRACE(build_by_runtime_size);
+            RuntimeFilterWrapper wrapper(&params);
+            ASSERT_NE(wrapper.bloom_filter_func(), nullptr);
+            ASSERT_EQ(wrapper.bloom_filter_func()->get_size(), 0);
+            ASSERT_TRUE(wrapper.init(runtime_size).ok());
+            if (runtime_size <= static_cast<size_t>(params.max_in_num)) {
+                EXPECT_EQ(wrapper.get_real_type(), RuntimeFilterType::IN_FILTER);
+                EXPECT_EQ(wrapper.bloom_filter_func()->get_size(), 0);
+                EXPECT_EQ(wrapper.bloom_filter_func()->_bloom_filter_alloced, 0);
+                EXPECT_EQ(wrapper.bloom_filter_func()->_bloom_filter, nullptr);
+                PMergeFilterRequest request;
+                ASSERT_TRUE(wrapper.to_protobuf(request.mutable_in_filter()).ok());
+            } else {
+                EXPECT_EQ(wrapper.get_real_type(), RuntimeFilterType::BLOOM_FILTER);
+                EXPECT_GT(wrapper.bloom_filter_func()->get_size(), 0);
+                auto col = ColumnHelper::create_column<DataTypeInt32>({1, 2, 3});
+                ASSERT_TRUE(wrapper.insert(col, 0).ok());
+                std::vector<uint8_t> matches(3);
+                wrapper.bloom_filter_func()->find_fixed_len(col, matches.data());
+                EXPECT_TRUE(std::all_of(matches.begin(), matches.end(),
+                                        [](uint8_t match) { return match != 0; }));
+            }
         }
-
-        EXPECT_TRUE(wrapper->insert(std::move(bitmap_column), 0).ok());
-        EXPECT_EQ(wrapper->get_state(), RuntimeFilterWrapper::State::UNINITED);
-
-        // merge
-        std::shared_ptr<RuntimeFilterWrapper> new_wrapper;
-        new_wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
-        EXPECT_TRUE(new_wrapper->init(80).ok());
-        EXPECT_EQ(new_wrapper->get_state(), RuntimeFilterWrapper::State::UNINITED);
-        EXPECT_EQ(new_wrapper->bitmap_filter_func()->size(), 0);
-        wrapper->_state = RuntimeFilterWrapper::State::READY;
-        EXPECT_TRUE(new_wrapper->merge(wrapper.get()).ok());
     }
-    {
-        wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
-        EXPECT_TRUE(wrapper->init(80).ok());
-        EXPECT_EQ(wrapper->get_state(), RuntimeFilterWrapper::State::UNINITED);
-        EXPECT_EQ(wrapper->bitmap_filter_func()->size(), 0);
-        // Insert nullable column
-        DataTypePtr bitmap_data_type(
-                std::make_shared<DataTypeNullable>(std::make_shared<DataTypeBitMap>()));
-        auto bitmap_column = bitmap_data_type->create_column();
-        std::vector<BitmapValue>& container = ((ColumnBitmap*)((ColumnNullable*)bitmap_column.get())
-                                                       ->get_nested_column_ptr()
-                                                       .get())
-                                                      ->get_data();
-        auto& null_map = ((ColumnUInt8*)((ColumnNullable*)bitmap_column.get())
-                                  ->get_null_map_column_ptr()
-                                  .get())
-                                 ->get_data();
-
-        for (int i = 0; i < 1024; ++i) {
-            BitmapValue bv;
-            bv.add(i);
-            container.push_back(bv);
-            null_map.push_back(i % 3 == 0);
-        }
-
-        EXPECT_TRUE(wrapper->insert(std::move(bitmap_column), 0).ok());
-        EXPECT_EQ(wrapper->get_state(), RuntimeFilterWrapper::State::UNINITED);
-
-        // merge
-        std::shared_ptr<RuntimeFilterWrapper> new_wrapper;
-        new_wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
-        EXPECT_TRUE(new_wrapper->init(80).ok());
-        EXPECT_EQ(new_wrapper->get_state(), RuntimeFilterWrapper::State::UNINITED);
-        EXPECT_EQ(new_wrapper->bitmap_filter_func()->size(), 0);
-        wrapper->_state = RuntimeFilterWrapper::State::READY;
-        EXPECT_TRUE(new_wrapper->merge(wrapper.get()).ok());
-    }
-    {
-        PMergeFilterRequest valid_request;
-        auto new_wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
-        EXPECT_EQ(new_wrapper->assign(valid_request, nullptr).code(), ErrorCode::INTERNAL_ERROR);
-    }
-    EXPECT_EQ(wrapper->filter_id(), filter_id);
-    EXPECT_TRUE(wrapper->is_valid());
-    EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::BITMAP_FILTER);
-    EXPECT_EQ(wrapper->column_type(), column_return_type);
-    EXPECT_EQ(wrapper->contain_null(), false);
-    EXPECT_FALSE(wrapper->_change_to_bloom_filter().ok());
 }
 
 TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
@@ -914,8 +840,6 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
     int64_t bloom_filter_size = 64;
     bool bloom_filter_size_calculated_by_ndv = false;
 
-    bool bitmap_filter_not_in = false;
-
     std::shared_ptr<RuntimeFilterWrapper> wrapper;
     {
         RuntimeFilterParams params {
@@ -928,9 +852,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_EQ(wrapper->bloom_filter_func()->_bloom_filter_length, bloom_filter_size);
         EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
@@ -961,15 +883,14 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_EQ(wrapper->bloom_filter_func()->_bloom_filter_length, bloom_filter_size);
         EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         // Init (keep in filter)
         EXPECT_TRUE(wrapper->init(runtime_size).ok());
         EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
+        EXPECT_EQ(wrapper->bloom_filter_func()->get_size(), 0);
         EXPECT_EQ(wrapper->get_state(), RuntimeFilterWrapper::State::UNINITED);
         // Insert
         auto col = ColumnHelper::create_column<DataType>(data_vector);
@@ -991,9 +912,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(wrapper->init(runtime_size).ok());
@@ -1008,9 +927,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         auto new_wrapper = std::make_shared<RuntimeFilterWrapper>(&new_params);
         EXPECT_EQ(new_wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(new_wrapper->init(runtime_size).ok());
@@ -1032,6 +949,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
         EXPECT_TRUE(wrapper->merge(new_wrapper.get()).ok());
         EXPECT_EQ(wrapper->hybrid_set()->size(), col->size() * 2);
         EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
+        EXPECT_EQ(wrapper->bloom_filter_func()->get_size(), 0);
     }
     {
         // In + In -> Bloom
@@ -1047,8 +965,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(wrapper->init(runtime_size).ok());
@@ -1063,8 +980,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         auto new_wrapper = std::make_shared<RuntimeFilterWrapper>(&new_params);
         EXPECT_EQ(new_wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(new_wrapper->init(runtime_size).ok());
@@ -1108,8 +1024,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(wrapper->init(runtime_size).ok());
@@ -1127,8 +1042,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         auto new_wrapper = std::make_shared<RuntimeFilterWrapper>(&new_params);
         EXPECT_EQ(new_wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(new_wrapper->init(runtime_size).ok());
@@ -1174,8 +1088,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(wrapper->init(runtime_size).ok());
@@ -1193,8 +1106,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         auto new_wrapper = std::make_shared<RuntimeFilterWrapper>(&new_params);
         EXPECT_EQ(new_wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(new_wrapper->init(runtime_size).ok());
@@ -1241,8 +1153,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
         EXPECT_EQ(wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(wrapper->init(runtime_size).ok());
@@ -1258,8 +1169,7 @@ TEST_F(RuntimeFilterWrapperTest, TestInOrBloom) {
                 .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
                 .bloom_filter_size = bloom_filter_size,
                 .build_bf_by_runtime_size = build_bf_by_runtime_size,
-                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-                .bitmap_filter_not_in = bitmap_filter_not_in};
+                .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
         auto new_wrapper = std::make_shared<RuntimeFilterWrapper>(&new_params);
         EXPECT_EQ(new_wrapper->get_real_type(), RuntimeFilterType::IN_FILTER);
         EXPECT_TRUE(new_wrapper->init(runtime_size).ok());
@@ -1314,8 +1224,6 @@ TEST_F(RuntimeFilterWrapperTest, TestErrorPath) {
     bool build_bf_by_runtime_size = false;
     int64_t bloom_filter_size = 64;
     bool bloom_filter_size_calculated_by_ndv = false;
-
-    bool bitmap_filter_not_in = false;
     RuntimeFilterParams params {
             .filter_id = filter_id,
             .filter_type = filter_type,
@@ -1326,8 +1234,7 @@ TEST_F(RuntimeFilterWrapperTest, TestErrorPath) {
             .runtime_bloom_filter_max_size = runtime_bloom_filter_max_size,
             .bloom_filter_size = bloom_filter_size,
             .build_bf_by_runtime_size = build_bf_by_runtime_size,
-            .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv,
-            .bitmap_filter_not_in = bitmap_filter_not_in};
+            .bloom_filter_size_calculated_by_ndv = bloom_filter_size_calculated_by_ndv};
     std::shared_ptr<RuntimeFilterWrapper> wrapper = std::make_shared<RuntimeFilterWrapper>(&params);
     auto col = ColumnHelper::create_column<DataType>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
     EXPECT_EQ(wrapper->insert(col, 0).code(), ErrorCode::INTERNAL_ERROR);
@@ -1343,7 +1250,6 @@ TEST_F(RuntimeFilterWrapperTest, TestErrorPath) {
     EXPECT_FALSE(wrapper->to_protobuf(valid_request.mutable_bloom_filter(), nullptr, nullptr).ok());
     EXPECT_EQ(wrapper->minmax_func(), nullptr);
     EXPECT_EQ(wrapper->bloom_filter_func(), nullptr);
-    EXPECT_EQ(wrapper->bitmap_filter_func(), nullptr);
     EXPECT_EQ(wrapper->hybrid_set(), nullptr);
     wrapper->check_state({RuntimeFilterWrapper::State::UNINITED});
     bool ex = false;

@@ -20,6 +20,7 @@
 
 #include "common/be_mock_util.h"
 #include "common/status.h"
+#include "exec/operator/join/process_hash_table_probe.h"
 #include "exec/operator/join_probe_operator.h"
 #include "exec/operator/operator.h"
 
@@ -135,21 +136,23 @@ public:
     bool need_more_input_data(RuntimeState* state) const override;
     DataDistribution required_data_distribution(RuntimeState* state) const override {
         if (_join_op == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN) {
-            return {ExchangeType::NOOP};
+            return {TLocalPartitionType::NOOP};
         } else if (_is_broadcast_join) {
             if (state->enable_broadcast_join_force_passthrough()) {
-                return DataDistribution(ExchangeType::PASSTHROUGH);
+                return DataDistribution(TLocalPartitionType::PASSTHROUGH);
             } else {
                 return _child && _child->is_serial_operator()
-                               ? DataDistribution(ExchangeType::PASSTHROUGH)
-                               : DataDistribution(ExchangeType::NOOP);
+                               ? DataDistribution(TLocalPartitionType::PASSTHROUGH)
+                               : DataDistribution(TLocalPartitionType::NOOP);
             }
         }
 
         return (_join_distribution == TJoinDistributionType::BUCKET_SHUFFLE ||
                                 _join_distribution == TJoinDistributionType::COLOCATE
-                        ? DataDistribution(ExchangeType::BUCKET_HASH_SHUFFLE, _partition_exprs)
-                        : DataDistribution(ExchangeType::HASH_SHUFFLE, _partition_exprs));
+                        ? DataDistribution(TLocalPartitionType::BUCKET_HASH_SHUFFLE,
+                                           _partition_exprs)
+                        : DataDistribution(TLocalPartitionType::GLOBAL_EXECUTION_HASH_SHUFFLE,
+                                           _partition_exprs));
     }
     bool is_broadcast_join() const { return _is_broadcast_join; }
 
@@ -168,8 +171,6 @@ public:
         return (is_shuffled_operator() && !is_colocated_operator()) ||
                _followed_by_shuffled_operator;
     }
-
-    bool need_finalize_variant_column() const { return _need_finalize_variant_column; }
 
     bool can_do_lazy_materialized() const { return _have_other_join_conjunct || _is_mark_join; }
 
@@ -208,13 +209,18 @@ private:
     std::vector<SlotId> _hash_output_slot_ids;
     std::vector<bool> _left_output_slot_flags;
     std::vector<bool> _right_output_slot_flags;
-    bool _need_finalize_variant_column = false;
     std::set<int> _should_not_lazy_materialized_column_ids;
     std::vector<std::string> _right_table_column_names;
     std::vector<TExpr> _partition_exprs;
 
-    // Index of column(slot) from right table in the `_intermediate_row_desc`.
+    // Index of column(slot) from right table in the join row descriptor.
     size_t _right_col_idx;
 };
+
+/// Instantiated once in operator.cpp / join_probe_operator.cpp; suppresses per-TU
+/// implicit instantiation.
+extern template class StatefulOperatorX<HashJoinProbeLocalState>;
+extern template class JoinProbeLocalState<HashJoinSharedState, HashJoinProbeLocalState>;
+extern template class JoinProbeOperatorX<HashJoinProbeLocalState>;
 
 } // namespace doris

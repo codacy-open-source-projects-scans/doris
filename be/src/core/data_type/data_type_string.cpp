@@ -20,6 +20,7 @@
 
 #include "core/data_type/data_type_string.h"
 
+#include <gen_cpp/types.pb.h>
 #include <lz4/lz4.h>
 #include <streamvbyte.h>
 
@@ -42,10 +43,6 @@
 #include "core/types.h"
 
 namespace doris {
-
-Field DataTypeString::get_default() const {
-    return Field::create_field<TYPE_STRING>(String());
-}
 
 MutableColumnPtr DataTypeString::create_column() const {
     return ColumnString::create();
@@ -189,6 +186,13 @@ FieldWithDataType DataTypeString::get_field_with_data_type(const IColumn& column
     return FieldWithDataType {
             .field = Field::create_field<TYPE_STRING>(column_data.get_data_at(row_num).to_string()),
             .base_scalar_type_id = get_primitive_type()};
+}
+
+void DataTypeString::to_protobuf(PTypeDesc* ptype, PTypeNode* node,
+                                 PScalarType* scalar_type) const {
+    if (_primitive_type == TYPE_CHAR || _primitive_type == TYPE_VARCHAR) {
+        scalar_type->set_len(_len);
+    }
 }
 
 } // namespace doris

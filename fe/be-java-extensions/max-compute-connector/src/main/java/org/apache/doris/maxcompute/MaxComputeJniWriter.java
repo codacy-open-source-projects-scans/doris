@@ -17,17 +17,12 @@
 
 package org.apache.doris.maxcompute;
 
-import org.apache.doris.common.jni.JniWriter;
-import org.apache.doris.common.jni.utils.JNINativeMethod;
-import org.apache.doris.common.jni.vec.VectorColumn;
-import org.apache.doris.common.jni.vec.VectorTable;
-import org.apache.doris.common.maxcompute.MCProperties;
-import org.apache.doris.common.maxcompute.MCUtils;
+import org.apache.doris.jni.spi.JniWriter;
+import org.apache.doris.jni.spi.vec.VectorColumn;
+import org.apache.doris.jni.spi.vec.VectorTable;
 
 import com.aliyun.odps.Odps;
 import com.aliyun.odps.OdpsType;
-import com.aliyun.odps.table.arrow.ArrowWriter;
-import com.aliyun.odps.table.arrow.ArrowWriterFactory;
 import com.aliyun.odps.table.configuration.ArrowOptions;
 import com.aliyun.odps.table.configuration.ArrowOptions.TimestampUnit;
 import com.aliyun.odps.table.configuration.CompressionCodec;
@@ -63,12 +58,12 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.StructVector;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectOutputStream;
-import java.io.OutputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
@@ -83,10 +78,12 @@ import java.util.Objects;
 
 /**
  * MaxComputeJniWriter writes C++ Block data to MaxCompute tables via Storage API (Arrow).
- * Loaded by C++ as: org/apache/doris/maxcompute/MaxComputeJniWriter
+ *
+ * <p>BE never names this class. It asks for the {@code (max-compute, writer)} pair and gets back
+ * whatever {@link MaxComputeWriterFactory} builds; the class name is this plugin's business alone.
  */
 public class MaxComputeJniWriter extends JniWriter {
-    private static final Logger LOG = Logger.getLogger(MaxComputeJniWriter.class);
+    private static final Logger LOG = LoggerFactory.getLogger(MaxComputeJniWriter.class);
 
     private static final String ACCESS_KEY = "access_key";
     private static final String SECRET_KEY = "secret_key";
@@ -115,6 +112,7 @@ public class MaxComputeJniWriter extends JniWriter {
     private final int readTimeout;
     private final int retryCount;
     private final long maxBlockBytes;
+    private final MaxComputeFeClient feClient;
 
     // Storage API objects
     private TableBatchWriteSession writeSession;
@@ -125,6 +123,10 @@ public class MaxComputeJniWriter extends JniWriter {
     private List<String> columnNames;
     private long currentBlockId = -1L;
     private long currentBlockWrittenBytes = 0L;
+    // Per-row Arrow payload size observed from previously written ranges. Used to bound
+    // how many rows are materialized into a single Arrow root, so a large incoming JNI
+    // block is never copied whole before its size is known. Refined as ranges are written.
+    private long observedBytesPerRow = 0L;
     private final List<WriterCommitMessage> commitMessages = new ArrayList<>();
 
     // Statistics
@@ -155,10 +157,11 @@ public class MaxComputeJniWriter extends JniWriter {
         this.maxBlockBytes = Long.parseLong(
                 params.getOrDefault(MCProperties.WRITE_MAX_BLOCK_BYTES,
                         MCProperties.DEFAULT_WRITE_MAX_BLOCK_BYTES));
+        this.feClient = MaxComputeFeClient.create(params);
     }
 
     @Override
-    public void open() throws IOException {
+    protected void openInternal() throws IOException {
         try {
             Odps odps = MCUtils.createMcClient(params);
             odps.setDefaultProject(project);
@@ -233,7 +236,7 @@ public class MaxComputeJniWriter extends JniWriter {
         }
 
         try {
-            writeRowsWithRowChecks(inputTable, numRows, numCols);
+            writeBatch(inputTable, numRows, numCols);
         } catch (Exception e) {
             String errorMsg = "Failed to write data to MaxCompute table " + project + "." + tableName;
             LOG.error(errorMsg, e);
@@ -241,12 +244,12 @@ public class MaxComputeJniWriter extends JniWriter {
         }
     }
 
-    private long resolveInitialBlockId() {
+    private long resolveInitialBlockId() throws IOException {
         return preallocatedBlockId != null ? preallocatedBlockId : requestBlockId();
     }
 
-    private long requestBlockId() {
-        return JNINativeMethod.requestMaxComputeBlockId(txnId, writeSessionId);
+    private long requestBlockId() throws IOException {
+        return feClient.requestBlockId(txnId, writeSessionId);
     }
 
     private void openBatchWriter(long blockId) throws IOException {
@@ -271,79 +274,144 @@ public class MaxComputeJniWriter extends JniWriter {
         openBatchWriter(requestBlockId());
     }
 
-    private void writeRowsWithRowChecks(VectorTable inputTable, int numRows, int numCols) throws IOException {
+    private void writeBatch(VectorTable inputTable, int numRows, int numCols) throws IOException {
         int rowStart = 0;
         while (rowStart < numRows) {
-            int rowEnd = rowStart;
-            long batchEstimatedBytes = 0L;
-            boolean rotateAfterWrite = false;
-            while (rowEnd < numRows) {
-                long rowEstimatedBytes = estimateSingleRowPayloadBytes(inputTable, numCols, rowEnd);
-                boolean exceedsHardLimit = currentBlockWrittenBytes + batchEstimatedBytes
-                        + rowEstimatedBytes > maxBlockBytes;
-                if (exceedsHardLimit) {
-                    if (rowEnd == rowStart) {
-                        if (currentBlockWrittenBytes > 0) {
-                            rotateCurrentBatchWriter();
-                            continue;
-                        }
-                        batchEstimatedBytes += rowEstimatedBytes;
-                        rowEnd++;
-                        rotateAfterWrite = true;
-                    }
-                    break;
+            // Bound the rows copied into one Arrow root using the per-row size observed so
+            // far, so an oversized incoming block is never materialized whole before we know
+            // whether it fits the current block.
+            int probeEnd = rowStart + boundedProbeRowCount(observedBytesPerRow, maxBlockBytes, numRows - rowStart);
+            try (VectorSchemaRoot root = buildRowRangeRoot(inputTable, numCols, rowStart, probeEnd)) {
+                int probeRows = probeEnd - rowStart;
+                long probeBytes = estimateBatchPayloadBytes(root);
+                observedBytesPerRow = probeBytes / probeRows;
+                if (currentBlockWrittenBytes + probeBytes <= maxBlockBytes) {
+                    writeRoot(root, probeRows, probeBytes);
+                    rowStart = probeEnd;
+                    continue;
                 }
-                batchEstimatedBytes += rowEstimatedBytes;
-                rowEnd++;
-                if (currentBlockWrittenBytes + batchEstimatedBytes >= maxBlockBytes) {
-                    rotateAfterWrite = true;
-                    break;
+
+                // The probe overflows the current block. Split it WITHOUT rebuilding: the binary
+                // search measures leading-row sizes from this already-built root via
+                // getBufferSizeFor, then we slice off the prefix that fits. The remaining rows are
+                // rebuilt on the next iteration (after rotating), so no Arrow buffer outlives the
+                // current block writer.
+                RowRange rowRange = findPartialRowRange(rowStart, probeEnd, currentBlockWrittenBytes,
+                        maxBlockBytes, (rangeStart, rangeEnd) -> prefixBufferBytes(root, rangeEnd - rangeStart));
+                if (rowRange.rotateBeforeWrite) {
+                    rotateCurrentBatchWriter();
+                    continue;
                 }
-            }
 
-            if (rowEnd == rowStart) {
-                long rowEstimatedBytes = estimateSingleRowPayloadBytes(inputTable, numCols, rowStart);
-                batchEstimatedBytes = rowEstimatedBytes;
-                rowEnd = rowStart + 1;
-                rotateAfterWrite = true;
+                int headRows = rowRange.rowEnd - rowStart;
+                try (VectorSchemaRoot head = root.slice(0, headRows)) {
+                    writeRoot(head, headRows, rowRange.bytes);
+                }
+                rowStart = rowRange.rowEnd;
             }
-
-            try (VectorSchemaRoot root = buildRowRangeRoot(inputTable, numCols, rowStart, rowEnd)) {
-                batchWriter.write(root);
-            }
-            batchWriter.flush();
-            int rowsWrittenNow = rowEnd - rowStart;
-            writtenRows += rowsWrittenNow;
-            currentBlockWrittenBytes += batchEstimatedBytes;
-            writtenBytes += batchEstimatedBytes;
-            rowStart = rowEnd;
-
-            if (rotateAfterWrite && rowStart < numRows) {
+            if (rowStart < numRows && currentBlockWrittenBytes >= maxBlockBytes) {
                 rotateCurrentBatchWriter();
             }
         }
     }
 
-    private static class CountingDiscardOutputStream extends OutputStream {
-        @Override
-        public void write(int b) {
-            // Discard bytes while allowing WriteChannel to track payload size.
+    // Off-heap payload bytes of the leading rowCount rows of an already-built Arrow root,
+    // read from the existing column buffers (getBufferSizeFor) without rebuilding any vector.
+    static long prefixBufferBytes(VectorSchemaRoot root, int rowCount) {
+        long total = 0L;
+        for (FieldVector vector : root.getFieldVectors()) {
+            total += vector.getBufferSizeFor(rowCount);
+        }
+        return total;
+    }
+
+    /**
+     * Choose how many rows to materialize into the next Arrow root, bounded so a large
+     * incoming JNI block is never copied whole before its size is known. The bound targets
+     * roughly one MaxCompute block worth of payload using {@code observedBytesPerRow}; before
+     * any range has been measured it probes a single row, then sizes from that row's measured
+     * Arrow payload. The result is at least one row and never exceeds {@code remainingRows}.
+     */
+    static int boundedProbeRowCount(long observedBytesPerRow, long maxBlockBytes, int remainingRows) {
+        long cap;
+        if (observedBytesPerRow <= 0L) {
+            cap = 1L;
+        } else {
+            cap = Math.max(1L, maxBlockBytes / observedBytesPerRow);
+        }
+        if (cap >= remainingRows) {
+            return remainingRows;
+        }
+        return (int) cap;
+    }
+
+    private void writeRoot(VectorSchemaRoot root, int numRows, long batchBytes) throws IOException {
+        batchWriter.write(root);
+        batchWriter.flush();
+
+        writtenRows += numRows;
+        currentBlockWrittenBytes += batchBytes;
+        writtenBytes += batchBytes;
+    }
+
+    static RowRange findPartialRowRange(int rowStart, int numRows, long currentBlockWrittenBytes,
+            long maxBlockBytes, RowRangeByteEstimator estimator) throws IOException {
+        int low = rowStart + 1;
+        int high = numRows - 1;
+        int bestEnd = rowStart;
+        long bestBytes = 0L;
+        while (low <= high) {
+            int mid = low + (high - low) / 2;
+            long rangeBytes = estimator.estimate(rowStart, mid);
+            if (currentBlockWrittenBytes + rangeBytes <= maxBlockBytes) {
+                bestEnd = mid;
+                bestBytes = rangeBytes;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
         }
 
-        @Override
-        public void write(byte[] b, int off, int len) {
-            // Discard bytes while allowing WriteChannel to track payload size.
+        if (bestEnd > rowStart) {
+            return RowRange.write(bestEnd, bestBytes);
+        }
+        if (currentBlockWrittenBytes > 0) {
+            return RowRange.rotateBeforeWrite();
+        }
+        return RowRange.write(rowStart + 1, estimator.estimate(rowStart, rowStart + 1));
+    }
+
+    interface RowRangeByteEstimator {
+        long estimate(int rowStart, int rowEnd) throws IOException;
+    }
+
+    static class RowRange {
+        final int rowEnd;
+        final long bytes;
+        final boolean rotateBeforeWrite;
+
+        private RowRange(int rowEnd, long bytes, boolean rotateBeforeWrite) {
+            this.rowEnd = rowEnd;
+            this.bytes = bytes;
+            this.rotateBeforeWrite = rotateBeforeWrite;
+        }
+
+        static RowRange write(int rowEnd, long bytes) {
+            return new RowRange(rowEnd, bytes, false);
+        }
+
+        static RowRange rotateBeforeWrite() {
+            return new RowRange(-1, 0L, true);
         }
     }
 
-    private long estimateSingleRowPayloadBytes(VectorTable inputTable, int numCols, int rowIndex)
-            throws IOException {
-        try (VectorSchemaRoot root = buildRowRangeRoot(inputTable, numCols, rowIndex, rowIndex + 1);
-                ArrowWriter estimator = ArrowWriterFactory.getRecordBatchWriter(
-                        new CountingDiscardOutputStream(), writerOptions)) {
-            estimator.writeBatch(root);
-            return estimator.bytesWritten();
+    // Estimate an Arrow batch's payload size from its column buffer sizes (O(columns)).
+    static long estimateBatchPayloadBytes(VectorSchemaRoot root) {
+        long total = 0L;
+        for (FieldVector vector : root.getFieldVectors()) {
+            total += vector.getBufferSize();
         }
+        return total;
     }
 
     private VectorSchemaRoot buildRowRangeRoot(VectorTable inputTable, int numCols, int rowStart, int rowEnd) {
@@ -902,7 +970,7 @@ public class MaxComputeJniWriter extends JniWriter {
     }
 
     @Override
-    public void close() throws IOException {
+    protected void closeInternal() throws IOException {
         try {
             closeCurrentBatchWriterAndCollectCommit();
             if (allocator != null) {
@@ -918,11 +986,13 @@ public class MaxComputeJniWriter extends JniWriter {
             String errorMsg = "Failed to close MaxCompute arrow writer";
             LOG.error(errorMsg, e);
             throw new IOException(errorMsg, e);
+        } finally {
+            feClient.close();
         }
     }
 
     @Override
-    public Map<String, String> getStatistics() {
+    protected Map<String, String> collectStatistics() {
         Map<String, String> stats = new HashMap<>();
         stats.put("mc_partition_spec", partitionSpec != null ? partitionSpec : "");
 

@@ -31,10 +31,30 @@
 #include "exec/sort/sort_block.h"
 
 namespace doris {
+
+void ColumnVarbinary::insert_many_continuous_binary_data(const char* data, const uint32_t* offsets,
+                                                         size_t num) {
+    reserve(size() + num);
+    for (size_t row = 0; row < num; ++row) {
+        insert_data(data + offsets[row], offsets[row + 1] - offsets[row]);
+    }
+}
+
+void ColumnVarbinary::insert_many_dict_data(const int32_t* data_array, size_t start_index,
+                                            const StringRef* dict, size_t data_num,
+                                            uint32_t dict_num) {
+    reserve(size() + data_num);
+    // Decoder pages can be released after the call; copy long dictionary entries into our arena.
+    for (size_t row = start_index; row < start_index + data_num; ++row) {
+        const auto& value = dict[data_array[row]];
+        insert_data(value.data, value.size);
+    }
+}
+
 MutableColumnPtr ColumnVarbinary::clone_resized(size_t size) const {
     auto res = create();
     if (size > 0) {
-        auto& new_col = assert_cast<Self&>(*res);
+        auto& new_col = *res;
         size_t count = std::min(this->size(), size);
         for (size_t i = 0; i < count; ++i) {
             auto value = this->get_data_at(i);
@@ -108,7 +128,7 @@ ColumnPtr ColumnVarbinary::filter(const IColumn::Filter& filt, ssize_t result_si
 
 size_t ColumnVarbinary::filter(const IColumn::Filter& filter) {
     size_t pos = 0;
-    const Self& src_vec = assert_cast<const Self&>(*this);
+    const Self& src_vec = *this;
     for (size_t i = 0; i < filter.size(); i++) {
         if (filter[i]) {
             if (src_vec.get_data()[i].isInline()) {
@@ -225,8 +245,7 @@ void ColumnVarbinary::insert_many_strings_overflow(const StringRef* strings, siz
 void ColumnVarbinary::sort_column(const ColumnSorter* sorter, EqualFlags& flags,
                                   IColumn::Permutation& perms, EqualRange& range,
                                   bool last_column) const {
-    sorter->sort_column(assert_cast<const ColumnVarbinary&>(*this), flags, perms, range,
-                        last_column);
+    sorter->sort_column(*this, flags, perms, range, last_column);
 }
 
 } // namespace doris

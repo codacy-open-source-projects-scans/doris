@@ -36,12 +36,16 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Consumer;
 
 public class JdbcMySQLClient extends JdbcClient {
+
+    private static final String APACHE_DORIS_SERVER_IDENTITY = "apache_doris";
 
     private boolean convertDateToNull = false;
     private boolean isDoris = false;
@@ -55,10 +59,15 @@ public class JdbcMySQLClient extends JdbcClient {
         try {
             conn = super.getConnection();
             stmt = conn.createStatement();
-            rs = stmt.executeQuery("SHOW VARIABLES LIKE 'version_comment'");
+            rs = stmt.executeQuery("SHOW VARIABLES LIKE 'server_identity'");
             if (rs.next()) {
-                String versionComment = rs.getString("Value");
-                isDoris = versionComment.toLowerCase().contains("doris");
+                isDoris = isDorisServerIdentity(rs.getString("Value"));
+            } else {
+                close(rs);
+                rs = stmt.executeQuery("SHOW VARIABLES LIKE 'version_comment'");
+                if (rs.next()) {
+                    isDoris = isDorisCompatibleVersionComment(rs.getString("Value"));
+                }
             }
         } catch (SQLException | JdbcClientException e) {
             closeClient();
@@ -72,6 +81,24 @@ public class JdbcMySQLClient extends JdbcClient {
         super(jdbcClientConfig);
         convertDateToNull = isConvertDatetimeToNull(jdbcClientConfig);
         this.dbType = dbType;
+    }
+
+    static boolean isDorisServerIdentity(String serverIdentity) {
+        return APACHE_DORIS_SERVER_IDENTITY.equalsIgnoreCase(serverIdentity);
+    }
+
+    static boolean isDorisCompatibleVersionComment(String versionComment) {
+        if (Strings.isNullOrEmpty(versionComment)) {
+            return false;
+        }
+        String lowerVersionComment = versionComment.toLowerCase(Locale.ROOT);
+        // Enterprise releases can omit the optional "(Cloud Mode)" suffix.
+        return lowerVersionComment.contains("doris")
+                || lowerVersionComment.contains("selectdb")
+                || lowerVersionComment.contains("velodb")
+                || lowerVersionComment.contains("enterprise version enterprise-")
+                || (lowerVersionComment.contains("enterprise version")
+                    && lowerVersionComment.contains("cloud mode"));
     }
 
     @Override
@@ -189,13 +216,14 @@ public class JdbcMySQLClient extends JdbcClient {
     public List<String> getPrimaryKeys(String remoteDbName, String remoteTableName) {
         Connection conn = getConnection();
         ResultSet rs = null;
-        List<String> primaryKeys = Lists.newArrayList();
+        // getPrimaryKeys orders rows by COLUMN_NAME, not KEY_SEQ; reorder by the 1-based KEY_SEQ
+        // to keep the real composite-PK column order.
+        TreeMap<Short, String> primaryKeys = new TreeMap<>();
         try {
             DatabaseMetaData databaseMetaData = conn.getMetaData();
             rs = databaseMetaData.getPrimaryKeys(remoteDbName, null, remoteTableName);
             while (rs.next()) {
-                String fieldName = rs.getString("COLUMN_NAME");
-                primaryKeys.add(fieldName);
+                primaryKeys.put(rs.getShort("KEY_SEQ"), rs.getString("COLUMN_NAME"));
             }
         } catch (SQLException e) {
             throw new JdbcClientException("failed to get jdbc primary key info for remote table `%s.%s`: %s",
@@ -203,7 +231,7 @@ public class JdbcMySQLClient extends JdbcClient {
         } finally {
             close(rs, conn);
         }
-        return primaryKeys;
+        return Lists.newArrayList(primaryKeys.values());
     }
 
     protected String getCatalogName(Connection conn) throws SQLException {

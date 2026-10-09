@@ -244,10 +244,13 @@ suite("test_hdfs_parquet_group2", "p0,external") {
 
 
             uri = "${defaultFS}" + "/user/doris/tvf_data/test_hdfs_parquet/group2/group-field-with-enum-as-logical-annotation.parquet"
-            order_qt_test_31 """ select * from HDFS(
+            test {
+                sql """ select * from HDFS(
                         "uri" = "${uri}",
                         "hadoop.username" = "${hdfsUserName}",
                         "format" = "parquet") limit 10; """
+                exception "Logical type Enum cannot be applied to group node"
+            }
 
 
             uri = "${defaultFS}" + "/user/doris/tvf_data/test_hdfs_parquet/group2/timemillis-in-i64.parquet"
@@ -279,6 +282,7 @@ suite("test_hdfs_parquet_group2", "p0,external") {
 
 
             uri = "${defaultFS}" + "/user/doris/tvf_data/test_hdfs_parquet/group2/before_1582_timestamp_int96_dict_v2_4_6.snappy.parquet"
+            // The fixture stores the golden's INT96 wall-clock values; a catalog timezone would shift them.
             order_qt_test_36 """ select * from HDFS(
                         "uri" = "${uri}",
                         "hadoop.username" = "${hdfsUserName}",

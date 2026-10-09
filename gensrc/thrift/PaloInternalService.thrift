@@ -209,7 +209,7 @@ struct TQueryOptions {
 
   64: optional bool dry_run_query = false
 
-  65: optional bool enable_common_expr_pushdown = false;
+  65: optional bool enable_common_expr_pushdown = false; // deprecated
 
   66: optional i32 parallel_instance = 1
   // Indicate where useServerPrepStmts enabled
@@ -299,7 +299,7 @@ struct TQueryOptions {
   // max rows of each sub-queue in DataQueue.
   106: optional i64 data_queue_max_blocks = 0;
   
-  // expr pushdown for index filter rows
+  // deprecated
   107: optional bool enable_common_expr_pushdown_for_inverted_index = false;
   108: optional i64 local_exchange_free_blocks_limit;
 
@@ -352,7 +352,7 @@ struct TQueryOptions {
 
   135: optional bool enable_parallel_outfile = false;
 
-  136: optional bool enable_phrase_query_sequential_opt = true;
+  136: optional bool enable_phrase_query_sequential_opt = true; // deprecated
   
   137: optional bool enable_auto_create_when_overwrite = false;
 
@@ -374,6 +374,8 @@ struct TQueryOptions {
 
   148: optional i32 min_scanners_concurrency = 1;
   149: optional i32 min_scan_scheduler_concurrency = 0; //deprecated
+  // Controls runtime-filter partition pruning for readers that honor this option.
+  // FileScannerV2 always enables safe partition pruning.
   150: optional bool enable_runtime_filter_partition_prune = true;
 
   // The minimum memory that an operator required to run.
@@ -437,7 +439,7 @@ struct TQueryOptions {
   195: optional bool enable_left_semi_direct_return_opt;
 
   200: optional bool enable_adjust_conjunct_order_by_cost;
-  // Use paimon-cpp to read Paimon splits on BE
+  // Deprecated: the paimon-cpp reader has been removed. Retained for wire compatibility.
   201: optional bool enable_paimon_cpp_reader = false;
 
   // Whether all fragments of this query are assigned to a single backend.
@@ -471,7 +473,6 @@ struct TQueryOptions {
   // session variable `spill_repartition_max_depth` in FE. Default is 8.
   209: optional i32 spill_repartition_max_depth = 8
 
-
   210: optional double max_scan_mem_ratio = 0.3;
   211: optional bool enable_adaptive_scan = false;
 
@@ -482,18 +483,63 @@ struct TQueryOptions {
   215: optional i64 ai_context_window_size = 131072;
 
   // Use Rust-based Lance reader for FORMAT_LANCE scan ranges
-  216: optional bool enable_rust_lance_reader = false;
+  216: optional bool enable_rust_lance_reader = false; // deprecated
   217: optional bool new_version_percentile = false
 
   // Adaptive batch size: target output block size in bytes. Valid range [1MB, 512MB].
   // Default 8MB. Sent by FE session variable preferred_block_size_bytes.
   218: optional i64 preferred_block_size_bytes = 8388608
 
+  // Push LIMIT into SegmentIterator when safe.
+  219: optional bool enable_segment_limit_pushdown = true
+
+  220: optional bool enable_ann_index_result_cache = true
+  // ANN search falls back to exact vector distance evaluation when candidate rows
+  // before ANN search are less than this value. 0 disables the absolute threshold.
+  221: optional i64 ann_index_candidate_rows_threshold = 0
+  // Candidate row ratio threshold against segment rows. Existing default is 0.3.
+  222: optional double ann_index_candidate_rows_percent_threshold = 0.3
+
+  // enable plan local exchange node in fe
+  223: optional bool enable_local_shuffle_planner;
+
+  // Controls expression-based ZoneMap pruning for readers that honor this option.
+  // FileScannerV2 always enables safe expression ZoneMap pruning.
+  224: optional bool enable_expr_zonemap_filter = true
+
+  225: optional i64 runtime_filter_tree_publish_max_send_bytes = 268435456
+
+  226: optional bool enable_prune_nested_column = false;
+  227: optional bool new_version_bitmap_op_count = false;
+  228: optional bool enable_local_exchange_before_streaming_agg = false;
+  // FE is the receiver of fragment reports, so BE must also honor its message limit.
+  229: optional i32 coordinator_thrift_max_message_size;
+  // FE can explicitly and idempotently acknowledge external-file commit reports.
+  230: optional bool supports_external_file_report_ack = false;
+  // Fall back to RE2 when Hyperscan cannot compile a regular expression.
+  231: optional bool enable_hyperscan_fallback = true;
+  232: optional bool enable_runtime_filter_bucket_prune = true;
   // For cloud, to control if the content would be written into file cache
   // In write path, to control if the content would be written into file cache.
   // In read path, read from file cache or remote storage when execute query.
   1000: optional bool disable_file_cache = false
   1001: optional i32 file_cache_query_limit_percent = -1
+  1002: optional bool enable_file_scanner_v2 = false
+  1003: optional bool enable_topn_lazy_mat_phase2_no_write_file_cache = false
+  1004: optional i64 file_cache_query_limit_bytes = -1
+  // SNII inverted index query reads take the REMOTE_ONLY_ON_MISS file-cache
+  // policy: cache hits are served, but a miss reads remote directly and writes
+  // nothing back into the file cache. Data (.dat) and segment-meta reads keep
+  // the normal read-through-and-write-back path, and so do CLucene (V1/V2/V3)
+  // index reads -- the two formats amplify write-back differently, so each
+  // needs its own switch.
+  1005: optional bool inverted_index_snii_read_no_write_file_cache = false
+  // Whether to force a pushed-down MIN/MAX onto the zone map even when its bound is not a value
+  // the data holds right now: a string bound cut at 512 bytes is a prefix, and any bound still
+  // covers rows a delete predicate removed. Statistics collection sets it; every other query
+  // reads the data instead.
+  // Defaults to false because an old FE never sends this field, and BE checked both cases before.
+  1006: optional bool force_pushdown_zonemap_minmax = false
 }
 
 
@@ -501,13 +547,6 @@ struct TQueryOptions {
 struct TScanRangeParams {
   1: required PlanNodes.TScanRange scan_range
   2: optional i32 volume_id = -1
-}
-
-// deprecated
-struct TRuntimeFilterTargetParams {
-  1: required Types.TUniqueId target_fragment_instance_id
-  // The address of the instance where the fragment is expected to run
-  2: required Types.TNetworkAddress target_fragment_instance_addr
 }
 
 struct TRuntimeFilterTargetParamsV2 {
@@ -520,10 +559,6 @@ struct TRuntimeFilterTargetParamsV2 {
 struct TRuntimeFilterParams {
   // Runtime filter merge instance address. Used if this filter has a remote target
   1: optional Types.TNetworkAddress runtime_filter_merge_addr
-
-  // keep 2/3/4/5 unset if BE is not used for merge 
-  // deprecated
-  2: optional map<i32, list<TRuntimeFilterTargetParams>> rid_to_target_param
 
   // Runtime filter ID to the runtime filter desc
   // Used if this filter has a remote target
@@ -626,6 +661,7 @@ struct TFoldConstantParams {
 struct TTabletWithPartition {
     1: required i64 partition_id
     2: required i64 tablet_id
+    3: optional i64 binlog_tablet_id
 }
 
 struct TFetchDataResult {
@@ -648,9 +684,9 @@ enum TCompoundType {
 }
 
 struct TAIResource {
-  1: required string endpoint
-  2: required string provider_type
-  3: required string model_name
+  1: optional string endpoint
+  2: optional string provider_type
+  3: optional string model_name
   4: optional string api_key
   5: optional double temperature
   6: optional i64 max_tokens
@@ -658,6 +694,15 @@ struct TAIResource {
   8: optional i32 retry_delay_second
   9: optional string anthropic_version
   10: optional i32 dimensions
+  11: optional string embed_endpoint
+  12: optional string embed_provider_type
+  13: optional string embed_model_name
+  14: optional string embed_api_key
+  15: optional string effort
+  16: optional string embed_mm_endpoint
+  17: optional string embed_mm_provider_type
+  18: optional string embed_mm_model_name
+  19: optional string embed_mm_api_key
 }
 
 struct TCondition {
@@ -740,6 +785,7 @@ struct TPipelineFragmentParams {
 
   // For cloud
   1000: optional bool is_mow_table;
+  1001: optional bool enable_tso;
 }
 
 // pull up runtime filter info from instance level to BE level

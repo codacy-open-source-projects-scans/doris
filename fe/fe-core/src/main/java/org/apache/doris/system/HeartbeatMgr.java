@@ -19,6 +19,7 @@ package org.apache.doris.system;
 
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.FsBroker;
+import org.apache.doris.cloud.proto.Cloud.ClusterStatus;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
@@ -26,6 +27,7 @@ import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.Version;
 import org.apache.doris.common.util.DebugPointUtil;
+import org.apache.doris.common.util.HttpURLUtil;
 import org.apache.doris.common.util.MasterDaemon;
 import org.apache.doris.persist.HbPackage;
 import org.apache.doris.resource.Tag;
@@ -96,7 +98,9 @@ public class HeartbeatMgr extends MasterDaemon {
         TMasterInfo tMasterInfo = new TMasterInfo(
                 new TNetworkAddress(FrontendOptions.getLocalHostAddress(), Config.rpc_port), clusterId, epoch);
         tMasterInfo.setToken(token);
-        tMasterInfo.setHttpPort(Config.http_port);
+        // small_file_mgr at BE downloads from FE using this port,
+        // by trying http then fallback to https(for http_port=0 cases).
+        tMasterInfo.setHttpPort(HttpURLUtil.getHttpPort());
         long flags = heartbeatFlags.getHeartbeatFlags();
         tMasterInfo.setHeartbeatFlags(flags);
         if (Config.isCloudMode()) {
@@ -214,9 +218,13 @@ public class HeartbeatMgr extends MasterDaemon {
                     } else {
                         // invalid all connections cached in ClientPool
                         ClientPool.backendPool.clearPool(new TNetworkAddress(be.getHost(), be.getBePort()));
-                        if (!isReplay && System.currentTimeMillis() - be.getLastUpdateMs()
-                                >= Config.abort_txn_after_lost_heartbeat_time_second * 1000L
-                                && be.getLastUpdateMs() > 0) {
+                        long lostTimeMs = System.currentTimeMillis() - be.getLastUpdateMs();
+                        long timeoutMs = Config.abort_txn_after_lost_heartbeat_time_second * 1000L;
+                        boolean nonNormalCloudCluster = Config.isCloudMode()
+                                && !ClusterStatus.NORMAL.name().equals(be.getCloudClusterStatus());
+                        // Bound repeated MS scans for inactive clusters to [timeoutMs, 2 * timeoutMs).
+                        if (!isReplay && be.getLastUpdateMs() > 0 && lostTimeMs >= timeoutMs
+                                && (!nonNormalCloudCluster || lostTimeMs < 2 * timeoutMs)) {
                             submitAbortTxnTaskByExecutor(() -> Env.getCurrentGlobalTransactionMgr()
                                     .abortTxnWhenCoordinateBeDown(be.getId(), be.getHost(), 100), "down");
                         }
@@ -306,6 +314,10 @@ public class HeartbeatMgr extends MasterDaemon {
                     copiedMasterInfo.setTabletReportInactiveDurationMs(reportInterval);
                     TCloudClusterInfo clusterInfo = new TCloudClusterInfo();
                     clusterInfo.setIsStandby(backend.isInStandbyCluster());
+                    String computeGroupId = backend.getCloudClusterId();
+                    if (computeGroupId != null && !computeGroupId.isEmpty()) {
+                        clusterInfo.setCloudComputeGroupId(computeGroupId);
+                    }
                     copiedMasterInfo.setCloudClusterInfo(clusterInfo);
                 }
                 THeartbeatResult result;
@@ -412,7 +424,7 @@ public class HeartbeatMgr extends MasterDaemon {
                             System.currentTimeMillis(),
                             Version.DORIS_BUILD_VERSION + "-" + Version.DORIS_BUILD_SHORT_HASH,
                             ExecuteEnv.getInstance().getStartupTime(), ExecuteEnv.getInstance().getDiskInfos(),
-                            ExecuteEnv.getInstance().getProcessUUID());
+                            ExecuteEnv.getInstance().getProcessUUID(), Config.local_resource_group);
                 } else {
                     return new FrontendHbResponse(fe.getNodeName(), "not ready");
                 }
@@ -435,7 +447,8 @@ public class HeartbeatMgr extends MasterDaemon {
                     return new FrontendHbResponse(fe.getNodeName(), result.getQueryPort(),
                             result.getRpcPort(), result.getArrowFlightSqlPort(), result.getReplayedJournalId(),
                             System.currentTimeMillis(), result.getVersion(), result.getLastStartupTime(),
-                            FeDiskInfo.fromThrifts(result.getDiskInfos()), result.getProcessUUID());
+                            FeDiskInfo.fromThrifts(result.getDiskInfos()), result.getProcessUUID(),
+                            result.getLocalResourceGroup());
                 } else {
                     return new FrontendHbResponse(fe.getNodeName(), result.getMsg());
                 }

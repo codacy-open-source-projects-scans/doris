@@ -52,6 +52,7 @@
 #include "storage/rowset/rowset_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
 #include "storage/storage_engine.h"
+#include "storage/tablet/tablet.h"
 #include "storage/tablet/tablet_manager.h"
 #include "storage/tablet/tablet_meta.h"
 #include "storage/tablet/tablet_schema.h"
@@ -105,7 +106,7 @@ SnapshotManager::~SnapshotManager() = default;
 
 Status SnapshotManager::make_snapshot(const TSnapshotRequest& request, string* snapshot_path,
                                       bool* allow_incremental_clone) {
-    SCOPED_ATTACH_TASK(_mem_tracker);
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
     Status res = Status::OK();
     if (snapshot_path == nullptr) {
         return Status::Error<INVALID_ARGUMENT>("output parameter cannot be null");
@@ -151,7 +152,7 @@ Status SnapshotManager::release_snapshot(const string& snapshot_path) {
 
     // If the requested snapshot_path is located in the root/snapshot folder, it is considered legal and can be deleted.
     // Otherwise, it is considered an illegal request and returns an error result.
-    SCOPED_ATTACH_TASK(_mem_tracker);
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
     auto stores = _engine.get_stores();
     for (auto* store : stores) {
         std::string abs_path;
@@ -201,6 +202,7 @@ Result<std::vector<PendingRowsetGuard>> SnapshotManager::convert_rowset_ids(
     // keep this just for safety
     new_tablet_meta_pb.clear_inc_rs_metas();
     new_tablet_meta_pb.clear_stale_rs_metas();
+
     // should modify tablet id and schema hash because in restore process the tablet id is not
     // equal to tablet id in meta
     new_tablet_meta_pb.set_tablet_id(tablet_id);
@@ -352,6 +354,10 @@ Status SnapshotManager::_rename_rowset_id(const RowsetMetaPB& rs_meta_pb,
     context.newest_write_timestamp = org_rowset_meta->newest_write_timestamp();
     // keep segments_overlap same as origin rowset
     context.segments_overlap = rowset_meta->segments_overlap();
+    context.compaction_level = org_rowset_meta->compaction_level();
+    if (org_rowset_meta->is_row_binlog()) {
+        context.write_binlog_opt().enable = true;
+    }
     // propagate MOW flag so that non-MOW key-bounds aggregation is not applied
     // when restoring a MOW tablet's rowset
     context.enable_unique_key_merge_on_write = enable_unique_key_merge_on_write;
@@ -369,6 +375,9 @@ Status SnapshotManager::_rename_rowset_id(const RowsetMetaPB& rs_meta_pb,
                                    "failed to build rowset when rename rowset id");
     RETURN_IF_ERROR(new_rowset->load(false));
     new_rowset->rowset_meta()->to_rowset_pb(new_rs_meta_pb);
+    if (rs_meta_pb.has_commit_tso()) {
+        new_rs_meta_pb->mutable_commit_tso()->CopyFrom(rs_meta_pb.commit_tso());
+    }
     RETURN_IF_ERROR(org_rowset->remove());
     return Status::OK();
 }
@@ -473,7 +482,7 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
         return res;
     }
 
-    bool is_copy_binlog = request.__isset.is_copy_binlog ? request.is_copy_binlog : false;
+    bool need_ccr_binlog = request.__isset.is_copy_binlog ? request.is_copy_binlog : false;
 
     // schema_full_path_desc.filepath:
     //      /snapshot_id_path/tablet_id/schema_hash/
@@ -678,7 +687,6 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
                          << " ref tablet=" << ref_tablet->tablet_id();
             break;
         }
-
         // The inc_rs_metas is deprecated since Doris version 0.13.
         // Clear it for safety reason.
         // Whether it is incremental or full snapshot, rowset information is stored in rs_meta.
@@ -715,7 +723,7 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
             break;
         }
 
-        if (!is_copy_binlog || !target_tablet->is_enable_binlog()) {
+        if (!need_ccr_binlog || !target_tablet->enable_ccr_binlog()) {
             break;
         }
 
@@ -773,6 +781,8 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
                 }
             }};
 
+            // Binlog is local-mode only. These files use contiguous segment indexes because
+            // segment-list rowsets are cloud-only.
             // link segment files and index files
             for (int64_t segment_index = 0; segment_index < num_segments; ++segment_index) {
                 segment_file_path = ref_tablet->get_segment_filepath(rowset_id, segment_index);
@@ -811,7 +821,7 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
                         linked_success_files.push_back(snapshot_segment_index_file_path);
                     }
                 } else {
-                    if (tablet_schema.has_inverted_index() || tablet_schema.has_ann_index()) {
+                    if (tablet_schema.has_inverted_or_ann_index()) {
                         auto index_file = InvertedIndexDescriptor::get_index_file_path_v2(
                                 InvertedIndexDescriptor::get_index_file_path_prefix(
                                         segment_file_path));

@@ -19,7 +19,11 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "core/data_type/data_type_date_or_datetime_v2.h"
+#include "core/data_type/data_type_varbinary.h"
+#include "format/table/iceberg/partition_spec.h"
 
 namespace doris {
 
@@ -28,6 +32,18 @@ public:
     PartitionTransformersTest() = default;
     virtual ~PartitionTransformersTest() = default;
 };
+
+TEST_F(PartitionTransformersTest, binary_computation_transforms_are_not_supported) {
+    const auto type = std::make_shared<DataTypeVarbinary>();
+    for (const auto& source_type : DataTypes {type, make_nullable(type)}) {
+        for (const auto& transform : {"truncate[1]", "bucket[16]"}) {
+            EXPECT_THROW(
+                    PartitionColumnTransforms::create(
+                            iceberg::PartitionField(1, 1000, "binary_key", transform), source_type),
+                    Exception);
+        }
+    }
+}
 
 TEST_F(PartitionTransformersTest, test_integer_truncate_transform) {
     const std::vector<int32_t> values({1, -1});
@@ -113,6 +129,28 @@ TEST_F(PartitionTransformersTest, test_string_truncate_transform) {
     for (size_t i = 0; i < result_column->size(); ++i) {
         EXPECT_EQ(expected_data[i], result_column->get_data_at(i));
     }
+}
+
+TEST_F(PartitionTransformersTest, test_floating_point_special_partition_value) {
+    auto float_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_FLOAT, false);
+    auto double_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DOUBLE, false);
+    IdentityPartitionColumnTransform float_transform(float_type);
+    IdentityPartitionColumnTransform double_transform(double_type);
+
+    EXPECT_EQ("NaN", float_transform.get_partition_value(
+                             float_type, std::numeric_limits<Float32>::quiet_NaN()));
+    EXPECT_EQ("Infinity", float_transform.get_partition_value(
+                                  float_type, std::numeric_limits<Float32>::infinity()));
+    EXPECT_EQ("-Infinity", float_transform.get_partition_value(
+                                   float_type, -std::numeric_limits<Float32>::infinity()));
+    EXPECT_EQ("NaN", double_transform.get_partition_value(
+                             double_type, std::numeric_limits<Float64>::quiet_NaN()));
+    EXPECT_EQ("Infinity", double_transform.get_partition_value(
+                                  double_type, std::numeric_limits<Float64>::infinity()));
+    EXPECT_EQ("-Infinity", double_transform.get_partition_value(
+                                   double_type, -std::numeric_limits<Float64>::infinity()));
 }
 
 TEST_F(PartitionTransformersTest, test_integer_bucket_transform) {
@@ -494,6 +532,32 @@ TEST_F(PartitionTransformersTest, test_nullable_column_integer_truncate_transfor
             ++j;
         }
     }
+}
+
+TEST_F(PartitionTransformersTest, test_nullable_column_string_truncate_transform) {
+    auto column = ColumnNullable::create(ColumnString::create(), ColumnUInt8::create());
+    column->insert_data(nullptr, 0);
+    column->insert_data("iceberg", sizeof("iceberg") - 1);
+    column->insert_data("db", sizeof("db") - 1);
+    ColumnWithTypeAndName test_string(
+            column->get_ptr(),
+            std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()), "test_string");
+
+    Block block({test_string});
+    auto source_type = DataTypeFactory::instance().create_data_type(TYPE_STRING, true);
+    StringTruncatePartitionColumnTransform transform(source_type, 3);
+
+    auto result = transform.apply(block, 0);
+
+    const auto* result_column = assert_cast<const ColumnNullable*>(result.column.get());
+    const auto* result_strings =
+            assert_cast<const ColumnString*>(result_column->get_nested_column_ptr().get());
+    EXPECT_EQ(3, result_column->size());
+    EXPECT_EQ(Field::create_field<TYPE_BOOLEAN>(1), result_column->get_null_map_column()[0]);
+    EXPECT_EQ(Field::create_field<TYPE_BOOLEAN>(0), result_column->get_null_map_column()[1]);
+    EXPECT_EQ(Field::create_field<TYPE_BOOLEAN>(0), result_column->get_null_map_column()[2]);
+    EXPECT_EQ("ice", result_strings->get_data_at(1).to_string());
+    EXPECT_EQ("db", result_strings->get_data_at(2).to_string());
 }
 
 } // namespace doris

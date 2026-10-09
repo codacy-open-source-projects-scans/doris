@@ -17,6 +17,7 @@
 
 #include "format/table/iceberg/arrow_schema_util.h"
 
+#include <arrow/extension/uuid.h>
 #include <arrow/type.h>
 #include <arrow/util/key_value_metadata.h>
 
@@ -25,12 +26,14 @@ namespace doris::iceberg {
 const char* ArrowSchemaUtil::PARQUET_FIELD_ID = "PARQUET:field_id";
 const char* ArrowSchemaUtil::ORIGINAL_TYPE = "originalType";
 const char* ArrowSchemaUtil::MAP_TYPE_VALUE = "mapType";
+const char* ArrowSchemaUtil::UUID_TYPE_VALUE = "uuid";
 
 Status ArrowSchemaUtil::convert(const Schema* schema, const std::string& timezone,
-                                std::vector<std::shared_ptr<arrow::Field>>& fields) {
+                                std::vector<std::shared_ptr<arrow::Field>>& fields,
+                                bool use_uuid_extension) {
     for (const auto& column : schema->columns()) {
         std::shared_ptr<arrow::Field> arrow_field;
-        RETURN_IF_ERROR(convert_to(column, &arrow_field, timezone));
+        RETURN_IF_ERROR(convert_to(column, &arrow_field, timezone, use_uuid_extension));
         fields.push_back(arrow_field);
     }
     return Status::OK();
@@ -38,7 +41,7 @@ Status ArrowSchemaUtil::convert(const Schema* schema, const std::string& timezon
 
 Status ArrowSchemaUtil::convert_to(const iceberg::NestedField& field,
                                    std::shared_ptr<arrow::Field>* arrow_field,
-                                   const std::string& timezone) {
+                                   const std::string& timezone, bool use_uuid_extension) {
     std::shared_ptr<arrow::DataType> arrow_type;
     std::unordered_map<std::string, std::string> metadata;
     metadata[PARQUET_FIELD_ID] = std::to_string(field.field_id());
@@ -75,16 +78,28 @@ Status ArrowSchemaUtil::convert_to(const iceberg::NestedField& field,
         break;
     }
 
-    case iceberg::TypeID::BINARY:
     case iceberg::TypeID::STRING:
-    case iceberg::TypeID::UUID:
-    case iceberg::TypeID::FIXED:
         arrow_type = arrow::utf8();
         break;
 
+    case iceberg::TypeID::BINARY:
+        arrow_type = arrow::binary();
+        break;
+
+    case iceberg::TypeID::UUID:
+        metadata[ORIGINAL_TYPE] = UUID_TYPE_VALUE;
+        arrow_type = use_uuid_extension ? arrow::extension::uuid() : arrow::fixed_size_binary(16);
+        break;
+
+    case iceberg::TypeID::FIXED: {
+        iceberg::FixedType* fixed_type = static_cast<iceberg::FixedType*>(field.field_type());
+        arrow_type = arrow::fixed_size_binary(fixed_type->get_length());
+        break;
+    }
+
     case iceberg::TypeID::DECIMAL: {
         auto* dt = dynamic_cast<DecimalType*>(field.field_type());
-        arrow_type = arrow::decimal(dt->get_precision(), dt->get_scale());
+        arrow_type = arrow::decimal128(dt->get_precision(), dt->get_scale());
         break;
     }
 
@@ -93,7 +108,7 @@ Status ArrowSchemaUtil::convert_to(const iceberg::NestedField& field,
         StructType* st = field.field_type()->as_struct_type();
         for (const auto& column : st->fields()) {
             std::shared_ptr<arrow::Field> element_field;
-            RETURN_IF_ERROR(convert_to(column, &element_field, timezone));
+            RETURN_IF_ERROR(convert_to(column, &element_field, timezone, use_uuid_extension));
             element_fields.push_back(element_field);
         }
         arrow_type = arrow::struct_(element_fields);
@@ -103,7 +118,8 @@ Status ArrowSchemaUtil::convert_to(const iceberg::NestedField& field,
     case iceberg::TypeID::LIST: {
         std::shared_ptr<arrow::Field> item_field;
         ListType* list_type = field.field_type()->as_list_type();
-        RETURN_IF_ERROR(convert_to(list_type->element_field(), &item_field, timezone));
+        RETURN_IF_ERROR(
+                convert_to(list_type->element_field(), &item_field, timezone, use_uuid_extension));
         arrow_type = arrow::list(item_field);
         break;
     }
@@ -112,8 +128,10 @@ Status ArrowSchemaUtil::convert_to(const iceberg::NestedField& field,
         std::shared_ptr<arrow::Field> key_field;
         std::shared_ptr<arrow::Field> value_field;
         MapType* map_type = field.field_type()->as_map_type();
-        RETURN_IF_ERROR(convert_to(map_type->key_field(), &key_field, timezone));
-        RETURN_IF_ERROR(convert_to(map_type->value_field(), &value_field, timezone));
+        RETURN_IF_ERROR(
+                convert_to(map_type->key_field(), &key_field, timezone, use_uuid_extension));
+        RETURN_IF_ERROR(
+                convert_to(map_type->value_field(), &value_field, timezone, use_uuid_extension));
         metadata[ORIGINAL_TYPE] = MAP_TYPE_VALUE;
         arrow_type = std::make_shared<arrow::MapType>(key_field, value_field);
         break;

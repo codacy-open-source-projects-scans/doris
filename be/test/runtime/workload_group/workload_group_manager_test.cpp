@@ -29,20 +29,26 @@
 #include <filesystem>
 #include <memory>
 #include <sstream>
+#include <tuple>
 
 #include "common/config.h"
 #include "common/status.h"
+#include "cpp/sync_point.h"
 #include "exec/pipeline/dependency.h"
-#include "exec/pipeline/pipeline_tracing.h"
 #include "exec/spill/spill_file_manager.h"
+#include "load/memtable/memtable_memory_limiter.h"
 #include "runtime/exec_env.h"
 #include "runtime/query_context.h"
 #include "runtime/runtime_query_statistics_mgr.h"
 #include "runtime/thread_context.h"
 #include "runtime/workload_group/workload_group.h"
+#include "storage/adaptive_thread_pool_controller.h"
 #include "storage/olap_define.h"
+#include "storage/storage_engine.h"
 #include "testutil/mock/mock_query_task_controller.h"
 #include "util/defer_op.h"
+#include "util/mem_info.h"
+#include "util/threadpool.h"
 
 namespace doris {
 
@@ -85,13 +91,13 @@ protected:
         ExecEnv::GetInstance()->_spill_file_mgr = new SpillFileManager(std::move(spill_store_map));
         auto st = ExecEnv::GetInstance()->_spill_file_mgr->init();
         EXPECT_TRUE(st.ok()) << "init spill stream manager failed: " << st.to_string();
-        ExecEnv::GetInstance()->_pipeline_tracer_ctx = std::make_unique<PipelineTracerContext>();
-
         config::spill_in_paused_queue_timeout_ms = 2000;
         doris::ExecEnv::GetInstance()->set_memtable_memory_limiter(new MemTableMemoryLimiter());
     }
     void TearDown() override {
         _wg_manager.reset();
+        ExecEnv::GetInstance()->spill_file_mgr()->stop();
+        SAFE_DELETE(ExecEnv::GetInstance()->_spill_file_mgr);
         ExecEnv::GetInstance()->_runtime_query_statistics_mgr->stop_report_thread();
         SAFE_DELETE(ExecEnv::GetInstance()->_runtime_query_statistics_mgr);
 
@@ -104,10 +110,12 @@ protected:
 
 private:
     std::shared_ptr<QueryContext> _generate_on_query(std::shared_ptr<WorkloadGroup>& wg,
-                                                     int64_t mem_limit = 1024L * 1024 * 128) {
+                                                     int64_t mem_limit = 1024L * 1024 * 128,
+                                                     bool has_mem_limit = false) {
         TQueryOptions query_options;
         query_options.query_type = TQueryType::SELECT;
         query_options.mem_limit = mem_limit;
+        query_options.__isset.mem_limit = has_mem_limit;
         query_options.query_slot_count = 1;
         TNetworkAddress fe_address;
         fe_address.hostname = "127.0.0.1";
@@ -155,6 +163,29 @@ TEST_F(WorkloadGroupManagerTest, get_or_create_workload_group) {
     ASSERT_EQ(wg->id(), 0);
 }
 
+TEST_F(WorkloadGroupManagerTest, refresh_memory_usage_updates_memory_limits) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    const int64_t initial_mem_limit = 1024L * 1024 * 1024;
+    MemInfo::set_mem_limit_for_test(initial_mem_limit);
+
+    WorkloadGroupInfo wg_info {.id = 1,
+                               .memory_limit = initial_mem_limit / 2,
+                               .min_memory_percent = 25,
+                               .max_memory_percent = 50};
+    auto wg = _wg_manager->get_or_create_workload_group(wg_info);
+
+    EXPECT_EQ(wg->memory_limit(), initial_mem_limit / 2);
+    EXPECT_EQ(wg->min_memory_limit(), initial_mem_limit / 4);
+
+    const int64_t updated_mem_limit = initial_mem_limit * 2;
+    MemInfo::set_mem_limit_for_test(updated_mem_limit);
+    wg->refresh_memory_usage();
+
+    EXPECT_EQ(wg->memory_limit(), updated_mem_limit / 2);
+    EXPECT_EQ(wg->min_memory_limit(), updated_mem_limit / 4);
+}
+
 TEST_F(WorkloadGroupManagerTest, handle_paused_queries_ignores_empty_workload_group) {
     auto wg = _wg_manager->get_or_create_workload_group({});
 
@@ -162,6 +193,37 @@ TEST_F(WorkloadGroupManagerTest, handle_paused_queries_ignores_empty_workload_gr
 
     std::unique_lock<std::mutex> lock(_wg_manager->_paused_queries_lock);
     ASSERT_FALSE(_wg_manager->_paused_queries_list.contains(wg));
+}
+
+TEST_F(WorkloadGroupManagerTest, refresh_restores_query_limit_after_cgroup_expands) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    const int64_t small_mem_limit = 1024L * 1024 * 20;
+    const int64_t large_mem_limit = 1024L * 1024 * 100;
+    MemInfo::set_mem_limit_for_test(small_mem_limit);
+    WorkloadGroupInfo wg_info {.id = 1,
+                               .memory_limit = small_mem_limit,
+                               .max_memory_percent = 100,
+                               .slot_mem_policy = TWgSlotMemoryPolicy::NONE};
+    auto wg = _wg_manager->get_or_create_workload_group(wg_info);
+    auto query_context = _generate_on_query(wg, large_mem_limit, true);
+    auto query_without_mem_limit = _generate_on_query(wg);
+
+    ASSERT_EQ(query_context->resource_ctx()->memory_context()->mem_limit(), small_mem_limit);
+    ASSERT_EQ(query_context->resource_ctx()->memory_context()->user_set_mem_limit(),
+              large_mem_limit);
+    ASSERT_EQ(query_without_mem_limit->resource_ctx()->memory_context()->mem_limit(),
+              small_mem_limit);
+    ASSERT_EQ(query_without_mem_limit->resource_ctx()->memory_context()->user_set_mem_limit(),
+              1LL << 60);
+
+    MemInfo::set_mem_limit_for_test(large_mem_limit);
+    _wg_manager->refresh_workload_group_memory_state();
+
+    ASSERT_EQ(wg->memory_limit(), large_mem_limit);
+    ASSERT_EQ(query_context->resource_ctx()->memory_context()->mem_limit(), large_mem_limit);
+    ASSERT_EQ(query_without_mem_limit->resource_ctx()->memory_context()->mem_limit(),
+              large_mem_limit);
 }
 
 // Query is paused due to query memlimit exceed, after waiting in queue for  spill_in_paused_queue_timeout_ms
@@ -197,7 +259,7 @@ TEST_F(WorkloadGroupManagerTest, query_exceed) {
 //                    query_ctx->get_mem_tracker()->consumption() + query_it->reserve_size_)
 TEST_F(WorkloadGroupManagerTest, wg_exceed1) {
     auto wg = _wg_manager->get_or_create_workload_group({});
-    auto query_context = _generate_on_query(wg);
+    auto query_context = _generate_on_query(wg, 1024L * 1024 * 128, true);
 
     query_context->query_mem_tracker()->consume(1024L * 1024 * 1024 * 4);
     _wg_manager->add_paused_query(query_context->resource_ctx(), 1024L,
@@ -319,8 +381,13 @@ TEST_F(WorkloadGroupManagerTest, wg_reserve_failed_before_query_limit_and_high_w
 // query limit > workload group limit
 // query's limit will be set to workload group limit
 TEST_F(WorkloadGroupManagerTest, wg_exceed3) {
-    WorkloadGroupInfo wg_info {
-            .id = 1, .memory_limit = 1024L * 1024, .slot_mem_policy = TWgSlotMemoryPolicy::NONE};
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    MemInfo::set_mem_limit_for_test(1024L * 1024 * 100);
+    WorkloadGroupInfo wg_info {.id = 1,
+                               .memory_limit = 1024L * 1024,
+                               .max_memory_percent = 1,
+                               .slot_mem_policy = TWgSlotMemoryPolicy::NONE};
     auto wg = _wg_manager->get_or_create_workload_group(wg_info);
     auto query_context = _generate_on_query(wg);
 
@@ -361,6 +428,9 @@ TEST_F(WorkloadGroupManagerTest, wg_exceed3) {
 
 // TWgSlotMemoryPolicy::FIXED
 TEST_F(WorkloadGroupManagerTest, wg_exceed4) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    MemInfo::set_mem_limit_for_test(1024L * 1024 * 100);
     WorkloadGroupInfo wg_info {.id = 1,
                                .memory_limit = 1024L * 1024 * 100,
                                .memory_low_watermark = 80,
@@ -398,6 +468,9 @@ TEST_F(WorkloadGroupManagerTest, wg_exceed4) {
 
 // TWgSlotMemoryPolicy::DYNAMIC
 TEST_F(WorkloadGroupManagerTest, wg_exceed5) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    MemInfo::set_mem_limit_for_test(1024L * 1024 * 100);
     WorkloadGroupInfo wg_info {.id = 1,
                                .memory_limit = 1024L * 1024 * 100,
                                .min_memory_percent = 10,
@@ -444,7 +517,7 @@ TEST_F(WorkloadGroupManagerTest, overcommit) {
     auto wg = _wg_manager->get_or_create_workload_group(wg_info);
     EXPECT_EQ(wg->id(), wg_info.id);
 
-    auto query_context = _generate_on_query(wg);
+    auto query_context = _generate_on_query(wg, 1024L * 1024 * 128, true);
 
     _wg_manager->add_paused_query(query_context->resource_ctx(), 1024L * 1024 * 1024,
                                   Status::Error(ErrorCode::WORKLOAD_GROUP_MEMORY_EXCEEDED, "test"));
@@ -523,6 +596,9 @@ TEST_F(WorkloadGroupManagerTest, query_released) {
 }
 
 TEST_F(WorkloadGroupManagerTest, ProcessMemoryNotEnough) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    MemInfo::set_mem_limit_for_test(1024L * 1024 * 1000);
     WorkloadGroupInfo wg1_info {.id = 1,
                                 .memory_limit = 1024L * 1024 * 1000,
                                 .min_memory_percent = 10,
@@ -796,6 +872,9 @@ TEST_F(WorkloadGroupManagerTest, cancelled_query_does_not_block_query_mem_exceed
 }
 
 TEST_F(WorkloadGroupManagerTest, recently_cancelled_query_delays_process_mem_exceeded) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    MemInfo::set_mem_limit_for_test(1024L * 1024 * 1000);
     WorkloadGroupInfo wg1_info {.id = 1,
                                 .memory_limit = 1024L * 1024 * 1000,
                                 .min_memory_percent = 10,
@@ -847,11 +926,14 @@ TEST_F(WorkloadGroupManagerTest, recently_cancelled_query_delays_process_mem_exc
 // For NONE policy, the old code never called set_mem_limit during refresh (user_set > user_set
 // is always false), so a limit lowered by handle_paused_queries would never recover.
 TEST_F(WorkloadGroupManagerTest, update_queries_limit_restores_limit_none_policy) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    MemInfo::set_mem_limit_for_test(1024L * 1024 * 200);
     WorkloadGroupInfo wg_info {.id = 1,
                                .memory_limit = 1024L * 1024 * 200,
                                .slot_mem_policy = TWgSlotMemoryPolicy::NONE};
     auto wg = _wg_manager->get_or_create_workload_group(wg_info);
-    auto query_context = _generate_on_query(wg);
+    auto query_context = _generate_on_query(wg, 1024L * 1024 * 128, true);
 
     // user_set_mem_limit is set in QueryContext init = query_options.mem_limit = 128MB
     const int64_t user_set = query_context->resource_ctx()->memory_context()->user_set_mem_limit();
@@ -878,6 +960,9 @@ TEST_F(WorkloadGroupManagerTest, update_queries_limit_restores_limit_none_policy
 // query_weighted_mem_limit = wg_high_water_mark which is typically > user_set_mem_limit.
 // The old code's condition (user_set > query_weighted) would be false, preventing restoration.
 TEST_F(WorkloadGroupManagerTest, update_queries_limit_restores_limit_dynamic_policy) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    MemInfo::set_mem_limit_for_test(1024L * 1024 * 200);
     WorkloadGroupInfo wg_info {.id = 1,
                                .memory_limit = 1024L * 1024 * 200,
                                .memory_low_watermark = 80,
@@ -885,7 +970,7 @@ TEST_F(WorkloadGroupManagerTest, update_queries_limit_restores_limit_dynamic_pol
                                .total_query_slot_count = 5,
                                .slot_mem_policy = TWgSlotMemoryPolicy::DYNAMIC};
     auto wg = _wg_manager->get_or_create_workload_group(wg_info);
-    auto query_context = _generate_on_query(wg);
+    auto query_context = _generate_on_query(wg, 1024L * 1024 * 128, true);
 
     const int64_t user_set = query_context->resource_ctx()->memory_context()->user_set_mem_limit();
     ASSERT_EQ(user_set, 1024L * 1024 * 128);
@@ -908,6 +993,9 @@ TEST_F(WorkloadGroupManagerTest, update_queries_limit_restores_limit_dynamic_pol
 // Test Fix 3: For FIXED policy, limit should be correctly set to slot-weighted value.
 // This already worked before the fix, but verify it still works.
 TEST_F(WorkloadGroupManagerTest, update_queries_limit_restores_limit_fixed_policy) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    MemInfo::set_mem_limit_for_test(1024L * 1024 * 200);
     WorkloadGroupInfo wg_info {.id = 1,
                                .memory_limit = 1024L * 1024 * 200,
                                .memory_low_watermark = 80,
@@ -937,6 +1025,9 @@ TEST_F(WorkloadGroupManagerTest, update_queries_limit_restores_limit_fixed_polic
 // Test: When WG concurrency decreases (queries finish), remaining queries should get
 // higher per-query limits in FIXED policy.
 TEST_F(WorkloadGroupManagerTest, limit_increases_when_concurrency_decreases) {
+    const int64_t original_mem_limit = MemInfo::mem_limit();
+    Defer restore_mem_limit {[&]() { MemInfo::set_mem_limit_for_test(original_mem_limit); }};
+    MemInfo::set_mem_limit_for_test(1024L * 1024 * 200);
     WorkloadGroupInfo wg_info {.id = 1,
                                .memory_limit = 1024L * 1024 * 200,
                                .memory_low_watermark = 80,
@@ -1143,6 +1234,128 @@ TEST_F(WorkloadGroupManagerTest, phase4_skips_cancelled_query_memory_exceeded) {
 
     cancelled_query->query_mem_tracker()->consume(-1024 * 4);
     live_query->query_mem_tracker()->consume(-1024 * 4);
+}
+
+TEST_F(WorkloadGroupManagerTest, FailedInternalGroupSetupCancelsAdaptiveFlush) {
+    auto* env = ExecEnv::GetInstance();
+    auto saved_engine = std::move(env->_storage_engine);
+    const auto saved_config = std::make_tuple(
+            config::enable_adaptive_flush_threads, config::enable_task_executor_in_internal_table,
+            config::enable_task_executor_in_external_table, config::pipeline_executor_size,
+            config::blocking_pipeline_executor_size, config::doris_scanner_thread_pool_thread_num,
+            config::doris_max_remote_scanner_thread_pool_thread_num,
+            config::doris_scanner_min_thread_pool_thread_num, config::min_active_scan_threads,
+            config::min_active_file_scan_threads, config::flush_thread_num_per_store);
+    Defer restore {[&] {
+        env->set_storage_engine(std::move(saved_engine));
+        std::tie(config::enable_adaptive_flush_threads,
+                 config::enable_task_executor_in_internal_table,
+                 config::enable_task_executor_in_external_table, config::pipeline_executor_size,
+                 config::blocking_pipeline_executor_size,
+                 config::doris_scanner_thread_pool_thread_num,
+                 config::doris_max_remote_scanner_thread_pool_thread_num,
+                 config::doris_scanner_min_thread_pool_thread_num, config::min_active_scan_threads,
+                 config::min_active_file_scan_threads, config::flush_thread_num_per_store) =
+                saved_config;
+    }};
+    env->set_storage_engine(std::make_unique<StorageEngine>(EngineOptions {}));
+    auto* controller = env->storage_engine().adaptive_thread_controller();
+    config::enable_adaptive_flush_threads = true;
+    config::enable_task_executor_in_internal_table = false;
+    config::enable_task_executor_in_external_table = false;
+    config::pipeline_executor_size = 1;
+    config::blocking_pipeline_executor_size = 1;
+    config::doris_scanner_thread_pool_thread_num = 1;
+    config::doris_max_remote_scanner_thread_pool_thread_num = 1;
+    config::doris_scanner_min_thread_pool_thread_num = 1;
+    config::min_active_scan_threads = 1;
+    config::min_active_file_scan_threads = 1;
+    config::flush_thread_num_per_store = 1;
+
+    auto* sp = SyncPoint::get_instance();
+    sp->enable_processing();
+    Defer disable_sync_points {[&] { sp->disable_processing(); }};
+    int failed_starts = 0;
+    int cancelled_registrations = 0;
+    SyncPoint::CallbackGuard start_guard;
+    SyncPoint::CallbackGuard cancel_guard;
+    sp->set_call_back(
+            "WorkloadGroup::upsert_thread_pool_no_lock::task_scheduler_start",
+            [&](auto&& args) {
+                auto* result = try_any_cast_ret<Status>(args);
+                result->first = Status::InternalError<false>("injected pipeline scheduler failure");
+                result->second = true;
+                ++failed_starts;
+            },
+            &start_guard);
+    sp->set_call_back(
+            "AdaptiveThreadPoolController::cancel_stopped",
+            [&](auto&&) { ++cancelled_registrations; }, &cancel_guard);
+
+    const auto status = _wg_manager->create_internal_wg();
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(status.to_string().find("injected pipeline scheduler failure"), std::string::npos);
+    EXPECT_EQ(failed_starts, 1);
+    EXPECT_TRUE(_wg_manager->_workload_groups.empty());
+    // The flush pool was registered despite the earlier scheduler failure, and
+    // must be cancelled even though the WG never entered the manager's map.
+    EXPECT_EQ(cancelled_registrations, 1);
+    {
+        std::lock_guard<std::mutex> lock(controller->_mutex);
+        EXPECT_TRUE(controller->_pool_groups.empty());
+    }
+    // Also clean up if an assertion above detects a missing cancellation.
+    controller->stop();
+}
+
+// Exercise the actual registration/cancellation paths without starting query schedulers.
+TEST_F(WorkloadGroupManagerTest, AdaptiveFlushRegistrationSurvivesIdChangeAndReuse) {
+    auto* env = ExecEnv::GetInstance();
+    auto saved_engine = std::move(env->_storage_engine);
+    const bool saved_adaptive = config::enable_adaptive_flush_threads;
+    Defer restore {[&] {
+        env->set_storage_engine(std::move(saved_engine));
+        config::enable_adaptive_flush_threads = saved_adaptive;
+    }};
+    env->set_storage_engine(std::make_unique<StorageEngine>(EngineOptions {}));
+    auto* controller = env->storage_engine().adaptive_thread_controller();
+    config::enable_adaptive_flush_threads = true;
+
+    auto wg = _wg_manager->get_or_create_workload_group({.id = 1, .name = "normal"});
+    ASSERT_TRUE(ThreadPoolBuilder("wg_flush_test")
+                        .set_min_threads(1)
+                        .set_max_threads(2)
+                        .build(&wg->_memtable_flush_pool)
+                        .ok());
+    wg->register_adaptive_flush_no_lock();
+    const auto key = wg->_adaptive_flush_key;
+    ASSERT_GT(controller->get_current_threads(key), 0);
+    _wg_manager->reset_workload_group_id("normal", 100);
+    EXPECT_EQ(wg->id(), 100);
+    EXPECT_EQ(wg->_adaptive_flush_key, key);
+
+    // A second WG using the original ID must not replace the first registration.
+    auto reused = _wg_manager->get_or_create_workload_group({.id = 1, .name = "reused"});
+    ASSERT_TRUE(ThreadPoolBuilder("wg_flush_reused")
+                        .set_min_threads(1)
+                        .set_max_threads(2)
+                        .build(&reused->_memtable_flush_pool)
+                        .ok());
+    reused->register_adaptive_flush_no_lock();
+    const auto reused_key = reused->_adaptive_flush_key;
+    EXPECT_NE(key, reused_key);
+
+    // Disabling adjustment must not disable cleanup of already registered pools.
+    config::enable_adaptive_flush_threads = false;
+    wg->try_stop_schedulers();
+    wg->destroy_schedulers();
+    EXPECT_EQ(controller->get_current_threads(key), 0);
+    EXPECT_GT(controller->get_current_threads(reused_key), 0);
+    // Direct scheduler destruction must also drain the registration.
+    reused->destroy_schedulers();
+    EXPECT_EQ(controller->get_current_threads(reused_key), 0);
+    config::enable_adaptive_flush_threads = true;
+    controller->adjust_once();
 }
 
 } // namespace doris

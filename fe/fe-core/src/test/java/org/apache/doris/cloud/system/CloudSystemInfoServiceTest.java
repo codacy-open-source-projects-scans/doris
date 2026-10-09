@@ -19,15 +19,21 @@ package org.apache.doris.cloud.system;
 
 import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cloud.catalog.ComputeGroup;
+import org.apache.doris.cloud.catalog.CloudComputeGroupMeta;
+import org.apache.doris.cloud.catalog.CloudEnv;
+import org.apache.doris.cloud.proto.Cloud;
+import org.apache.doris.cloud.rpc.MetaServiceProxy;
 import org.apache.doris.common.Config;
+import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.Backend;
 
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -36,10 +42,11 @@ import java.util.Map;
 public class CloudSystemInfoServiceTest {
     private CloudSystemInfoService infoService;
 
-    @Before
+    @BeforeEach
     public void setUp() {
         // Enable cloud mode for testing
         Config.cloud_unique_id = "test_cloud_unique_id";
+        Config.meta_service_endpoint = "127.0.0.1:5000";
     }
 
     @Test
@@ -48,7 +55,7 @@ public class CloudSystemInfoServiceTest {
         // not exist cluster
         String c1 = "not_exist_cluster_1";
         String res = infoService.getPhysicalCluster(c1);
-        Assert.assertEquals(c1, res);
+        Assertions.assertEquals(c1, res);
     }
 
     @Test
@@ -56,7 +63,7 @@ public class CloudSystemInfoServiceTest {
         infoService = new CloudSystemInfoService();
         String c1 = "physical_cluster_1";
         String res = infoService.getPhysicalCluster(c1);
-        Assert.assertEquals(c1, res);
+        Assertions.assertEquals(c1, res);
     }
 
     // virtual cluster does not contain physical cluster
@@ -64,7 +71,7 @@ public class CloudSystemInfoServiceTest {
     //public void testGetPhysicalClusterEmptyVirtualCluster() {
     //    infoService = new CloudSystemInfoService();
     //    String vcgName = "v_cluster_1";
-    //    ComputeGroup vcg = new ComputeGroup("id1", vcgName, ComputeGroup.ComputeTypeEnum.VIRTUAL);
+    //    CloudComputeGroupMeta vcg = new CloudComputeGroupMeta("id1", vcgName, CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
     //    infoService.addComputeGroup(vcgName, vcg);
 
     //    String res = infoService.getPhysicalCluster(vcgName);
@@ -79,20 +86,20 @@ public class CloudSystemInfoServiceTest {
         String pcgName1 = "p_cluster_1";
         String pcgName2 = "p_cluster_2";
 
-        ComputeGroup vcg = new ComputeGroup("id1", vcgName, ComputeGroup.ComputeTypeEnum.VIRTUAL);
-        ComputeGroup.Policy policy = new ComputeGroup.Policy();
+        CloudComputeGroupMeta vcg = new CloudComputeGroupMeta("id1", vcgName, CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
         policy.setActiveComputeGroup(pcgName1);
         policy.setStandbyComputeGroup(pcgName2);
         vcg.setPolicy(policy);
 
-        ComputeGroup pcg1 = new ComputeGroup("id2", pcgName1, ComputeGroup.ComputeTypeEnum.COMPUTE);
-        ComputeGroup pcg2 = new ComputeGroup("id3", pcgName2, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg1 = new CloudComputeGroupMeta("id2", pcgName1, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg2 = new CloudComputeGroupMeta("id3", pcgName2, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(vcgName, vcg);
         infoService.addComputeGroup(pcgName1, pcg1);
         infoService.addComputeGroup(pcgName2, pcg2);
 
         String res = infoService.getPhysicalCluster(vcgName);
-        Assert.assertEquals(pcgName1, res);
+        Assertions.assertEquals(pcgName1, res);
     }
 
     // active is empty cluster and standby has 3 alive be
@@ -104,14 +111,14 @@ public class CloudSystemInfoServiceTest {
         String pcgName1 = "p_cluster_1";
         String pcgName2 = "p_cluster_2";
 
-        ComputeGroup vcg = new ComputeGroup("id1", vcgName, ComputeGroup.ComputeTypeEnum.VIRTUAL);
-        ComputeGroup.Policy policy = new ComputeGroup.Policy();
+        CloudComputeGroupMeta vcg = new CloudComputeGroupMeta("id1", vcgName, CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
         policy.setActiveComputeGroup(pcgName1);
         policy.setStandbyComputeGroup(pcgName2);
         vcg.setPolicy(policy);
 
-        ComputeGroup pcg1 = new ComputeGroup("id2", pcgName1, ComputeGroup.ComputeTypeEnum.COMPUTE);
-        ComputeGroup pcg2 = new ComputeGroup("id3", pcgName2, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg1 = new CloudComputeGroupMeta("id2", pcgName1, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg2 = new CloudComputeGroupMeta("id3", pcgName2, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(vcgName, vcg);
         infoService.addComputeGroup(pcgName1, pcg1);
         infoService.addComputeGroup(pcgName2, pcg2);
@@ -129,7 +136,7 @@ public class CloudSystemInfoServiceTest {
         infoService.updateCloudClusterMapNoLock(toAdd, new ArrayList<>());
 
         String res = infoService.getPhysicalCluster(vcgName);
-        Assert.assertEquals(pcgName2, res);
+        Assertions.assertEquals(pcgName2, res);
     }
 
     // active has 3 alive be and standby is empty cluster
@@ -141,14 +148,14 @@ public class CloudSystemInfoServiceTest {
         String pcgName1 = "p_cluster_1";
         String pcgName2 = "p_cluster_2";
 
-        ComputeGroup vcg = new ComputeGroup("id1", vcgName, ComputeGroup.ComputeTypeEnum.VIRTUAL);
-        ComputeGroup.Policy policy = new ComputeGroup.Policy();
+        CloudComputeGroupMeta vcg = new CloudComputeGroupMeta("id1", vcgName, CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
         policy.setActiveComputeGroup(pcgName1);
         policy.setStandbyComputeGroup(pcgName2);
         vcg.setPolicy(policy);
 
-        ComputeGroup pcg1 = new ComputeGroup("id2", pcgName1, ComputeGroup.ComputeTypeEnum.COMPUTE);
-        ComputeGroup pcg2 = new ComputeGroup("id3", pcgName2, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg1 = new CloudComputeGroupMeta("id2", pcgName1, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg2 = new CloudComputeGroupMeta("id3", pcgName2, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(vcgName, vcg);
         infoService.addComputeGroup(pcgName1, pcg1);
         infoService.addComputeGroup(pcgName2, pcg2);
@@ -166,7 +173,7 @@ public class CloudSystemInfoServiceTest {
         infoService.updateCloudClusterMapNoLock(toAdd, new ArrayList<>());
 
         String res = infoService.getPhysicalCluster(vcgName);
-        Assert.assertEquals(pcgName1, res);
+        Assertions.assertEquals(pcgName1, res);
     }
 
     // active has 3 alive be and standby has 3 dead be
@@ -178,14 +185,14 @@ public class CloudSystemInfoServiceTest {
         String pcgName1 = "p_cluster_1";
         String pcgName2 = "p_cluster_2";
 
-        ComputeGroup vcg = new ComputeGroup("id1", vcgName, ComputeGroup.ComputeTypeEnum.VIRTUAL);
-        ComputeGroup.Policy policy = new ComputeGroup.Policy();
+        CloudComputeGroupMeta vcg = new CloudComputeGroupMeta("id1", vcgName, CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
         policy.setActiveComputeGroup(pcgName1);
         policy.setStandbyComputeGroup(pcgName2);
         vcg.setPolicy(policy);
 
-        ComputeGroup pcg1 = new ComputeGroup("id2", pcgName1, ComputeGroup.ComputeTypeEnum.COMPUTE);
-        ComputeGroup pcg2 = new ComputeGroup("id3", pcgName2, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg1 = new CloudComputeGroupMeta("id2", pcgName1, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg2 = new CloudComputeGroupMeta("id3", pcgName2, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(vcgName, vcg);
         infoService.addComputeGroup(pcgName1, pcg1);
         infoService.addComputeGroup(pcgName2, pcg2);
@@ -215,7 +222,15 @@ public class CloudSystemInfoServiceTest {
         infoService.updateCloudClusterMapNoLock(toAdd2, new ArrayList<>());
 
         String res = infoService.getPhysicalCluster(vcgName);
-        Assert.assertEquals(pcgName1, res);
+        Assertions.assertEquals(pcgName1, res);
+
+        Backend activeBackend = toAdd1.get(1);
+        Assertions.assertSame(activeBackend,
+                infoService.getBackendInCurrentCluster(pcgName1, activeBackend.getId()));
+        Assertions.assertSame(activeBackend,
+                infoService.getBackendInCurrentCluster(vcgName, activeBackend.getId()));
+        Assertions.assertNull(infoService.getBackendInCurrentCluster(vcgName, toAdd2.get(1).getId()));
+        Assertions.assertNull(infoService.getBackendInCurrentCluster(vcgName, Long.MAX_VALUE));
     }
 
     // active has 3 dead be and standby has 3 alive be
@@ -227,14 +242,14 @@ public class CloudSystemInfoServiceTest {
         String pcgName1 = "p_cluster_1";
         String pcgName2 = "p_cluster_2";
 
-        ComputeGroup vcg = new ComputeGroup("id1", vcgName, ComputeGroup.ComputeTypeEnum.VIRTUAL);
-        ComputeGroup.Policy policy = new ComputeGroup.Policy();
+        CloudComputeGroupMeta vcg = new CloudComputeGroupMeta("id1", vcgName, CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
         policy.setActiveComputeGroup(pcgName1);
         policy.setStandbyComputeGroup(pcgName2);
         vcg.setPolicy(policy);
 
-        ComputeGroup pcg1 = new ComputeGroup("id2", pcgName1, ComputeGroup.ComputeTypeEnum.COMPUTE);
-        ComputeGroup pcg2 = new ComputeGroup("id3", pcgName2, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg1 = new CloudComputeGroupMeta("id2", pcgName1, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg2 = new CloudComputeGroupMeta("id3", pcgName2, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(vcgName, vcg);
         infoService.addComputeGroup(pcgName1, pcg1);
         infoService.addComputeGroup(pcgName2, pcg2);
@@ -264,7 +279,66 @@ public class CloudSystemInfoServiceTest {
         infoService.updateCloudClusterMapNoLock(toAdd2, new ArrayList<>());
 
         String res = infoService.getPhysicalCluster(vcgName);
-        Assert.assertEquals(pcgName2, res);
+        Assertions.assertEquals(pcgName2, res);
+    }
+
+    @Test
+    public void testGetPhysicalClusterSwitchActiveStandbyMetric() throws Exception {
+        infoService = new CloudSystemInfoService();
+
+        String vcgName = "v_cluster_1";
+        String vcgId = "id1";
+        String pcgName1 = "p_cluster_1";
+        String pcgName2 = "p_cluster_2";
+
+        CloudComputeGroupMeta vcg = new CloudComputeGroupMeta(vcgId, vcgName, CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
+        policy.setActiveComputeGroup(pcgName1);
+        policy.setStandbyComputeGroup(pcgName2);
+        policy.setUnhealthyNodeThresholdPercent(100);
+        vcg.setPolicy(policy);
+
+        CloudComputeGroupMeta pcg2 = new CloudComputeGroupMeta("id3", pcgName2, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
+        infoService.addComputeGroup(vcgId, vcg);
+        infoService.clusterNameToId.put(pcgName1, "id2");
+        infoService.addComputeGroup("id3", pcg2);
+
+        List<Backend> toAdd2 = new ArrayList<>();
+        for (int i = 0; i < 3; ++i) {
+            Backend b = new Backend(i + 4, "", i);
+            Map<String, String> newTagMap = Tag.DEFAULT_BACKEND_TAG.toMap();
+            newTagMap.put(Tag.CLOUD_CLUSTER_NAME, pcgName2);
+            newTagMap.put(Tag.CLOUD_CLUSTER_ID, "id3");
+            b.setTagMap(newTagMap);
+            b.setAlive(true);
+            toAdd2.add(b);
+        }
+        infoService.updateCloudClusterMapNoLock(toAdd2, new ArrayList<>());
+        Assertions.assertNull(infoService.getComputeGroupByName(pcgName1));
+        Assertions.assertTrue(infoService.isComputeGroupAvailable(pcgName2, policy.getUnhealthyNodeThresholdPercent()));
+
+        CloudEnv cloudEnv = Mockito.mock(CloudEnv.class);
+        Mockito.when(cloudEnv.getCloudInstanceId()).thenReturn("instance_id");
+        MetaServiceProxy metaServiceProxy = Mockito.mock(MetaServiceProxy.class);
+        Cloud.AlterClusterResponse response = Cloud.AlterClusterResponse.newBuilder()
+                .setStatus(Cloud.MetaServiceResponseStatus.newBuilder()
+                        .setCode(Cloud.MetaServiceCode.OK)
+                        .setMsg("OK"))
+                .build();
+        Mockito.when(metaServiceProxy.alterCluster(Mockito.any())).thenReturn(response);
+
+        try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class);
+                MockedStatic<MetaServiceProxy> mockedMetaServiceProxy = Mockito.mockStatic(MetaServiceProxy.class);
+                MockedStatic<MetricRepo> mockedMetricRepo = Mockito.mockStatic(MetricRepo.class)) {
+            mockedEnv.when(Env::getCurrentEnv).thenReturn(cloudEnv);
+            mockedMetaServiceProxy.when(MetaServiceProxy::getInstance).thenReturn(metaServiceProxy);
+
+            String res = infoService.getPhysicalCluster(vcgName);
+
+            Assertions.assertEquals(pcgName2, res);
+            mockedMetricRepo.verify(() ->
+                    MetricRepo.increaseVirtualComputeGroupSwitch(vcgId, vcgName, "id2", pcgName1, "id3", pcgName2));
+        }
     }
 
     // active has 1 alive be and 2 dead be, standby has 3 alive be
@@ -276,14 +350,14 @@ public class CloudSystemInfoServiceTest {
         String pcgName1 = "p_cluster_1";
         String pcgName2 = "p_cluster_2";
 
-        ComputeGroup vcg = new ComputeGroup("id1", vcgName, ComputeGroup.ComputeTypeEnum.VIRTUAL);
-        ComputeGroup.Policy policy = new ComputeGroup.Policy();
+        CloudComputeGroupMeta vcg = new CloudComputeGroupMeta("id1", vcgName, CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
         policy.setActiveComputeGroup(pcgName1);
         policy.setStandbyComputeGroup(pcgName2);
         vcg.setPolicy(policy);
 
-        ComputeGroup pcg1 = new ComputeGroup("id2", pcgName1, ComputeGroup.ComputeTypeEnum.COMPUTE);
-        ComputeGroup pcg2 = new ComputeGroup("id3", pcgName2, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg1 = new CloudComputeGroupMeta("id2", pcgName1, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg2 = new CloudComputeGroupMeta("id3", pcgName2, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(vcgName, vcg);
         infoService.addComputeGroup(pcgName1, pcg1);
         infoService.addComputeGroup(pcgName2, pcg2);
@@ -317,7 +391,7 @@ public class CloudSystemInfoServiceTest {
         infoService.updateCloudClusterMapNoLock(toAdd2, new ArrayList<>());
 
         String res = infoService.getPhysicalCluster(vcgName);
-        Assert.assertEquals(pcgName1, res);
+        Assertions.assertEquals(pcgName1, res);
     }
 
     @Test
@@ -329,28 +403,28 @@ public class CloudSystemInfoServiceTest {
         String pcgName2 = "p_cluster_2";
         String pcgName3 = "p_cluster_3";
 
-        ComputeGroup vcg = new ComputeGroup("id1", vcgName, ComputeGroup.ComputeTypeEnum.VIRTUAL);
-        ComputeGroup.Policy policy = new ComputeGroup.Policy();
+        CloudComputeGroupMeta vcg = new CloudComputeGroupMeta("id1", vcgName, CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
         policy.setActiveComputeGroup(pcgName1);
         policy.setStandbyComputeGroup(pcgName2);
         vcg.setPolicy(policy);
 
-        ComputeGroup pcg1 = new ComputeGroup("id2", pcgName1, ComputeGroup.ComputeTypeEnum.COMPUTE);
-        ComputeGroup pcg2 = new ComputeGroup("id3", pcgName2, ComputeGroup.ComputeTypeEnum.COMPUTE);
-        ComputeGroup pcg3 = new ComputeGroup("id4", pcgName2, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg1 = new CloudComputeGroupMeta("id2", pcgName1, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg2 = new CloudComputeGroupMeta("id3", pcgName2, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta pcg3 = new CloudComputeGroupMeta("id4", pcgName2, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(vcgName, vcg);
         infoService.addComputeGroup(pcgName1, pcg1);
         infoService.addComputeGroup(pcgName2, pcg2);
         infoService.addComputeGroup(pcgName3, pcg3);
 
         boolean res = infoService.isStandByComputeGroup(vcgName);
-        Assert.assertFalse(res);
+        Assertions.assertFalse(res);
         res = infoService.isStandByComputeGroup(pcgName1);
-        Assert.assertFalse(res);
+        Assertions.assertFalse(res);
         res = infoService.isStandByComputeGroup(pcgName2);
-        Assert.assertTrue(res);
+        Assertions.assertTrue(res);
         res = infoService.isStandByComputeGroup(pcgName3);
-        Assert.assertFalse(res);
+        Assertions.assertFalse(res);
     }
 
     // Test for getMinPipelineExecutorSize method
@@ -361,7 +435,7 @@ public class CloudSystemInfoServiceTest {
         String clusterId = "test_cluster_id";
 
         // Mock an empty cluster (no backends)
-        ComputeGroup cg = new ComputeGroup(clusterId, clusterName, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg = new CloudComputeGroupMeta(clusterId, clusterName, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(clusterId, cg);
 
         // Set ConnectContext to select the cluster
@@ -370,7 +444,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Since there are no backends in the cluster, should return 1
             int result = infoService.getMinPipelineExecutorSize(clusterName);
-            Assert.assertEquals(1, result);
+            Assertions.assertEquals(1, result);
         } finally {
             ConnectContext.remove();
         }
@@ -383,7 +457,7 @@ public class CloudSystemInfoServiceTest {
         String clusterId = "test_cluster_id";
 
         // Setup cluster
-        ComputeGroup cg = new ComputeGroup(clusterId, clusterName, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg = new CloudComputeGroupMeta(clusterId, clusterName, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(clusterId, cg);
 
         // Add a backend with pipeline executor size = 8
@@ -404,7 +478,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return the pipeline executor size of the single backend
             int result = infoService.getMinPipelineExecutorSize(clusterName);
-            Assert.assertEquals(8, result);
+            Assertions.assertEquals(8, result);
         } finally {
             ConnectContext.remove();
         }
@@ -417,7 +491,7 @@ public class CloudSystemInfoServiceTest {
         String clusterId = "test_cluster_id";
 
         // Setup cluster
-        ComputeGroup cg = new ComputeGroup(clusterId, clusterName, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg = new CloudComputeGroupMeta(clusterId, clusterName, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(clusterId, cg);
 
         // Add multiple backends with different pipeline executor sizes
@@ -455,7 +529,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return the minimum pipeline executor size (6)
             int result = infoService.getMinPipelineExecutorSize(clusterName);
-            Assert.assertEquals(6, result);
+            Assertions.assertEquals(6, result);
         } finally {
             ConnectContext.remove();
         }
@@ -468,7 +542,7 @@ public class CloudSystemInfoServiceTest {
         String clusterId = "test_cluster_id";
 
         // Setup cluster
-        ComputeGroup cg = new ComputeGroup(clusterId, clusterName, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg = new CloudComputeGroupMeta(clusterId, clusterName, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(clusterId, cg);
 
         // Add backends with zero and positive pipeline executor sizes
@@ -506,7 +580,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return the minimum positive pipeline executor size (4)
             int result = infoService.getMinPipelineExecutorSize(clusterName);
-            Assert.assertEquals(4, result);
+            Assertions.assertEquals(4, result);
         } finally {
             ConnectContext.remove();
         }
@@ -519,7 +593,7 @@ public class CloudSystemInfoServiceTest {
         String clusterId = "test_cluster_id";
 
         // Setup cluster
-        ComputeGroup cg = new ComputeGroup(clusterId, clusterName, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg = new CloudComputeGroupMeta(clusterId, clusterName, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(clusterId, cg);
 
         // Add backends with only zero or negative pipeline executor sizes
@@ -550,7 +624,7 @@ public class CloudSystemInfoServiceTest {
             // Should return 1 when no valid pipeline executor sizes are
             // found
             int result = infoService.getMinPipelineExecutorSize(clusterName);
-            Assert.assertEquals(1, result);
+            Assertions.assertEquals(1, result);
         } finally {
             ConnectContext.remove();
         }
@@ -566,7 +640,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return 1 when no cluster is set in ConnectContext
             int result = infoService.getMinPipelineExecutorSize("");
-            Assert.assertEquals(1, result);
+            Assertions.assertEquals(1, result);
         } finally {
             ConnectContext.remove();
         }
@@ -579,7 +653,7 @@ public class CloudSystemInfoServiceTest {
         String clusterId = "mixed_cluster_id";
 
         // Setup cluster
-        ComputeGroup cg = new ComputeGroup(clusterId, clusterName, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg = new CloudComputeGroupMeta(clusterId, clusterName, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(clusterId, cg);
 
         // Add backends with mixed valid and invalid pipeline executor sizes
@@ -629,7 +703,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return 8 (minimum valid size)
             int result = infoService.getMinPipelineExecutorSize(clusterName);
-            Assert.assertEquals(8, result);
+            Assertions.assertEquals(8, result);
         } finally {
             ConnectContext.remove();
         }
@@ -642,7 +716,7 @@ public class CloudSystemInfoServiceTest {
         String clusterId = "large_cluster_id";
 
         // Setup cluster
-        ComputeGroup cg = new ComputeGroup(clusterId, clusterName, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg = new CloudComputeGroupMeta(clusterId, clusterName, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(clusterId, cg);
 
         // Add backends with large pipeline executor sizes
@@ -680,7 +754,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return 512 (minimum among large values)
             int result = infoService.getMinPipelineExecutorSize(clusterName);
-            Assert.assertEquals(512, result);
+            Assertions.assertEquals(512, result);
         } finally {
             ConnectContext.remove();
         }
@@ -693,7 +767,7 @@ public class CloudSystemInfoServiceTest {
         String clusterId = "consistency_cluster_id";
 
         // Setup cluster
-        ComputeGroup cg = new ComputeGroup(clusterId, clusterName, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg = new CloudComputeGroupMeta(clusterId, clusterName, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(clusterId, cg);
 
         // Add backends with same pipeline executor sizes
@@ -716,7 +790,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return 32 (consistent across all backends)
             int result = infoService.getMinPipelineExecutorSize(clusterName);
-            Assert.assertEquals(32, result);
+            Assertions.assertEquals(32, result);
         } finally {
             ConnectContext.remove();
         }
@@ -734,11 +808,11 @@ public class CloudSystemInfoServiceTest {
         String cluster2Id = "cluster2_id";
 
         // Setup cluster1
-        ComputeGroup cg1 = new ComputeGroup(cluster1Id, cluster1Name, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg1 = new CloudComputeGroupMeta(cluster1Id, cluster1Name, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(cluster1Id, cg1);
 
         // Setup cluster2
-        ComputeGroup cg2 = new ComputeGroup(cluster2Id, cluster2Name, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg2 = new CloudComputeGroupMeta(cluster2Id, cluster2Name, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(cluster2Id, cg2);
 
         // Add backends to cluster1 with smaller pipeline executor sizes
@@ -787,7 +861,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return 8 (minimum from current cluster2), not 2 (global minimum from cluster1)
             int result = infoService.getMinPipelineExecutorSize(cluster2Name);
-            Assert.assertEquals(8, result);
+            Assertions.assertEquals(8, result);
         } finally {
             ConnectContext.remove();
         }
@@ -806,20 +880,20 @@ public class CloudSystemInfoServiceTest {
         String otherClusterId = "other_cluster_id";
 
         // Setup virtual cluster
-        ComputeGroup virtualCg = new ComputeGroup(virtualClusterId, virtualClusterName,
-                ComputeGroup.ComputeTypeEnum.VIRTUAL);
-        ComputeGroup.Policy policy = new ComputeGroup.Policy();
+        CloudComputeGroupMeta virtualCg = new CloudComputeGroupMeta(virtualClusterId, virtualClusterName,
+                CloudComputeGroupMeta.ComputeTypeEnum.VIRTUAL);
+        CloudComputeGroupMeta.Policy policy = new CloudComputeGroupMeta.Policy();
         policy.setActiveComputeGroup(physicalClusterName);
         virtualCg.setPolicy(policy);
         infoService.addComputeGroup(virtualClusterId, virtualCg);
 
         // Setup physical cluster
-        ComputeGroup physicalCg = new ComputeGroup(physicalClusterId, physicalClusterName,
-                ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta physicalCg = new CloudComputeGroupMeta(physicalClusterId, physicalClusterName,
+                CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(physicalClusterId, physicalCg);
 
         // Setup other cluster
-        ComputeGroup otherCg = new ComputeGroup(otherClusterId, otherClusterName, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta otherCg = new CloudComputeGroupMeta(otherClusterId, otherClusterName, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(otherClusterId, otherCg);
 
         // Add backends to physical cluster
@@ -861,14 +935,14 @@ public class CloudSystemInfoServiceTest {
             // Should return 32 (minimum from virtual cluster's physical cluster), not 8
             // (from other cluster)
             int result = infoService.getMinPipelineExecutorSize(virtualClusterName);
-            Assert.assertEquals(32, result);
+            Assertions.assertEquals(32, result);
 
             // Switch to other cluster
             ctx.setCloudCluster(otherClusterName);
 
             // Should return 8 (from other cluster)
             result = infoService.getMinPipelineExecutorSize(otherClusterName);
-            Assert.assertEquals(8, result);
+            Assertions.assertEquals(8, result);
 
         } finally {
             // Clean up ConnectContext
@@ -886,7 +960,7 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return 1 because no cluster is set (will catch AnalysisException)
             int result = infoService.getMinPipelineExecutorSize("");
-            Assert.assertEquals(1, result);
+            Assertions.assertEquals(1, result);
 
         } finally {
             // Clean up ConnectContext
@@ -906,11 +980,11 @@ public class CloudSystemInfoServiceTest {
         String cluster2Id = "ctx_cluster2_id";
 
         // Setup cluster1
-        ComputeGroup cg1 = new ComputeGroup(cluster1Id, cluster1Name, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg1 = new CloudComputeGroupMeta(cluster1Id, cluster1Name, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(cluster1Id, cg1);
 
         // Setup cluster2
-        ComputeGroup cg2 = new ComputeGroup(cluster2Id, cluster2Name, ComputeGroup.ComputeTypeEnum.COMPUTE);
+        CloudComputeGroupMeta cg2 = new CloudComputeGroupMeta(cluster2Id, cluster2Name, CloudComputeGroupMeta.ComputeTypeEnum.COMPUTE);
         infoService.addComputeGroup(cluster2Id, cg2);
 
         // Add backends to cluster1 with smaller pipeline executor sizes
@@ -959,18 +1033,33 @@ public class CloudSystemInfoServiceTest {
         try {
             // Should return 2 (minimum from cluster1), not 16 (minimum from cluster2)
             int result = infoService.getMinPipelineExecutorSize(cluster1Name);
-            Assert.assertEquals(2, result);
+            Assertions.assertEquals(2, result);
 
             // Now switch to cluster2
             ctx.setCloudCluster(cluster2Name);
 
             // Should return 16 (minimum from cluster2), not 2 (minimum from cluster1)
             result = infoService.getMinPipelineExecutorSize(cluster2Name);
-            Assert.assertEquals(16, result);
+            Assertions.assertEquals(16, result);
         } finally {
             // Clean up ConnectContext
             ConnectContext.remove();
         }
+    }
+
+    @Test
+    public void testContainsCloudCluster() {
+        infoService = new CloudSystemInfoService();
+        // Empty / null inputs short-circuit without touching the map.
+        Assertions.assertFalse(infoService.containsCloudCluster(null));
+        Assertions.assertFalse(infoService.containsCloudCluster(""));
+        // Unknown cluster name -> false.
+        Assertions.assertFalse(infoService.containsCloudCluster("absent_cluster"));
+        // Register a cluster; lookup must hit.
+        infoService.addVirtualClusterInfoToMapsNoLock("cid_1", "cluster_1");
+        Assertions.assertTrue(infoService.containsCloudCluster("cluster_1"));
+        // Different name in same map -> still false.
+        Assertions.assertFalse(infoService.containsCloudCluster("cluster_2"));
     }
 
     /**

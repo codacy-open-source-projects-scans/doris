@@ -17,12 +17,30 @@
 
 package org.apache.doris.common.proc;
 
+import org.apache.doris.catalog.Database;
+import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.MaterializedIndex;
+import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.Replica;
+import org.apache.doris.catalog.Tablet;
+import org.apache.doris.catalog.TabletInvertedIndex;
+import org.apache.doris.catalog.TabletMeta;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.system.SystemInfoService;
+import org.apache.doris.thrift.TStorageMedium;
 
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import com.google.common.collect.ImmutableMap;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
+
+import java.util.Collections;
+import java.util.List;
 
 public class ProcServiceTest {
     private class EmptyProcNode implements ProcNodeInterface {
@@ -42,28 +60,28 @@ public class ProcServiceTest {
     //   | - conf
     //   | - build.sh
     // | - common
-    @Before
+    @BeforeEach
     public void beforeTest() {
         ProcService procService = ProcService.getInstance();
 
         BaseProcDir paloDir = new BaseProcDir();
-        Assert.assertTrue(procService.register("palo", paloDir));
+        Assertions.assertTrue(procService.register("palo", paloDir));
 
         BaseProcDir beDir = new BaseProcDir();
-        Assert.assertTrue(paloDir.register("be", beDir));
-        Assert.assertTrue(beDir.register("src", new BaseProcDir()));
-        Assert.assertTrue(beDir.register("deps", new BaseProcDir()));
+        Assertions.assertTrue(paloDir.register("be", beDir));
+        Assertions.assertTrue(beDir.register("src", new BaseProcDir()));
+        Assertions.assertTrue(beDir.register("deps", new BaseProcDir()));
 
         BaseProcDir feDir = new BaseProcDir();
-        Assert.assertTrue(paloDir.register("fe", feDir));
-        Assert.assertTrue(feDir.register("src", new BaseProcDir()));
-        Assert.assertTrue(feDir.register("conf", new BaseProcDir()));
-        Assert.assertTrue(feDir.register("build.sh", new EmptyProcNode()));
+        Assertions.assertTrue(paloDir.register("fe", feDir));
+        Assertions.assertTrue(feDir.register("src", new BaseProcDir()));
+        Assertions.assertTrue(feDir.register("conf", new BaseProcDir()));
+        Assertions.assertTrue(feDir.register("build.sh", new EmptyProcNode()));
 
-        Assert.assertTrue(paloDir.register("common", new BaseProcDir()));
+        Assertions.assertTrue(paloDir.register("common", new BaseProcDir()));
     }
 
-    @After
+    @AfterEach
     public void afterTest() {
         ProcService.destroy();
     }
@@ -74,7 +92,7 @@ public class ProcServiceTest {
         String name = "test";
         BaseProcDir dir = new BaseProcDir();
 
-        Assert.assertTrue(procService.register(name, dir));
+        Assertions.assertTrue(procService.register(name, dir));
     }
 
     // register second time
@@ -84,8 +102,8 @@ public class ProcServiceTest {
         String name = "test";
         BaseProcDir dir = new BaseProcDir();
 
-        Assert.assertTrue(procService.register(name, dir));
-        Assert.assertFalse(procService.register(name, dir));
+        Assertions.assertTrue(procService.register(name, dir));
+        Assertions.assertFalse(procService.register(name, dir));
     }
 
     // register invalid
@@ -95,9 +113,9 @@ public class ProcServiceTest {
         String name = "test";
         BaseProcDir dir = new BaseProcDir();
 
-        Assert.assertFalse(procService.register(null, dir));
-        Assert.assertFalse(procService.register("", dir));
-        Assert.assertFalse(procService.register(name, null));
+        Assertions.assertFalse(procService.register(null, dir));
+        Assertions.assertFalse(procService.register("", dir));
+        Assertions.assertFalse(procService.register(name, null));
     }
 
     @Test
@@ -105,16 +123,16 @@ public class ProcServiceTest {
         ProcService procService = ProcService.getInstance();
 
         // assert root
-        Assert.assertNotNull(procService.open("/"));
-        Assert.assertNotNull(procService.open("/palo"));
-        Assert.assertNotNull(procService.open("/palo/be"));
-        Assert.assertNotNull(procService.open("/palo/be/src"));
-        Assert.assertNotNull(procService.open("/palo/be/deps"));
-        Assert.assertNotNull(procService.open("/palo/fe"));
-        Assert.assertNotNull(procService.open("/palo/fe/src"));
-        Assert.assertNotNull(procService.open("/palo/fe/conf"));
-        Assert.assertNotNull(procService.open("/palo/fe/build.sh"));
-        Assert.assertNotNull(procService.open("/palo/common"));
+        Assertions.assertNotNull(procService.open("/"));
+        Assertions.assertNotNull(procService.open("/palo"));
+        Assertions.assertNotNull(procService.open("/palo/be"));
+        Assertions.assertNotNull(procService.open("/palo/be/src"));
+        Assertions.assertNotNull(procService.open("/palo/be/deps"));
+        Assertions.assertNotNull(procService.open("/palo/fe"));
+        Assertions.assertNotNull(procService.open("/palo/fe/src"));
+        Assertions.assertNotNull(procService.open("/palo/fe/conf"));
+        Assertions.assertNotNull(procService.open("/palo/fe/build.sh"));
+        Assertions.assertNotNull(procService.open("/palo/common"));
     }
 
     @Test
@@ -122,18 +140,18 @@ public class ProcServiceTest {
         ProcService procService = ProcService.getInstance();
 
         // assert space
-        Assert.assertNotNull(procService.open(" \r/"));
-        Assert.assertNotNull(procService.open(" \r/ "));
-        Assert.assertNotNull(procService.open("  /palo \r\n"));
-        Assert.assertNotNull(procService.open("\n\r\t /palo/be \n\r"));
+        Assertions.assertNotNull(procService.open(" \r/"));
+        Assertions.assertNotNull(procService.open(" \r/ "));
+        Assertions.assertNotNull(procService.open("  /palo \r\n"));
+        Assertions.assertNotNull(procService.open("\n\r\t /palo/be \n\r"));
 
         // assert last '/'
-        Assert.assertNotNull(procService.open(" /palo/be/"));
-        Assert.assertNotNull(procService.open(" /palo/fe/  "));
+        Assertions.assertNotNull(procService.open(" /palo/be/"));
+        Assertions.assertNotNull(procService.open(" /palo/fe/  "));
 
         ProcNodeInterface node = procService.open("/dbs");
-        Assert.assertNotNull(node);
-        Assert.assertTrue(node instanceof DbsProcDir);
+        Assertions.assertNotNull(node);
+        Assertions.assertTrue(node instanceof DbsProcDir);
     }
 
     @Test
@@ -148,29 +166,84 @@ public class ProcServiceTest {
             ++errCount;
         }
         try {
-            Assert.assertNull(procService.open("/palo/b e"));
+            Assertions.assertNull(procService.open("/palo/b e"));
         } catch (AnalysisException e) {
             ++errCount;
         }
         try {
-            Assert.assertNull(procService.open("/palo/fe/build.sh/"));
+            Assertions.assertNull(procService.open("/palo/fe/build.sh/"));
         } catch (AnalysisException e) {
             ++errCount;
         }
 
         // assert no root
         try {
-            Assert.assertNull(procService.open("palo"));
+            Assertions.assertNull(procService.open("palo"));
         } catch (AnalysisException e) {
             ++errCount;
         }
         try {
-            Assert.assertNull(procService.open(" palo"));
+            Assertions.assertNull(procService.open(" palo"));
         } catch (AnalysisException e) {
             ++errCount;
         }
 
-        Assert.assertEquals(5, errCount);
+        Assertions.assertEquals(5, errCount);
+    }
+
+    @Test
+    public void testTabletProc() throws AnalysisException {
+        List<String> replicasTitles = ReplicasProcNode.TITLE_NAMES;
+        int replicaIdIdx = replicasTitles.indexOf("ReplicaId");
+        int backendIdIdx = replicasTitles.indexOf("BackendId");
+        int versionIdx = replicasTitles.indexOf("Version");
+        int lastSuccessVersionIdx = replicasTitles.indexOf("LstSuccessVersion");
+
+        long tabletId = 10001L;
+        long backendId = 10002L;
+
+        SystemInfoService systemInfoService = Mockito.mock(SystemInfoService.class);
+        TabletInvertedIndex tabletInvertedIndex = Mockito.mock(TabletInvertedIndex.class);
+        InternalCatalog internalCatalog = Mockito.mock(InternalCatalog.class);
+        Database database = Mockito.mock(Database.class);
+        OlapTable table = Mockito.mock(OlapTable.class);
+        Partition partition = Mockito.mock(Partition.class);
+        MaterializedIndex index = Mockito.mock(MaterializedIndex.class);
+        Tablet tablet = Mockito.mock(Tablet.class);
+        Replica replica = Mockito.mock(Replica.class);
+
+        TabletMeta tabletMeta = new TabletMeta(20001L, 20002L, 20003L, 20004L, 12345, TStorageMedium.HDD,
+                false /* isRowBinlog */);
+
+        Mockito.when(systemInfoService.getAllBackendsByAllCluster()).thenReturn(ImmutableMap.of());
+        Mockito.when(tabletInvertedIndex.getTabletMeta(tabletId)).thenReturn(tabletMeta);
+        Mockito.when(internalCatalog.getDbNullable(tabletMeta.getDbId())).thenReturn(database);
+        Mockito.when(database.getTableNullable(tabletMeta.getTableId())).thenReturn(table);
+        Mockito.when(table.getPartition(tabletMeta.getPartitionId())).thenReturn(partition);
+        Mockito.when(partition.getIndex(tabletMeta.getIndexId())).thenReturn(index);
+        Mockito.when(index.getTablet(tabletId)).thenReturn(tablet);
+
+        Mockito.when(replica.getId()).thenReturn(6006L);
+        Mockito.when(replica.getBackendIdWithoutException()).thenReturn(backendId);
+        Mockito.when(replica.getVersion()).thenReturn(101L);
+        Mockito.when(replica.getLastSuccessVersion()).thenReturn(100L);
+
+        try (MockedStatic<Env> mockedEnvStatic = Mockito.mockStatic(Env.class)) {
+            mockedEnvStatic.when(Env::getCurrentSystemInfo).thenReturn(systemInfoService);
+            mockedEnvStatic.when(Env::getCurrentInvertedIndex).thenReturn(tabletInvertedIndex);
+            mockedEnvStatic.when(Env::getCurrentInternalCatalog).thenReturn(internalCatalog);
+
+            ProcResult result = new ReplicasProcNode(tabletId, Collections.singletonList(replica)).fetchResult();
+            List<List<String>> rows = result.getRows();
+            Assertions.assertEquals(1, rows.size());
+
+            List<String> row = rows.get(0);
+            Assertions.assertEquals(replicasTitles.size(), row.size());
+            Assertions.assertEquals("6006", row.get(replicaIdIdx));
+            Assertions.assertEquals("10002", row.get(backendIdIdx));
+            Assertions.assertEquals("101", row.get(versionIdx));
+            Assertions.assertEquals("100", row.get(lastSuccessVersionIdx));
+        }
     }
 
 }

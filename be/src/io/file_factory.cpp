@@ -49,29 +49,31 @@
 #include "load/stream_load/stream_load_context.h"
 #include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
+#include "service/backend_options.h"
 #include "util/s3_uri.h"
 #include "util/s3_util.h"
+#include "util/string_util.h"
 #include "util/uid_util.h"
 
 namespace doris {
 
 constexpr std::string_view RANDOM_CACHE_BASE_PATH = "random";
 
-io::FileReaderOptions FileFactory::get_reader_options(RuntimeState* state,
+io::FileReaderOptions FileFactory::get_reader_options(const TQueryOptions& option,
                                                       const io::FileDescription& fd) {
     io::FileReaderOptions opts {
             .cache_base_path {},
             .file_size = fd.file_size,
             .mtime = fd.mtime,
+            .storage_resource_id {},
     };
-    if (config::enable_file_cache && state != nullptr &&
-        state->query_options().__isset.enable_file_cache &&
-        state->query_options().enable_file_cache && fd.file_cache_admission) {
+    if (config::enable_file_cache && option.__isset.enable_file_cache && option.enable_file_cache &&
+        fd.file_cache_admission) {
         opts.cache_type = io::FileCachePolicy::FILE_BLOCK_CACHE;
     }
-    if (state != nullptr && state->query_options().__isset.file_cache_base_path &&
-        state->query_options().file_cache_base_path != RANDOM_CACHE_BASE_PATH) {
-        opts.cache_base_path = state->query_options().file_cache_base_path;
+    if (option.__isset.file_cache_base_path &&
+        option.file_cache_base_path != RANDOM_CACHE_BASE_PATH) {
+        opts.cache_base_path = option.file_cache_base_path;
     }
     return opts;
 }
@@ -121,7 +123,7 @@ Result<io::FileSystemSPtr> FileFactory::create_fs(const io::FSPropertiesRef& fs_
     case TFileType::FILE_HDFS: {
         std::string fs_name = _get_fs_name(file_description);
         return io::HdfsFileSystem::create(*fs_properties.properties, fs_name,
-                                          io::FileSystem::TMP_FS_ID, nullptr);
+                                          io::FileSystem::TMP_FS_ID);
     }
     case TFileType::FILE_HTTP: {
         const auto& kv = *fs_properties.properties;
@@ -247,7 +249,7 @@ Result<io::FileReaderSPtr> FileFactory::_create_file_reader_internal(
         RETURN_IF_ERROR_RESULT(ExecEnv::GetInstance()->hdfs_mgr()->get_or_create_fs(
                 system_properties.hdfs_params, *fs_name, &handler));
         return io::HdfsFileReader::create(file_description.path, handler->hdfs_fs, *fs_name,
-                                          reader_options, profile)
+                                          reader_options)
                 .and_then([&](auto&& reader) {
                     return io::create_cached_file_reader(std::move(reader), reader_options);
                 });
@@ -270,10 +272,16 @@ Result<io::FileReaderSPtr> FileFactory::_create_file_reader_internal(
                 });
     }
     case TFileType::FILE_HTTP: {
+        auto options = reader_options;
+        auto chunk_response = system_properties.properties.find("http.enable.chunk.response");
+        if (chunk_response != system_properties.properties.end() &&
+            (iequal(chunk_response->second, "true") || chunk_response->second == "1")) {
+            options.cache_type = io::FileCachePolicy::NO_CACHE;
+        }
         return io::HttpFileReader::create(file_description.path, system_properties.properties,
-                                          reader_options, profile)
-                .and_then([&](auto&& reader) {
-                    return io::create_cached_file_reader(std::move(reader), reader_options);
+                                          options, profile)
+                .and_then([&options](auto&& reader) {
+                    return io::create_cached_file_reader(std::move(reader), options);
                 });
     }
     default:

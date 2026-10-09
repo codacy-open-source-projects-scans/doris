@@ -277,7 +277,7 @@ public:
         jsonb_column->reserve(load_cols[0]->size());
         MutableColumns assert_cols;
         for (size_t i = 0; i < load_cols.size(); ++i) {
-            assert_cols.push_back(load_cols[i]->assume_mutable());
+            assert_cols.push_back(load_cols[i]->clone_empty());
         }
         DataTypeSerDe::FormatOptions options;
         auto tz = cctz::utc_time_zone();
@@ -372,8 +372,8 @@ public:
         // convert block to arrow
         std::shared_ptr<arrow::RecordBatch> result;
         cctz::time_zone _timezone_obj; //default UTC
-        Status stt = convert_to_arrow_batch(*block, block_arrow_schema,
-                                            arrow::default_memory_pool(), &result, _timezone_obj);
+        Status stt = DorisArrowBlockConvertor(block_arrow_schema, _timezone_obj)
+                             .convert_to_arrow(*block, arrow::default_memory_pool(), &result);
         EXPECT_EQ(Status::OK(), stt) << "convert block to arrow failed" << stt.to_string();
         std::cout << "arrow serialize result: " << result->num_columns() << ", "
                   << result->num_rows() << std::endl;

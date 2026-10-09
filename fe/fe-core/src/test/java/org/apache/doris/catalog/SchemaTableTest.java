@@ -35,8 +35,8 @@ import org.apache.doris.nereids.types.JsonType;
 import org.apache.doris.nereids.types.StringType;
 import org.apache.doris.utframe.TestWithFeService;
 
-import org.junit.Test;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 
@@ -84,6 +84,7 @@ public class SchemaTableTest {
         SchemaTable sqlBlockRuleStatus = (SchemaTable) SchemaTable.TABLE_MAP.get("sql_block_rule_status");
         Assertions.assertTrue(sqlBlockRuleStatus.shouldFetchAllFe());
         Assertions.assertTrue(sqlBlockRuleStatus.shouldAddAgg());
+        Assertions.assertEquals("REQUIRE_PARTITION_FILTER", sqlBlockRuleStatus.getFullSchema().get(8).getName());
 
         SchemaTable processlist = (SchemaTable) SchemaTable.TABLE_MAP.get("processlist");
         Assertions.assertTrue(processlist.shouldFetchAllFe());
@@ -115,5 +116,16 @@ public class SchemaTableTest {
         Assertions.assertEquals("CREATE_TIME", roleMappings.getFullSchema().get(5).getName());
         Assertions.assertEquals("ALTER_USER", roleMappings.getFullSchema().get(6).getName());
         Assertions.assertEquals("MODIFY_TIME", roleMappings.getFullSchema().get(7).getName());
+
+        SchemaTable tsoStatus = (SchemaTable) SchemaTable.TABLE_MAP.get("tso_status");
+        Assertions.assertFalse(tsoStatus.shouldFetchAllFe());
+        Assertions.assertFalse(tsoStatus.shouldAddAgg());
+        Assertions.assertEquals(6, tsoStatus.getFullSchema().size());
+        Assertions.assertEquals("WINDOW_END_PHYSICAL_TIME", tsoStatus.getFullSchema().get(0).getName());
+        Assertions.assertEquals("CURRENT_TSO", tsoStatus.getFullSchema().get(1).getName());
+        Assertions.assertEquals("CURRENT_TSO_PHYSICAL_TIME", tsoStatus.getFullSchema().get(2).getName());
+        Assertions.assertEquals("CURRENT_TSO_LOGICAL_COUNTER", tsoStatus.getFullSchema().get(3).getName());
+        Assertions.assertEquals("COMMITTED_TSO", tsoStatus.getFullSchema().get(4).getName());
+        Assertions.assertEquals("COMMITTED_TSO_PHYSICAL_TIME", tsoStatus.getFullSchema().get(5).getName());
     }
 }

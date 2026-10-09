@@ -99,8 +99,8 @@ public class ShowCreateUserCommand extends ShowCommand {
         sb.append(" IDENTIFIED BY *** ");
 
         // tls requirements
-        if (user.getSan() != null) {
-            sb.append(" REQUIRE SAN '").append(user.getSan()).append("'");
+        if (user.hasSanRequirement()) {
+            sb.append(" REQUIRE SAN '").append(user.getSanRequirementSql()).append("'");
         }
 
         // password policy
@@ -146,6 +146,10 @@ public class ShowCreateUserCommand extends ShowCommand {
                     } else {
                         sb.append(" PASSWORD_LOCK_TIME ").append(lockValue).append(" SECOND");
                     }
+                }
+                // failedLoginPolicy: <ACCOUNT_LOCKED> -- the administrative lock (MySQL ACCOUNT LOCK)
+                if (policies.size() > 8 && "true".equalsIgnoreCase(policies.get(8).get(1))) {
+                    sb.append(" ACCOUNT_LOCK");
                 }
             }
         }

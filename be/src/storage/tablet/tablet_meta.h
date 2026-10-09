@@ -118,7 +118,8 @@ public:
                        TInvertedIndexFileStorageFormat::V2,
                TEncryptionAlgorithm::type tde_algorithm = TEncryptionAlgorithm::PLAINTEXT,
                TStorageFormat::type storage_format = TStorageFormat::V2,
-               int32_t vertical_compaction_num_columns_per_group = 5);
+               int32_t vertical_compaction_num_columns_per_group = 5,
+               TTabletRole::type tablet_role = TTabletRole::TABLET_ROLE_DATA);
     // If need add a filed in TableMeta, filed init copy in copy construct function
     TabletMeta(const TabletMeta& tablet_meta);
     TabletMeta(TabletMeta&& tablet_meta) = delete;
@@ -173,7 +174,6 @@ public:
     size_t tablet_local_size() const;
     // Remote disk space occupied by tablet.
     size_t tablet_remote_size() const;
-
     size_t tablet_local_index_size() const;
     size_t tablet_local_segment_size() const;
     size_t tablet_remote_index_size() const;
@@ -223,6 +223,9 @@ public:
     // used for after tablet cloned to clear stale rowset
     void clear_stale_rowset();
 
+    // Clear stale rowset metadata without changing the delete bitmap cache.
+    void clear_stale_rs_metas();
+
     void clear_rowsets();
 
     // MUST hold EXCLUSIVE `_meta_lock` in belonged Tablet
@@ -245,8 +248,20 @@ public:
     static void init_column_from_tcolumn(uint32_t unique_id, const TColumn& tcolumn,
                                          ColumnPB* column);
 
+    struct SchemaCreateOptions {
+        const std::unordered_map<uint32_t, uint32_t>& col_ordinal_to_unique_id;
+        TCompressionType::type compression_type;
+        TInvertedIndexFileStorageFormat::type inverted_index_file_storage_format;
+        uint32_t next_unique_id;
+    };
+
+    static void init_schema_from_thrift(const TTabletSchema& tablet_schema,
+                                        const SchemaCreateOptions& schema_create_options,
+                                        TabletSchemaPB* tablet_schema_pb);
+
     DeleteBitmapPtr delete_bitmap_ptr() { return _delete_bitmap; }
     DeleteBitmap& delete_bitmap() { return *_delete_bitmap; }
+
     void remove_rowset_delete_bitmap(const RowsetId& rowset_id, const Version& version);
 
     bool enable_unique_key_merge_on_write() const { return _enable_unique_key_merge_on_write; }
@@ -260,6 +275,13 @@ public:
     void set_binlog_config(BinlogConfig binlog_config) {
         _binlog_config = std::move(binlog_config);
     }
+    TabletRolePB tablet_role() const { return _tablet_role; }
+    bool is_row_binlog_tablet() const {
+        return _tablet_role == TabletRolePB::TABLET_ROLE_ROW_BINLOG;
+    }
+    void set_tablet_role(TabletRolePB tablet_role) { _tablet_role = tablet_role; }
+    int64_t binlog_tablet_id() const { return _binlog_tablet_id; }
+    void set_binlog_tablet_id(int64_t binlog_tablet_id) { _binlog_tablet_id = binlog_tablet_id; }
 
     void set_compaction_policy(std::string compaction_policy) {
         _compaction_policy = compaction_policy;
@@ -313,9 +335,29 @@ public:
         _ttl_seconds = ttl_seconds;
     }
 
+    // Absolute timestamp (seconds since epoch) at which this tablet's data stops being kept
+    // in the file cache TTL queue, or 0 when the tablet has no TTL or the deadline has
+    // already passed. The deadline is anchored at the tablet creation time, so every tablet
+    // of a table shares one deadline regardless of when each rowset was written.
+    //
+    // This is the single definition of that deadline. The load, compaction, schema change,
+    // query and warm up paths all stamp the cache blocks they create with this value, and
+    // BlockFileCacheTtlMgr expires those blocks by the very same value, so a block's
+    // recorded expiration time always agrees with the sweep that acts on it.
+    int64_t file_cache_ttl_expiration_time() const;
+
     int64_t avg_rs_meta_serialize_size() const { return _avg_rs_meta_serialize_size; }
 
     EncryptionAlgorithmPB encryption_algorithm() const { return _encryption_algorithm; }
+
+    bool has_inverted_index_storage_format() const {
+        return _inverted_index_storage_format.has_value();
+    }
+
+    InvertedIndexStorageFormatPB inverted_index_storage_format() const {
+        return _inverted_index_storage_format.value_or(
+                _schema->get_inverted_index_storage_format());
+    }
 
 private:
     Status _save_meta(DataDir* data_dir);
@@ -365,6 +407,8 @@ private:
 
     // binlog config
     BinlogConfig _binlog_config {};
+    TabletRolePB _tablet_role = TabletRolePB::TABLET_ROLE_DATA;
+    int64_t _binlog_tablet_id = 0;
 
     // meta for compaction
     std::string _compaction_policy;
@@ -385,6 +429,9 @@ private:
     // Persisted storage format for this tablet (e.g. V2, V3). Used to derive
     // schema-level defaults such as external ColumnMeta usage.
     TStorageFormat::type _storage_format = TStorageFormat::V2;
+    // The schema KV is shared by (index_id, schema_version). Keep the tablet's
+    // immutable file format outside that shared identity.
+    std::optional<InvertedIndexStorageFormatPB> _inverted_index_storage_format;
 
     mutable std::shared_mutex _meta_lock;
 };
@@ -429,6 +476,7 @@ public:
     using SegmentId = uint32_t;
     using Version = uint64_t;
     using BitmapKey = std::tuple<RowsetId, SegmentId, Version>;
+    using RowsetIdWithSegmentIds = std::pair<RowsetId, std::vector<SegmentId>>;
     std::map<BitmapKey, roaring::Roaring> delete_bitmap; // Ordered map
     constexpr static inline uint32_t INVALID_SEGMENT_ID = std::numeric_limits<uint32_t>::max() - 1;
     constexpr static inline uint32_t ROWSET_SENTINEL_MARK =
@@ -497,6 +545,7 @@ public:
      * @return true if marked deleted
      */
     bool contains(const BitmapKey& bmk, uint32_t row_id) const;
+    bool contain_rowsets(const RowsetIdUnorderedSet& rowset_ids) const;
 
     /**
      * Checks if this delete bitmap is empty
@@ -547,7 +596,7 @@ public:
      */
     void subset(const BitmapKey& start, const BitmapKey& end,
                 DeleteBitmap* subset_delete_map) const;
-    void subset(std::vector<std::pair<RowsetId, int64_t>>& rowset_ids, int64_t start_version,
+    void subset(const std::vector<RowsetIdWithSegmentIds>& rowsets, int64_t start_version,
                 int64_t end_version, DeleteBitmap* subset_delete_map) const;
 
     /**
@@ -555,9 +604,8 @@ public:
      * with given version range [start_version, end_version] and agg to end_version,
      * then merge to subset_delete_map
      */
-    void subset_and_agg(std::vector<std::pair<RowsetId, int64_t>>& rowset_ids,
-                        int64_t start_version, int64_t end_version,
-                        DeleteBitmap* subset_delete_map) const;
+    void subset_and_agg(const std::vector<RowsetIdWithSegmentIds>& rowsets, int64_t start_version,
+                        int64_t end_version, DeleteBitmap* subset_delete_map) const;
 
     /**
      * Gets count of delete_bitmap with given range [start, end)

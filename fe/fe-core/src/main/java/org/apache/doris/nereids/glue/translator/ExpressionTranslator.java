@@ -30,14 +30,17 @@ import org.apache.doris.analysis.CompoundPredicate;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.FunctionCallExpr;
 import org.apache.doris.analysis.FunctionParams;
+import org.apache.doris.analysis.InvertedIndexUtil;
 import org.apache.doris.analysis.IsNullPredicate;
 import org.apache.doris.analysis.LambdaFunctionCallExpr;
 import org.apache.doris.analysis.LambdaFunctionExpr;
 import org.apache.doris.analysis.MatchPredicate;
 import org.apache.doris.analysis.OrderByElement;
 import org.apache.doris.analysis.SearchPredicate;
+import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.TryCastExpr;
+import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.catalog.ArrayType;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Function;
@@ -83,10 +86,12 @@ import org.apache.doris.nereids.trees.expressions.WhenClause;
 import org.apache.doris.nereids.trees.expressions.functions.AlwaysNotNullable;
 import org.apache.doris.nereids.trees.expressions.functions.AlwaysNullable;
 import org.apache.doris.nereids.trees.expressions.functions.PropagateNullLiteral;
+import org.apache.doris.nereids.trees.expressions.functions.RequiresShortCircuitEvaluation;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateFunction;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateParam;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Count;
 import org.apache.doris.nereids.trees.expressions.functions.agg.NotNullableAggregateFunction;
+import org.apache.doris.nereids.trees.expressions.functions.combinator.CombineCombinator;
 import org.apache.doris.nereids.trees.expressions.functions.combinator.ForEachCombinator;
 import org.apache.doris.nereids.trees.expressions.functions.combinator.MergeCombinator;
 import org.apache.doris.nereids.trees.expressions.functions.combinator.StateCombinator;
@@ -98,6 +103,7 @@ import org.apache.doris.nereids.trees.expressions.functions.scalar.DictGet;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DictGetMany;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.ElementAt;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Lambda;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.Nullable;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.ScalarFunction;
 import org.apache.doris.nereids.trees.expressions.functions.udf.JavaUdaf;
 import org.apache.doris.nereids.trees.expressions.functions.udf.JavaUdf;
@@ -108,6 +114,7 @@ import org.apache.doris.nereids.trees.expressions.functions.udf.PythonUdtf;
 import org.apache.doris.nereids.trees.expressions.functions.window.WindowFunction;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionVisitor;
+import org.apache.doris.nereids.types.AggStateType;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.thrift.TDictFunction;
 
@@ -207,6 +214,27 @@ public class ExpressionTranslator extends DefaultExpressionVisitor<Expr, PlanTra
                .orElse(null);
     }
 
+    private Index getInvertedIndexFromTranslatedSlot(Expr translatedSlot, PlanTranslatorContext context) {
+        if (!(translatedSlot instanceof SlotRef)) {
+            return null;
+        }
+        SlotRef slotRef = (SlotRef) translatedSlot;
+        SlotDescriptor slotDesc = slotRef.getDesc();
+        if (slotDesc == null) {
+            return null;
+        }
+        TupleDescriptor tupleDesc = context.getTupleDesc(slotDesc.getParentId());
+        if (tupleDesc == null || !(tupleDesc.getTable() instanceof OlapTable)) {
+            return null;
+        }
+        Column column = slotRef.getColumn();
+        if (column == null) {
+            return null;
+        }
+        OlapTable olapTbl = (OlapTable) tupleDesc.getTable();
+        return olapTbl.getInvertedIndex(column, slotDesc.getSubColLables());
+    }
+
     @Override
     public Expr visitElementAt(ElementAt elementAt, PlanTranslatorContext context) {
         return visitScalarFunction(elementAt, context);
@@ -230,6 +258,9 @@ public class ExpressionTranslator extends DefaultExpressionVisitor<Expr, PlanTra
         // down for storage-level index evaluation (fast path).
         Index invertedIndex = null;
         String analyzer = match.getAnalyzer().orElse(null);
+        if (analyzer != null) {
+            analyzer = InvertedIndexUtil.resolveAnalyzerName(analyzer);
+        }
         Column column = slot.getOriginalColumn().orElse(null);
         OlapTable olapTbl = getOlapTableDirectly(slot);
         if (column != null && olapTbl != null) {
@@ -428,6 +459,7 @@ public class ExpressionTranslator extends DefaultExpressionVisitor<Expr, PlanTra
         CastExpr castExpr = new CastExpr(cast.getDataType().toCatalogDataType(),
                 cast.child().accept(this, context), cast.nullable());
         castExpr.setImplicit(!cast.isExplicitType());
+        castExpr.setStrict(cast.isStrict());
         return castExpr;
     }
 
@@ -683,6 +715,9 @@ public class ExpressionTranslator extends DefaultExpressionVisitor<Expr, PlanTra
                     }
                 }
             }
+            if (invertedIndex == null) {
+                invertedIndex = getInvertedIndexFromTranslatedSlot(translatedSlot, context);
+            }
             fieldIndexes.add(invertedIndex);
         }
 
@@ -714,7 +749,11 @@ public class ExpressionTranslator extends DefaultExpressionVisitor<Expr, PlanTra
                 "", Function.BinaryType.BUILTIN, true, true, nullableMode);
 
         // create catalog FunctionCallExpr without analyze again
-        return new FunctionCallExpr(catalogFunction, new FunctionParams(false, arguments), function.nullable());
+        FunctionParams functionParams = new FunctionParams(false, arguments);
+        FunctionCallExpr functionCallExpr = new FunctionCallExpr(
+                catalogFunction, functionParams, function.nullable());
+        functionCallExpr.setShortCircuitEvaluation(function instanceof RequiresShortCircuitEvaluation);
+        return functionCallExpr;
     }
 
     @Override
@@ -810,24 +849,38 @@ public class ExpressionTranslator extends DefaultExpressionVisitor<Expr, PlanTra
                 visitAggregateFunction(combinator.getNestedFunction(), context).getFn(),
                 new FunctionParams(false, arguments), isReturnNullable);
         return convertToStateCombinator(combinator.getName(), functionCallExpr,
-                arguments.stream().map(Expr::getType).collect(Collectors.toList()),
-                combinator.getArguments().stream().map(Expression::nullable).collect(Collectors.toList()),
-                isReturnNullable);
+                combinator.getDataType().toCatalogDataType());
     }
 
-    private FunctionCallExpr convertToStateCombinator(String name, FunctionCallExpr fnCall,
-            List<Type> argTypes, List<Boolean> argNullables,
-            boolean returnNullable) {
+    private FunctionCallExpr convertToStateCombinator(String name, FunctionCallExpr fnCall, Type returnType) {
         Function aggFunction = fnCall.getFn();
         List<Type> arguments = Arrays.asList(aggFunction.getArgs());
         org.apache.doris.catalog.ScalarFunction fn = new org.apache.doris.catalog.ScalarFunction(
                 new FunctionName(name), arguments,
-                Expr.createAggStateType(aggFunction.getFunctionName().getFunction(),
-                        argTypes, argNullables, returnNullable),
+                returnType,
                 aggFunction.hasVarArgs(), aggFunction.isUserVisible());
         fn.setNullableMode(NullableMode.ALWAYS_NOT_NULLABLE);
         fn.setBinaryType(Function.BinaryType.AGG_STATE);
         return new FunctionCallExpr(fn, new FunctionParams(fnCall.getChildren()), false);
+    }
+
+    @Override
+    public Expr visitCombineCombinator(CombineCombinator combinator, PlanTranslatorContext context) {
+        List<Expr> arguments = combinator.children().stream()
+                .map(arg -> new SlotRef(arg.getDataType().toCatalogDataType(), arg.nullable()))
+                .collect(ImmutableList.toImmutableList());
+        FunctionCallExpr functionCallExpr = new FunctionCallExpr(
+                visitAggregateFunction(combinator.getNestedFunction(), context).getFn(),
+                new FunctionParams(false, arguments), false);
+        Function aggregateFunction = functionCallExpr.getFn();
+        aggregateFunction.setName(new FunctionName(combinator.getName()));
+        aggregateFunction.setArgs(arguments.stream().map(Expr::getType).collect(Collectors.toList()));
+        aggregateFunction.setBinaryType(Function.BinaryType.AGG_STATE);
+        aggregateFunction.setNullableMode(NullableMode.ALWAYS_NOT_NULLABLE);
+        Type returnType = combinator.getDataType().toCatalogDataType();
+        aggregateFunction.setReturnType(returnType);
+        functionCallExpr.setType(returnType);
+        return functionCallExpr;
     }
 
     @Override
@@ -968,6 +1021,25 @@ public class ExpressionTranslator extends DefaultExpressionVisitor<Expr, PlanTra
     private Expr translateAggregateFunction(AggregateFunction function,
             List<Expression> currentPhaseArguments, List<Expr> aggFnArguments,
             AggregateParam aggregateParam, PlanTranslatorContext context) {
+        if (function instanceof CombineCombinator) {
+            AggStateType stateType = (AggStateType) function.getDataType();
+            List<Boolean> nullables = stateType.getSubTypeNullables();
+            // The state layout survives rewrites even when a cast folds to a non-null literal.
+            // _combine consumes columns directly, so align both its signature and raw inputs here.
+            for (int i = 0; i < aggFnArguments.size(); i++) {
+                aggFnArguments.set(i, new SlotRef(
+                        stateType.getSubTypes().get(i).toCatalogDataType(), nullables.get(i)));
+            }
+            if (!aggregateParam.aggMode.consumeAggregateBuffer) {
+                ImmutableList.Builder<Expression> arguments =
+                        ImmutableList.builderWithExpectedSize(currentPhaseArguments.size());
+                for (int i = 0; i < currentPhaseArguments.size(); i++) {
+                    Expression argument = currentPhaseArguments.get(i);
+                    arguments.add(nullables.get(i) && !argument.nullable() ? new Nullable(argument) : argument);
+                }
+                currentPhaseArguments = arguments.build();
+            }
+        }
         List<Expr> currentPhaseCatalogArguments = Lists.newArrayListWithCapacity(currentPhaseArguments.size());
         for (Expression arg : currentPhaseArguments) {
             if (arg instanceof OrderExpression) {

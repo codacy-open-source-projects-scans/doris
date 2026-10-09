@@ -35,6 +35,7 @@
 #include "core/data_type_serde/data_type_serde.h"
 #include "core/field.h"
 #include "core/types.h"
+#include "storage/field_type.h"
 
 namespace doris {
 
@@ -69,12 +70,6 @@ public:
     char* serialize(const IColumn& column, char* buf, int be_exec_version) const override;
     const char* deserialize(const char* buf, MutableColumnPtr* column,
                             int be_exec_version) const override;
-
-    [[noreturn]] Field get_default() const override {
-        throw doris::Exception(ErrorCode::NOT_IMPLEMENTED_ERROR,
-                               "Method get_default() is not implemented for data type {}.",
-                               get_name());
-    }
 
     [[noreturn]] Field get_field(const TExprNode& node) const override {
         throw doris::Exception(ErrorCode::NOT_IMPLEMENTED_ERROR,

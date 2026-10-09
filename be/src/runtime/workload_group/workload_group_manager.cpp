@@ -30,6 +30,7 @@
 #include "exec/pipeline/task_scheduler.h"
 #include "exec/scan/scanner_scheduler.h"
 #include "information_schema/schema_scanner_helper.h"
+#include "runtime/cluster_info.h"
 #include "runtime/memory/global_memory_arbitrator.h"
 #include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/workload_group/workload_group.h"
@@ -971,6 +972,13 @@ void WorkloadGroupMgr::stop() {
     }
 }
 
+void WorkloadGroupMgr::destroy_schedulers() {
+    std::shared_lock<std::shared_mutex> r_lock(_group_mutex);
+    for (auto iter = _workload_groups.begin(); iter != _workload_groups.end(); iter++) {
+        iter->second->destroy_schedulers();
+    }
+}
+
 Status WorkloadGroupMgr::create_internal_wg() {
     TWorkloadGroupInfo twg_info;
     twg_info.__set_id(INTERNAL_NORMAL_WG_ID);
@@ -984,7 +992,14 @@ Status WorkloadGroupMgr::create_internal_wg() {
     WorkloadGroupInfo wg_info = WorkloadGroupInfo::parse_topic_info(twg_info);
     auto normal_wg = std::make_shared<WorkloadGroup>(wg_info);
 
-    RETURN_IF_ERROR(normal_wg->upsert_task_scheduler(&wg_info));
+    auto status = normal_wg->upsert_task_scheduler(&wg_info);
+    if (!status.ok()) {
+        // A later pool may have started and registered an adaptive callback even
+        // when an earlier scheduler failed. This WG is not owned by the manager
+        // yet, so drain its callbacks before the local shared_ptr releases it.
+        normal_wg->try_stop_schedulers();
+        return status;
+    }
 
     {
         std::lock_guard<std::shared_mutex> w_lock(_group_mutex);

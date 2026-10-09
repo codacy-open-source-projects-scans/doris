@@ -20,6 +20,8 @@
 #include <gmock/gmock-function-mocker.h>
 #include <gmock/gmock.h>
 
+#include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "core/data_type/data_type.h"
@@ -43,13 +45,11 @@ public:
             auto* slot = pool->add(new SlotDescriptor());
             slot->_type = type;
             slots.push_back(slot);
-            _num_slots++;
         }
         auto* tuple_desc = pool->add(new MockTupleDescriptor());
         tuple_desc->Slots = slots;
         tuple_desc_map.push_back(tuple_desc);
         _tuple_desc_map.push_back(tuple_desc);
-        _num_materialized_slots = static_cast<int>(types.size());
     }
     const std::vector<TupleDescriptor*>& tuple_descriptors() const override {
         return tuple_desc_map;
@@ -106,13 +106,41 @@ public:
         _slot_descriptors[slot_id] = std::move(slot_desc);
     }
 
+    void add_slot_descriptor(SlotId slot_id, int32_t col_unique_id, const std::string& col_name,
+                             const std::vector<std::string>& column_paths) {
+        TTypeNode type_node;
+        type_node.__set_type(TTypeNodeType::SCALAR);
+        TScalarType scalar_type;
+        scalar_type.__set_type(TPrimitiveType::STRING);
+        type_node.__set_scalar_type(scalar_type);
+        TTypeDesc type_desc;
+        type_desc.types.push_back(type_node);
+
+        TSlotDescriptor slot_desc;
+        slot_desc.__set_id(slot_id);
+        slot_desc.__set_parent(0);
+        slot_desc.__set_slotType(type_desc);
+        slot_desc.__set_columnPos(0);
+        slot_desc.__set_byteOffset(0);
+        slot_desc.__set_nullIndicatorByte(0);
+        slot_desc.__set_nullIndicatorBit(-1);
+        slot_desc.__set_colName(col_name);
+        slot_desc.__set_slotIdx(0);
+        slot_desc.__set_isMaterialized(true);
+        slot_desc.__set_col_unique_id(col_unique_id);
+        slot_desc.__set_is_key(false);
+        slot_desc.__set_column_paths(column_paths);
+        slot_desc.__set_primitive_type(TPrimitiveType::STRING);
+        _slot_descriptors[slot_id] = std::make_unique<SlotDescriptor>(slot_desc);
+    }
+
     SlotDescriptor* get_slot_descriptor(SlotId id) const override {
         auto it = _slot_descriptors.find(id);
         return it != _slot_descriptors.end() ? it->second.get() : nullptr;
     }
 
 private:
-    mutable std::unordered_map<SlotId, std::unique_ptr<MockSlopDescriptor>> _slot_descriptors;
+    mutable std::unordered_map<SlotId, std::unique_ptr<SlotDescriptor>> _slot_descriptors;
 };
 
 } // namespace doris

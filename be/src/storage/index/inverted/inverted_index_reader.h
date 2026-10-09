@@ -26,6 +26,7 @@
 
 #include "common/status.h"
 #include "core/data_type/primitive_type.h"
+#include "core/field.h"
 #include "io/fs/file_system.h"
 #include "io/fs/path.h"
 #include "storage/index/index_query_context.h"
@@ -65,7 +66,6 @@ class Roaring;
 
 namespace doris {
 class KeyCoder;
-class TypeInfo;
 struct OlapReaderStatistics;
 class RuntimeState;
 
@@ -81,6 +81,16 @@ class InvertedIndexResultBitmap {
 private:
     std::shared_ptr<roaring::Roaring> _data_bitmap = nullptr;
     std::shared_ptr<roaring::Roaring> _null_bitmap = nullptr;
+    // true means _data_bitmap is only a superset of candidates (from a gram index push-down, for
+    // instance), so the caller (SegmentIterator) must keep the original expression for row-level
+    // re-verification and may not consume the expression as it would for an exact index result.
+    //
+    // Every operation that produces a new value from an existing one has to carry the flag: the
+    // four special member functions copy it, and &=, |= and -= OR it in, because a combination
+    // involving one approximate operand is itself only a superset and must not be mistaken for an
+    // exact result. op_not is the exception -- see the comment there; negation cannot preserve
+    // the property at all, so it asserts instead of propagating.
+    bool _approximate = false;
 
 public:
     // Default constructor
@@ -99,12 +109,14 @@ public:
                                    : nullptr),
               _null_bitmap(other._null_bitmap
                                    ? std::make_shared<roaring::Roaring>(*other._null_bitmap)
-                                   : nullptr) {}
+                                   : nullptr),
+              _approximate(other._approximate) {}
 
     // Move constructor
     InvertedIndexResultBitmap(InvertedIndexResultBitmap&& other) noexcept
             : _data_bitmap(std::move(other._data_bitmap)),
-              _null_bitmap(std::move(other._null_bitmap)) {}
+              _null_bitmap(std::move(other._null_bitmap)),
+              _approximate(other._approximate) {}
 
     // Copy assignment operator
     InvertedIndexResultBitmap& operator=(const InvertedIndexResultBitmap& other) {
@@ -115,6 +127,7 @@ public:
             _null_bitmap = other._null_bitmap
                                    ? std::make_shared<roaring::Roaring>(*other._null_bitmap)
                                    : nullptr;
+            _approximate = other._approximate;
         }
         return *this;
     }
@@ -124,6 +137,7 @@ public:
         if (this != &other) { // Prevent self-assignment
             _data_bitmap = std::move(other._data_bitmap);
             _null_bitmap = std::move(other._null_bitmap);
+            _approximate = other._approximate;
         }
         return *this;
     }
@@ -141,6 +155,7 @@ public:
             }
             *_null_bitmap = std::move(new_null_bitmap);
         }
+        _approximate = _approximate || other._approximate;
         return *this;
     }
 
@@ -163,11 +178,20 @@ public:
             }
             *_null_bitmap = std::move(new_null_bitmap);
         }
+        _approximate = _approximate || other._approximate;
         return *this;
     }
 
     // NOT operation
+    //
+    // Negation is the one combination an approximate result cannot survive: complementing a
+    // superset of the matching rows yields a subset of the non-matching ones, so rows that do
+    // match would be dropped, and the approximate flag cannot repair that -- re-verifying the
+    // survivors never brings back a row that was already excluded. A caller holding an
+    // approximate result must keep the expression and let the scalar path evaluate the negation
+    // instead of asking for it here.
     const InvertedIndexResultBitmap& op_not(const roaring::Roaring* universe) const {
+        DCHECK(!_approximate) << "op_not on an approximate result would drop matching rows";
         if (_data_bitmap) {
             if (_null_bitmap) {
                 *_data_bitmap = *universe - *_data_bitmap - *_null_bitmap;
@@ -190,6 +214,7 @@ public:
                 *_null_bitmap -= *other._null_bitmap;
             }
         }
+        _approximate = _approximate || other._approximate;
         return *this;
     }
 
@@ -205,6 +230,11 @@ public:
 
     // Check if both bitmaps are empty
     bool is_empty() const { return (_data_bitmap == nullptr && _null_bitmap == nullptr); }
+
+    // true = superset of candidates: rows outside the bitmap certainly do not match, but rows
+    // inside it may not all match, so the expression must re-verify them.
+    void set_approximate(bool v) { _approximate = v; }
+    bool approximate() const { return _approximate; }
 
 private:
     static const roaring::Roaring& _empty_bitmap() {
@@ -223,18 +253,29 @@ public:
     IndexType index_type() override { return IndexType::INVERTED; }
 
     virtual Status query(const IndexQueryContextPtr& context, const std::string& column_name,
-                         const void* query_value, InvertedIndexQueryType query_type,
+                         const Field& query_value, InvertedIndexQueryType query_type,
                          std::shared_ptr<roaring::Roaring>& bit_map,
                          const InvertedIndexAnalyzerCtx* analyzer_ctx = nullptr) = 0;
+    virtual Status query_with_null_bitmap(const IndexQueryContextPtr& context,
+                                          const std::string& column_name, const Field& query_value,
+                                          InvertedIndexQueryType query_type,
+                                          std::shared_ptr<roaring::Roaring>& bit_map,
+                                          InvertedIndexQueryCacheHandle* null_bitmap_cache_handle,
+                                          const InvertedIndexAnalyzerCtx* analyzer_ctx = nullptr);
     virtual Status try_query(const IndexQueryContextPtr& context, const std::string& column_name,
-                             const void* query_value, InvertedIndexQueryType query_type,
+                             const Field& query_value, InvertedIndexQueryType query_type,
                              size_t* count) = 0;
 
-    Status read_null_bitmap(const IndexQueryContextPtr& context,
-                            InvertedIndexQueryCacheHandle* cache_handle,
-                            lucene::store::Directory* dir = nullptr);
+    virtual Status read_null_bitmap(const IndexQueryContextPtr& context,
+                                    InvertedIndexQueryCacheHandle* cache_handle,
+                                    lucene::store::Directory* dir = nullptr);
 
     virtual InvertedIndexReaderType type() = 0;
+
+    // Whether the index names an analyzer that cuts sparse or dense grams under the current
+    // policy -- the index LIKE / REGEXP gram queries are meant for. Decided from the index
+    // properties and in-memory policies only, never by opening the index.
+    virtual bool is_gram_family() const { return false; }
 
     [[nodiscard]] uint64_t get_index_id() const override { return _index_meta.index_id(); }
 
@@ -249,7 +290,11 @@ public:
     bool handle_query_cache(const IndexQueryContextPtr& context, InvertedIndexQueryCache* cache,
                             const InvertedIndexQueryCache::CacheKey& cache_key,
                             InvertedIndexQueryCacheHandle* cache_handler,
-                            std::shared_ptr<roaring::Roaring>& bit_map);
+                            std::shared_ptr<roaring::Roaring>& bit_map, bool enabled = true);
+    void insert_query_cache(const IndexQueryContextPtr& context, InvertedIndexQueryCache* cache,
+                            const InvertedIndexQueryCache::CacheKey& cache_key,
+                            std::shared_ptr<roaring::Roaring> bit_map,
+                            InvertedIndexQueryCacheHandle* cache_handler, bool enabled = true);
 
     virtual Status handle_searcher_cache(const IndexQueryContextPtr& context,
                                          InvertedIndexCacheHandle* inverted_index_cache_handle);
@@ -285,11 +330,11 @@ public:
 
     Status new_iterator(std::unique_ptr<IndexIterator>* iterator) override;
     Status query(const IndexQueryContextPtr& context, const std::string& column_name,
-                 const void* query_value, InvertedIndexQueryType query_type,
+                 const Field& query_value, InvertedIndexQueryType query_type,
                  std::shared_ptr<roaring::Roaring>& bit_map,
                  const InvertedIndexAnalyzerCtx* analyzer_ctx = nullptr) override;
     Status try_query(const IndexQueryContextPtr& context, const std::string& column_name,
-                     const void* query_value, InvertedIndexQueryType query_type,
+                     const Field& query_value, InvertedIndexQueryType query_type,
                      size_t* count) override {
         return Status::Error<ErrorCode::NOT_IMPLEMENTED_ERROR>(
                 "FullTextIndexReader not support try_query");
@@ -310,11 +355,11 @@ public:
 
     Status new_iterator(std::unique_ptr<IndexIterator>* iterator) override;
     Status query(const IndexQueryContextPtr& context, const std::string& column_name,
-                 const void* query_value, InvertedIndexQueryType query_type,
+                 const Field& query_value, InvertedIndexQueryType query_type,
                  std::shared_ptr<roaring::Roaring>& bit_map,
                  const InvertedIndexAnalyzerCtx* analyzer_ctx = nullptr) override;
     Status try_query(const IndexQueryContextPtr& context, const std::string& column_name,
-                     const void* query_value, InvertedIndexQueryType query_type,
+                     const Field& query_value, InvertedIndexQueryType query_type,
                      size_t* count) override {
         return Status::Error<ErrorCode::NOT_IMPLEMENTED_ERROR>(
                 "StringTypeInvertedIndexReader not support try_query");
@@ -335,7 +380,6 @@ public:
     std::string query_min;
     std::string query_max;
 
-public:
     InvertedIndexVisitor(const void* io_ctx, lucene::util::bkd::bkd_reader* r,
                          roaring::Roaring* hits, bool only_count = false);
     ~InvertedIndexVisitor() override = default;
@@ -370,21 +414,21 @@ public:
 
     Status new_iterator(std::unique_ptr<IndexIterator>* iterator) override;
     Status query(const IndexQueryContextPtr& context, const std::string& column_name,
-                 const void* query_value, InvertedIndexQueryType query_type,
+                 const Field& query_value, InvertedIndexQueryType query_type,
                  std::shared_ptr<roaring::Roaring>& bit_map,
                  const InvertedIndexAnalyzerCtx* analyzer_ctx = nullptr) override;
     Status try_query(const IndexQueryContextPtr& context, const std::string& column_name,
-                     const void* query_value, InvertedIndexQueryType query_type,
+                     const Field& query_value, InvertedIndexQueryType query_type,
                      size_t* count) override;
-    Status invoke_bkd_try_query(const IndexQueryContextPtr& context, const void* query_value,
+    Status invoke_bkd_try_query(const IndexQueryContextPtr& context, const Field& query_value,
                                 InvertedIndexQueryType query_type,
                                 std::shared_ptr<lucene::util::bkd::bkd_reader> r, size_t* count);
-    Status invoke_bkd_query(const IndexQueryContextPtr& context, const void* query_value,
+    Status invoke_bkd_query(const IndexQueryContextPtr& context, const Field& query_value,
                             InvertedIndexQueryType query_type,
                             std::shared_ptr<lucene::util::bkd::bkd_reader> r,
                             std::shared_ptr<roaring::Roaring>& bit_map);
     template <InvertedIndexQueryType QT>
-    Status construct_bkd_query_value(const void* query_value,
+    Status construct_bkd_query_value(const Field& query_value,
                                      std::shared_ptr<lucene::util::bkd::bkd_reader> r,
                                      InvertedIndexVisitor<QT>* visitor);
 
@@ -392,134 +436,8 @@ public:
     Status get_bkd_reader(const IndexQueryContextPtr& context, BKDIndexSearcherPtr& reader);
 
 private:
-    const TypeInfo* _type_info {};
+    FieldType _type = FieldType::OLAP_FIELD_TYPE_NONE;
     const KeyCoder* _value_key_coder {};
-};
-
-template <PrimitiveType PT>
-class InvertedIndexQueryParam;
-
-/**
- * @brief InvertedIndexQueryParamFactory is a factory class to create QueryValue object.
- * we need a template function to make predict class like in_list_predict template class to use.
- * also need a function with primitive type parameter to create inverted index query value. like some function expr: function_array_index
- * Now we just mapping field value in query engine to storage field value
- */
-class InvertedIndexQueryParamFactory {
-    ENABLE_FACTORY_CREATOR(InvertedIndexQueryParamFactory);
-
-public:
-    virtual ~InvertedIndexQueryParamFactory() = default;
-
-    template <PrimitiveType PT, typename ValueType>
-    static Status create_query_value(
-            const ValueType* value, std::unique_ptr<InvertedIndexQueryParamFactory>& result_param) {
-        static_assert(!std::is_same_v<ValueType, void>,
-                      "ValueType cannot be void, as it is unsupported and dangerous.");
-
-        using CPP_TYPE = typename PrimitiveTypeTraits<PT>::CppType;
-        std::unique_ptr<InvertedIndexQueryParam<PT>> param =
-                InvertedIndexQueryParam<PT>::create_unique();
-
-        if constexpr (is_string_type(PT)) {
-            if constexpr (std::is_same_v<ValueType, doris::Field>) {
-                const auto& str = value->template get<PT>();
-                param->set_value(str);
-            } else if constexpr (std::is_same_v<ValueType, StringRef>) {
-                param->set_value(value);
-            } else {
-                static_assert(std::is_convertible_v<ValueType, std::string>,
-                              "ValueType must be convertible to std::string for string types");
-                param->set_value(std::string(*value));
-            }
-        } else {
-            CPP_TYPE cpp_val;
-            if constexpr (std::is_same_v<ValueType, doris::Field>) {
-                auto field_val = value->template get<PT>();
-                cpp_val = static_cast<CPP_TYPE>(field_val);
-            } else {
-                cpp_val = static_cast<CPP_TYPE>(*value);
-            }
-
-            auto storage_val = PrimitiveTypeConvertor<PT>::to_storage_field_type(cpp_val);
-            param->set_value(&storage_val);
-        }
-        result_param = std::move(param);
-        return Status::OK();
-    }
-
-    static Status create_query_value(
-            const PrimitiveType& primitiveType, const doris::Field* value,
-            std::unique_ptr<InvertedIndexQueryParamFactory>& result_param) {
-        switch (primitiveType) {
-#define M(TYPE)                                                             \
-    case TYPE: {                                                            \
-        return create_query_value<TYPE, doris::Field>(value, result_param); \
-    }
-            M(PrimitiveType::TYPE_BOOLEAN)
-            M(PrimitiveType::TYPE_TINYINT)
-            M(PrimitiveType::TYPE_SMALLINT)
-            M(PrimitiveType::TYPE_INT)
-            M(PrimitiveType::TYPE_BIGINT)
-            M(PrimitiveType::TYPE_LARGEINT)
-            M(PrimitiveType::TYPE_FLOAT)
-            M(PrimitiveType::TYPE_DOUBLE)
-            M(PrimitiveType::TYPE_DECIMALV2)
-            M(PrimitiveType::TYPE_DECIMAL32)
-            M(PrimitiveType::TYPE_DECIMAL64)
-            M(PrimitiveType::TYPE_DECIMAL128I)
-            M(PrimitiveType::TYPE_DECIMAL256)
-            M(PrimitiveType::TYPE_DATE)
-            M(PrimitiveType::TYPE_DATETIME)
-            M(PrimitiveType::TYPE_CHAR)
-            M(PrimitiveType::TYPE_VARCHAR)
-            M(PrimitiveType::TYPE_STRING)
-            M(PrimitiveType::TYPE_DATEV2)
-            M(PrimitiveType::TYPE_DATETIMEV2)
-            M(PrimitiveType::TYPE_IPV4)
-            M(PrimitiveType::TYPE_IPV6)
-#undef M
-        default:
-            return Status::NotSupported("Unsupported primitive type {} for inverted index reader",
-                                        primitiveType);
-        }
-    };
-
-    virtual const void* get_value() const {
-        LOG_FATAL(
-                "Execution reached an undefined behavior code path in "
-                "InvertedIndexQueryParamFactory");
-        __builtin_unreachable();
-    };
-};
-
-template <PrimitiveType PT>
-class InvertedIndexQueryParam : public InvertedIndexQueryParamFactory {
-    ENABLE_FACTORY_CREATOR(InvertedIndexQueryParam);
-    using storage_val = typename PrimitiveTypeTraits<PT>::StorageFieldType;
-
-public:
-    void set_value(const storage_val* value) { _value = *value; }
-
-    const void* get_value() const override { return &_value; }
-
-private:
-    storage_val _value;
-};
-
-template <PrimitiveType PT>
-    requires(is_string_type(PT))
-class InvertedIndexQueryParam<PT> : public InvertedIndexQueryParamFactory {
-    ENABLE_FACTORY_CREATOR(InvertedIndexQueryParam);
-
-public:
-    void set_value(const std::string& value) { _value = value; }
-    void set_value(const StringRef* value) { _value.assign(value->data, value->size); }
-
-    const void* get_value() const override { return &_value; }
-
-private:
-    std::string _value;
 };
 
 } // namespace segment_v2

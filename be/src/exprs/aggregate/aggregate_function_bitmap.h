@@ -271,7 +271,8 @@ public:
                   std::vector<int>& rows, Arena&) const override {
         // now this only for bitmap_union function
         if constexpr (std::is_same_v<Op, AggregateFunctionBitmapUnionOp>) {
-            const auto& column = assert_cast<const ColVecType&>(*columns[0]);
+            const auto& column =
+                    assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(*columns[0]);
             std::vector<const BitmapValue*> values;
             for (auto row : rows) {
                 values.push_back(&(column.get_data()[row]));
@@ -284,7 +285,8 @@ public:
                          const IColumn** columns, Arena& arena, bool has_null) override {
         // now this only for bitmap_union function
         if constexpr (std::is_same_v<Op, AggregateFunctionBitmapUnionOp>) {
-            const auto& column = assert_cast<const ColVecType&>(*columns[0]);
+            const auto& column =
+                    assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(*columns[0]);
             std::vector<const BitmapValue*> values;
             for (size_t i = batch_begin; i <= batch_end; ++i) {
                 values.push_back(&(column.get_data()[i]));
@@ -312,7 +314,7 @@ public:
     }
 
     void insert_result_into(ConstAggregateDataPtr __restrict place, IColumn& to) const override {
-        auto& column = assert_cast<ColVecResult&>(to);
+        auto& column = assert_cast<ColVecResult&, TypeCheckOnRelease::DISABLE>(to);
         column.get_data().push_back(this->data(place).get());
     }
 
@@ -349,27 +351,35 @@ public:
 
     void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena&) const override {
+        const IColumn* data_column = columns[0];
         if constexpr (arg_is_nullable) {
-            const auto& nullable_column = assert_cast<const ColumnNullable&>(*columns[0]);
-            if (!nullable_column.is_null_at(row_num)) {
-                const auto& column = assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(
-                        nullable_column.get_nested_column());
-                this->data(place).add(column.get_data()[row_num]);
+            const auto& nullable_column =
+                    assert_cast<const ColumnNullable&, TypeCheckOnRelease::DISABLE>(*columns[0]);
+            if (nullable_column.is_null_at(row_num)) {
+                return;
             }
-        } else {
-            const auto& column =
-                    assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(*columns[0]);
-            this->data(place).add(column.get_data()[row_num]);
+            data_column = &nullable_column.get_nested_column();
         }
+        const auto& value =
+                assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(*data_column)
+                        .get_data()[row_num];
+        if constexpr (!std::is_same_v<ColVecType, ColumnBitmap>) {
+            // Match bitmap_agg and to_bitmap before conversion to uint64_t.
+            if (value < 0) {
+                return;
+            }
+        }
+        this->data(place).add(value);
     }
 
     void add_many(AggregateDataPtr __restrict place, const IColumn** columns,
                   std::vector<int>& rows, Arena&) const override {
         // now this only for bitmap_union_count function
         if constexpr (arg_is_nullable && std::is_same_v<ColVecType, ColumnBitmap>) {
-            const auto& nullable_column = assert_cast<const ColumnNullable&>(*columns[0]);
-            const auto& column =
-                    assert_cast<const ColVecType&>(nullable_column.get_nested_column());
+            const auto& nullable_column =
+                    assert_cast<const ColumnNullable&, TypeCheckOnRelease::DISABLE>(*columns[0]);
+            const auto& column = assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(
+                    nullable_column.get_nested_column());
             std::vector<const BitmapValue*> values;
             for (auto row : rows) {
                 if (!nullable_column.is_null_at(row)) {
@@ -378,7 +388,8 @@ public:
             }
             this->data(place).add_batch(values);
         } else if constexpr (std::is_same_v<ColVecType, ColumnBitmap>) {
-            const auto& column = assert_cast<const ColVecType&>(*columns[0]);
+            const auto& column =
+                    assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(*columns[0]);
             std::vector<const BitmapValue*> values;
             for (auto row : rows) {
                 values.push_back(&(column.get_data()[row]));
@@ -403,7 +414,8 @@ public:
                 return;
             }
             auto add_batch_lambda = [&](const IColumn& data_column, const NullMap* null_map) {
-                const auto& column = assert_cast<const ColVecType&>(data_column);
+                const auto& column =
+                        assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(data_column);
                 std::vector<const BitmapValue*> values;
                 for (size_t i = 0; i < batch_size; ++i) {
                     if constexpr (arg_is_nullable) {
@@ -417,7 +429,9 @@ public:
             };
 
             if constexpr (arg_is_nullable) {
-                const auto& nullable_column = assert_cast<const ColumnNullable&>(*columns[0]);
+                const auto& nullable_column =
+                        assert_cast<const ColumnNullable&, TypeCheckOnRelease::DISABLE>(
+                                *columns[0]);
                 add_batch_lambda(nullable_column.get_nested_column(),
                                  &(nullable_column.get_null_map_data()));
             } else {
@@ -444,7 +458,7 @@ public:
 
     void insert_result_into(ConstAggregateDataPtr __restrict place, IColumn& to) const override {
         auto& value_data = this->data(place).get();
-        auto& column = assert_cast<ColVecResult&>(to);
+        auto& column = assert_cast<ColVecResult&, TypeCheckOnRelease::DISABLE>(to);
         column.get_data().push_back(value_data.cardinality());
     }
 

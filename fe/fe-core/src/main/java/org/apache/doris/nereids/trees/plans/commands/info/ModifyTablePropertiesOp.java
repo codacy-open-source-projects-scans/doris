@@ -26,7 +26,6 @@ import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableProperty;
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.DatasourcePrintableMap;
 import org.apache.doris.common.util.DynamicPartitionUtil;
@@ -36,6 +35,7 @@ import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Strings;
 
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -67,6 +67,26 @@ public class ModifyTablePropertiesOp extends AlterTableOp {
 
     public boolean isBeingSynced() {
         return isBeingSynced;
+    }
+
+    @Override
+    public boolean allowOpRowBinlog() {
+        // Row-binlog tables forbid bloom-filter changes and storage relocation.
+        if (properties == null || properties.isEmpty()) {
+            return true;
+        }
+        // BF related properties are forbidden on row binlog tables.
+        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BF_COLUMNS)
+                || properties.containsKey(PropertyAnalyzer.PROPERTIES_BF_FPP)) {
+            return false;
+        }
+        if (properties.keySet().stream().anyMatch(key ->
+                key.equalsIgnoreCase(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM)
+                        || key.equalsIgnoreCase(PropertyAnalyzer.PROPERTIES_STORAGE_COOLDOWN_TIME))) {
+            return false;
+        }
+        // Other properties are allowed.
+        return true;
     }
 
     @Override
@@ -145,11 +165,10 @@ public class ModifyTablePropertiesOp extends AlterTableOp {
         } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_IS_BEING_SYNCED)) {
             setIsBeingSynced(Boolean.parseBoolean(properties.getOrDefault(
                     PropertyAnalyzer.PROPERTIES_IS_BEING_SYNCED, "false")));
-        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_TTL_SECONDS)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_BYTES)
-                || properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_HISTORY_NUMS)) {
-            // do nothing, will be alter in SchemaChangeHandler.updateBinlogConfig
+        } else if (TableProperty.isSamePrefixProperties(properties, PropertyAnalyzer.PROPERTIES_BINLOG_PREFIX)) {
+            // validate binlog.* properties
+            PropertyAnalyzer.analyzeBinlogConfig(new java.util.HashMap<>(properties));
+            // will be altered in SchemaChangeHandler.updateBinlogConfig
         } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_COMPACTION_POLICY)) {
             String compactionPolicy = properties.getOrDefault(PropertyAnalyzer.PROPERTIES_COMPACTION_POLICY, "");
             if (compactionPolicy != null
@@ -267,35 +286,13 @@ public class ModifyTablePropertiesOp extends AlterTableOp {
                                 + " should be set to true or false");
             }
             this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
+        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_PARTITION_INVERTED_INDEX_STORAGE_FORMAT)) {
+            PropertyAnalyzer.analyzePartitionInvertedIndexFileStorageFormat(new HashMap<>(properties));
+            this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
         } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_INVERTED_INDEX_STORAGE_FORMAT)) {
             throw new AnalysisException(
                     "Property "
                             + PropertyAnalyzer.PROPERTIES_INVERTED_INDEX_STORAGE_FORMAT + " is not allowed to change");
-        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_ENABLE_SINGLE_REPLICA_COMPACTION)) {
-            if (!properties.get(PropertyAnalyzer.PROPERTIES_ENABLE_SINGLE_REPLICA_COMPACTION).equalsIgnoreCase("true")
-                    && !properties.get(PropertyAnalyzer.PROPERTIES_ENABLE_SINGLE_REPLICA_COMPACTION)
-                            .equalsIgnoreCase("false")) {
-                throw new AnalysisException(
-                        "Property "
-                                + PropertyAnalyzer.PROPERTIES_ENABLE_SINGLE_REPLICA_COMPACTION
-                                + " should be set to true or false");
-            }
-            this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
-        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_ENABLE_TSO)) {
-            if (!properties.get(PropertyAnalyzer.PROPERTIES_ENABLE_TSO).equalsIgnoreCase("true")
-                    && !properties.get(PropertyAnalyzer.PROPERTIES_ENABLE_TSO).equalsIgnoreCase("false")) {
-                throw new AnalysisException(
-                        "Property "
-                                + PropertyAnalyzer.PROPERTIES_ENABLE_TSO
-                                + " should be set to true or false");
-            }
-            if (properties.get(PropertyAnalyzer.PROPERTIES_ENABLE_TSO).equalsIgnoreCase("true")
-                    && !Config.enable_tso_feature) {
-                throw new AnalysisException(
-                        "Property " + PropertyAnalyzer.PROPERTIES_ENABLE_TSO
-                                + " can not be enabled when experimental_enable_tso_feature is disabled");
-            }
-            this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
         } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_ENABLE_MOW_LIGHT_DELETE)) {
             if (!properties.get(PropertyAnalyzer.PROPERTIES_ENABLE_MOW_LIGHT_DELETE)
                     .equalsIgnoreCase("true")
@@ -335,6 +332,8 @@ public class ModifyTablePropertiesOp extends AlterTableOp {
             PropertyAnalyzer.analyzeGroupCommitMode(properties, false);
             this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
         } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_FILE_CACHE_TTL_SECONDS)) {
+            PropertyAnalyzer.analyzeFileCacheTtlSeconds(
+                    properties.get(PropertyAnalyzer.PROPERTIES_FILE_CACHE_TTL_SECONDS));
             this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
         } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_PARTITION_RETENTION_COUNT)) {
             // do a check here for valid value

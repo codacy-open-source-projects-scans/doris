@@ -17,20 +17,20 @@
 
 package org.apache.doris.connector.jdbc;
 
-import org.apache.doris.connector.api.ConnectorType;
-import org.apache.doris.connector.api.handle.ConnectorColumnHandle;
-import org.apache.doris.connector.api.pushdown.ConnectorAnd;
-import org.apache.doris.connector.api.pushdown.ConnectorBetween;
-import org.apache.doris.connector.api.pushdown.ConnectorColumnRef;
-import org.apache.doris.connector.api.pushdown.ConnectorComparison;
-import org.apache.doris.connector.api.pushdown.ConnectorExpression;
-import org.apache.doris.connector.api.pushdown.ConnectorFunctionCall;
-import org.apache.doris.connector.api.pushdown.ConnectorIn;
-import org.apache.doris.connector.api.pushdown.ConnectorIsNull;
-import org.apache.doris.connector.api.pushdown.ConnectorLike;
-import org.apache.doris.connector.api.pushdown.ConnectorLiteral;
-import org.apache.doris.connector.api.pushdown.ConnectorNot;
-import org.apache.doris.connector.api.pushdown.ConnectorOr;
+import org.apache.doris.connector.spi.ConnectorType;
+import org.apache.doris.connector.spi.handle.ConnectorColumnHandle;
+import org.apache.doris.connector.spi.pushdown.ConnectorAnd;
+import org.apache.doris.connector.spi.pushdown.ConnectorBetween;
+import org.apache.doris.connector.spi.pushdown.ConnectorColumnRef;
+import org.apache.doris.connector.spi.pushdown.ConnectorComparison;
+import org.apache.doris.connector.spi.pushdown.ConnectorExpression;
+import org.apache.doris.connector.spi.pushdown.ConnectorFunctionCall;
+import org.apache.doris.connector.spi.pushdown.ConnectorIn;
+import org.apache.doris.connector.spi.pushdown.ConnectorIsNull;
+import org.apache.doris.connector.spi.pushdown.ConnectorLike;
+import org.apache.doris.connector.spi.pushdown.ConnectorLiteral;
+import org.apache.doris.connector.spi.pushdown.ConnectorNot;
+import org.apache.doris.connector.spi.pushdown.ConnectorOr;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -340,7 +340,32 @@ public final class JdbcQueryBuilder {
         return null;
     }
 
+    private static boolean isUuidValue(ConnectorExpression expr) {
+        if (expr instanceof ConnectorColumnRef) {
+            return "UUID".equals(((ConnectorColumnRef) expr).getType().getTypeName());
+        } else if (expr instanceof ConnectorLiteral) {
+            return "UUID".equals(((ConnectorLiteral) expr).getType().getTypeName());
+        } else if (expr instanceof ConnectorFunctionCall) {
+            return "UUID".equals(((ConnectorFunctionCall) expr).getReturnType().getTypeName());
+        }
+        return false;
+    }
+
     private String comparisonToSql(ConnectorComparison comp, Map<String, String> colMapping) {
+        // ClickHouse compares the low 64 bits first; Doris uses unsigned 128-bit order.
+        // Equality remains pushable, but remote range filtering would discard valid rows.
+        if (dbType == JdbcDbType.CLICKHOUSE
+                && (isUuidValue(comp.getLeft()) || isUuidValue(comp.getRight()))) {
+            switch (comp.getOperator()) {
+                case LT:
+                case LE:
+                case GT:
+                case GE:
+                    return null;
+                default:
+                    break;
+            }
+        }
         String left = expressionToSql(comp.getLeft(), colMapping);
         String right = expressionToSql(comp.getRight(), colMapping);
         if (left == null || right == null) {
@@ -432,6 +457,11 @@ public final class JdbcQueryBuilder {
     }
 
     private String betweenToSql(ConnectorBetween between, Map<String, String> colMapping) {
+        // BETWEEN also depends on UUID ordering (including its bounds).
+        if (dbType == JdbcDbType.CLICKHOUSE && (isUuidValue(between.getValue())
+                || isUuidValue(between.getLower()) || isUuidValue(between.getUpper()))) {
+            return null;
+        }
         String valueSql = expressionToSql(between.getValue(), colMapping);
         String lowerSql = expressionToSql(between.getLower(), colMapping);
         String upperSql = expressionToSql(between.getUpper(), colMapping);

@@ -130,8 +130,8 @@ TEST_F(DateBloomFilterTest, query_index_test) {
     EXPECT_TRUE(res.has_value()) << res.error();
     const auto& rowset_writer = res.value();
 
-    Block block = _tablet_schema->create_block();
-    auto columns = block.mutate_columns();
+    Block block = _tablet_schema->create_storage_block();
+    auto columns = std::move(block).mutate_columns();
 
     auto date = timestamp_from_date("2024-11-08");
     auto datetime = timestamp_from_datetime("2024-11-08 09:00:00");
@@ -146,6 +146,7 @@ TEST_F(DateBloomFilterTest, query_index_test) {
     olap_datetime_value = datetime.to_olap_datetime();
     columns[0]->insert_many_fix_len_data(reinterpret_cast<const char*>(&olap_date_value), 1);
     columns[1]->insert_many_fix_len_data(reinterpret_cast<const char*>(&olap_datetime_value), 1);
+    block.set_columns(std::move(columns));
 
     Status st;
     st = rowset_writer->add_block(&block);
@@ -223,8 +224,8 @@ TEST_F(DateBloomFilterTest, in_list_predicate_test) {
     EXPECT_TRUE(res.has_value()) << res.error();
     const auto& rowset_writer = res.value();
 
-    Block block = _tablet_schema->create_block();
-    auto columns = block.mutate_columns();
+    Block block = _tablet_schema->create_storage_block();
+    auto columns = std::move(block).mutate_columns();
 
     // Insert test data
     auto date = timestamp_from_date("2024-11-08");
@@ -240,6 +241,7 @@ TEST_F(DateBloomFilterTest, in_list_predicate_test) {
     olap_datetime_value = datetime.to_olap_datetime();
     columns[0]->insert_many_fix_len_data(reinterpret_cast<const char*>(&olap_date_value), 1);
     columns[1]->insert_many_fix_len_data(reinterpret_cast<const char*>(&olap_datetime_value), 1);
+    block.set_columns(std::move(columns));
 
     EXPECT_TRUE(rowset_writer->add_block(&block).ok());
     EXPECT_TRUE(rowset_writer->flush().ok());

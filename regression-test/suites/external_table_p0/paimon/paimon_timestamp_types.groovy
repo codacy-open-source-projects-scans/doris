@@ -23,6 +23,7 @@ suite("paimon_timestamp_types", "p0,external") {
         return
     }
 
+    def originalTimeZone = sql("SELECT @@time_zone")[0][0]
     try {
         String catalog_name = "paimon_timestamp_types"
         String minio_port = context.config.otherConfigs.get("iceberg_minio_port")
@@ -44,6 +45,8 @@ suite("paimon_timestamp_types", "p0,external") {
         sql """use flink_paimon;"""
         logger.info("use test_paimon_db")
 
+        // The expected timestamp_ltz values are defined in the Asia/Shanghai timezone.
+        sql """set time_zone = 'Asia/Shanghai'"""
 
         def test_ltz_ntz = { table -> 
             qt_ltz_ntz2 """ select * from ${table} """
@@ -68,7 +71,7 @@ suite("paimon_timestamp_types", "p0,external") {
             qt_ltz_ntz21 """ select crow3 from ${table} """
         }
 
-        def test_ltz_ntz_simple = { table -> 
+        def test_ltz_ntz_simple = { table, expectedCrow2 ->
             qt_ltz_ntz_simple2 """ select * from ${table} """
             qt_ltz_ntz_simple3 """ select cmap1 from ${table} """
             qt_ltz_ntz_simple4 """ select cmap1['2024-01-01 10:12:34.123456'] from ${table} """
@@ -81,37 +84,89 @@ suite("paimon_timestamp_types", "p0,external") {
             qt_ltz_ntz_simple11 """ select carray2 from ${table} """
             qt_ltz_ntz_simple12 """ select carray2[2] from ${table} """
             qt_ltz_ntz_simple13 """ select crow from ${table} """
-            qt_ltz_ntz_simple14 """ select STRUCT_ELEMENT(crow, 'crow1') from ${table} """
-            qt_ltz_ntz_simple15 """ select STRUCT_ELEMENT(crow, 'crow2') from ${table} """
+            // Project crow1 while crow2 is filter-only so the predicate keeps Paimon's nested
+            // TIMESTAMP_LTZ semantic. The BE unit test pins the same path for precision-9 INT96.
+            order_qt_ltz_ntz_simple14 """
+                select element_at(crow, 'crow1') from ${table}
+                where cast(element_at(crow, 'crow2') as string) = '${expectedCrow2}'
+            """
+            qt_ltz_ntz_simple15 """ select element_at(crow, 'crow2') from ${table} """
         }
 
-        def test_scale = {
+        def test_scale = { String orcTimestamp ->
             def ts_scale_orc = """select * from ts_scale_orc"""
             def ts_scale_parquet = """select * from ts_scale_parquet"""
             qt_c1 ts_scale_orc
             qt_c2 ts_scale_parquet
 
+            // JNI truncates ORC nanoseconds while native ORC rounds; predicates must use each
+            // reader's visible microsecond value to keep pruning and decoding consistent. Keep the
+            // predicates below on ts9 so file pruning must retain the row whose source value has
+            // nanoseconds beyond the Doris-visible literal.
+            order_qt_ts9_eq_orc """
+                select id from ts_scale_orc
+                where ts9 = '${orcTimestamp}'
+                order by id
+            """
+            order_qt_ts9_eq_parquet """
+                select id from ts_scale_parquet
+                where ts9 = '2024-01-02 10:04:05.123456'
+                order by id
+            """
+            order_qt_ts9_lt_orc """
+                select id from ts_scale_orc
+                where ts9 < '${orcTimestamp}'
+                order by id
+            """
+            order_qt_ts9_le_orc """
+                select id from ts_scale_orc
+                where ts9 <= '${orcTimestamp}'
+                order by id
+            """
+            order_qt_ts9_gt_parquet """
+                select id from ts_scale_parquet
+                where ts9 > '2024-01-02 10:04:05.123456'
+                order by id
+            """
+            order_qt_ts9_ge_parquet """
+                select id from ts_scale_parquet
+                where ts9 >= '2024-01-02 10:04:05.123456'
+                order by id
+            """
+            order_qt_ts9_in_orc """
+                select id from ts_scale_orc
+                where ts9 in ('2024-01-02 10:04:05.123457', '2024-01-02 10:04:05.123456')
+                order by id
+            """
+            order_qt_ts9_ne_parquet """
+                select id from ts_scale_parquet
+                where ts9 != '2024-01-02 10:04:05.123457'
+                order by id
+            """
+
         }
 
         sql """set force_jni_scanner=true"""
-        test_scale()
+        test_scale("2024-01-02 10:04:05.123456")
         // test_ltz_ntz("test_timestamp_ntz_ltz_orc")
         // test_ltz_ntz("test_timestamp_ntz_ltz_parquet")
-        test_ltz_ntz_simple("test_timestamp_ntz_ltz_simple_orc")
+        test_ltz_ntz_simple("test_timestamp_ntz_ltz_simple_orc", "2024-01-02 10:12:34.123456")
         // test_ltz_ntz_simple("test_timestamp_ntz_ltz_simple_parquet")
 
+        // Native ORC rounds scales 7-9 to microseconds; JNI truncates. Native Parquet uses
+        // Paimon history semantics for high-precision INT96 instead of the session timezone.
         sql """set force_jni_scanner=false"""
-        test_scale()
+        test_scale("2024-01-02 10:04:05.123457")
         // test_ltz_ntz("test_timestamp_ntz_ltz_orc")
         // test_ltz_ntz("test_timestamp_ntz_ltz_parquet")
-        test_ltz_ntz_simple("test_timestamp_ntz_ltz_simple_orc")
-        test_ltz_ntz_simple("test_timestamp_ntz_ltz_simple_parquet")
+        test_ltz_ntz_simple("test_timestamp_ntz_ltz_simple_orc", "2024-01-02 02:12:34.123456")
+        test_ltz_ntz_simple("test_timestamp_ntz_ltz_simple_parquet", "2024-01-02 10:12:34.123456")
     } finally {
         sql """set force_jni_scanner=false"""
+        sql """set time_zone = '${originalTimeZone}'"""
     }
 
     // TODO:
-    // 1. Fix: native read + parquet + timestamp(7/8/9) (ts7,ts8,ts9), it will be 8 hour more
     // 2. paimon bugs: native read + orc + timestamp_ltz.
     //                 In the Shanghai time zone, the read data will be 8 hours less, 
     //                 because the data written by Flink to the orc file is UTC, but the time zone saved in the orc file is Shanghai.

@@ -17,56 +17,37 @@
 
 #include "exprs/aggregate/aggregate_function_min_max_by.h"
 
+#include "core/call_on_type_index.h"
+#include "core/data_type/primitive_type.h"
 #include "exprs/aggregate/aggregate_function_simple_factory.h"
 
 namespace doris {
-std::unique_ptr<MaxMinValueBase> create_max_min_value(const DataTypePtr& type, int be_version) {
+std::unique_ptr<MaxMinValueBase> create_max_min_value(const DataTypePtr& type) {
+    std::unique_ptr<MaxMinValueBase> result;
+    auto call = [&](const auto& dispatch_type) -> bool {
+        using DispatchType = std::decay_t<decltype(dispatch_type)>;
+        constexpr auto PT = DispatchType::PType;
+        result = std::make_unique<MaxMinValue<SingleValueDataFixed<PT>>>();
+        return true;
+    };
+    if (type->get_primitive_type() == TYPE_TIMESTAMP_NS) {
+        call(DispatchDataType<TYPE_TIMESTAMP_NS>());
+        return result;
+    }
+    if (dispatch_switch_scalar(type->get_primitive_type(), call)) {
+        return result;
+    }
     switch (type->get_primitive_type()) {
-    case PrimitiveType::TYPE_BOOLEAN:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_BOOLEAN>>>();
-    case PrimitiveType::TYPE_TINYINT:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_TINYINT>>>();
-    case PrimitiveType::TYPE_SMALLINT:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_SMALLINT>>>();
-    case PrimitiveType::TYPE_INT:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_INT>>>();
-    case PrimitiveType::TYPE_BIGINT:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_BIGINT>>>();
-    case PrimitiveType::TYPE_LARGEINT:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_LARGEINT>>>();
-    case PrimitiveType::TYPE_FLOAT:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_FLOAT>>>();
-    case PrimitiveType::TYPE_DOUBLE:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_DOUBLE>>>();
-    case PrimitiveType::TYPE_DECIMAL32:
-        return std::make_unique<MaxMinValue<SingleValueDataDecimal<TYPE_DECIMAL32>>>();
-    case PrimitiveType::TYPE_DECIMAL64:
-        return std::make_unique<MaxMinValue<SingleValueDataDecimal<TYPE_DECIMAL64>>>();
-    case PrimitiveType::TYPE_DECIMAL128I:
-        return std::make_unique<MaxMinValue<SingleValueDataDecimal<TYPE_DECIMAL128I>>>();
-    case PrimitiveType::TYPE_DECIMALV2:
-        return std::make_unique<MaxMinValue<SingleValueDataDecimal<TYPE_DECIMALV2>>>();
-    case PrimitiveType::TYPE_DECIMAL256:
-        return std::make_unique<MaxMinValue<SingleValueDataDecimal<TYPE_DECIMAL256>>>();
     case PrimitiveType::TYPE_STRING:
     case PrimitiveType::TYPE_CHAR:
     case PrimitiveType::TYPE_VARCHAR:
         return std::make_unique<MaxMinValue<SingleValueDataString>>();
-    case PrimitiveType::TYPE_DATE:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_DATE>>>();
-    case PrimitiveType::TYPE_DATETIME:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_DATETIME>>>();
-    case PrimitiveType::TYPE_DATEV2:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_DATEV2>>>();
-    case PrimitiveType::TYPE_DATETIMEV2:
-        return std::make_unique<MaxMinValue<SingleValueDataFixed<TYPE_DATETIMEV2>>>();
     case PrimitiveType::TYPE_BITMAP:
         return std::make_unique<MaxMinValue<BitmapValueData>>();
     case PrimitiveType::TYPE_ARRAY:
     case PrimitiveType::TYPE_MAP:
     case PrimitiveType::TYPE_STRUCT:
-        return std::make_unique<MaxMinValue<SingleValueDataComplexType>>(DataTypes {type},
-                                                                         be_version);
+        return std::make_unique<MaxMinValue<SingleValueDataColumn>>();
     default:
         throw doris::Exception(ErrorCode::INTERNAL_ERROR,
                                "Illegal type {} of argument of aggregate function min/max_by",

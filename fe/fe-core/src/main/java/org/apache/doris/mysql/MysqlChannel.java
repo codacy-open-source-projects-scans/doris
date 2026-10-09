@@ -32,10 +32,13 @@ import org.xnio.channels.Channels;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLPeerUnverifiedException;
 
 /**
  * This class used to read/write MySQL logical packet.
@@ -54,6 +57,11 @@ public class MysqlChannel implements BytesChannel {
     protected static final int SSL_PACKET_HEADER_LEN = 5;
     // next sequence id to receive or send
     protected int sequenceId;
+    // The sequence id the client expects next: sequenceId as of the last packet that reached the
+    // wire (the command packet received, or the last packet flushed). sequenceId runs ahead of
+    // it by the packets still in the send buffer; reset() rewinds to it when it drops them, so
+    // the packets written after a reset are numbered the way the client expects them.
+    protected int wireSequenceId;
     // channel connected with client
     private StreamConnection conn;
     // used to receive/send header, avoiding new this many time.
@@ -142,6 +150,7 @@ public class MysqlChannel implements BytesChannel {
 
     public void setSequenceId(int sequenceId) {
         this.sequenceId = sequenceId;
+        this.wireSequenceId = sequenceId;
     }
 
     public String getRemoteIp() {
@@ -164,6 +173,21 @@ public class MysqlChannel implements BytesChannel {
 
     public void setSslHandshaking(boolean sslHandshaking) {
         isSslHandshaking = sslHandshaking;
+    }
+
+    public X509Certificate getClientCertificate() {
+        if (sslEngine == null) {
+            return null;
+        }
+        try {
+            Certificate[] peerCertificates = sslEngine.getSession().getPeerCertificates();
+            if (peerCertificates == null || peerCertificates.length == 0) {
+                return null;
+            }
+            return peerCertificates[0] instanceof X509Certificate ? (X509Certificate) peerCertificates[0] : null;
+        } catch (SSLPeerUnverifiedException e) {
+            return null;
+        }
     }
 
     private int packetId() {
@@ -411,6 +435,7 @@ public class MysqlChannel implements BytesChannel {
             }
             if (!isSslHandshaking) {
                 accSequenceId();
+                wireSequenceId = sequenceId;
             }
             if (packetLen != MAX_PHYSICAL_PACKET_LENGTH) {
                 result.flip();
@@ -486,6 +511,7 @@ public class MysqlChannel implements BytesChannel {
         } finally {
             sendBuffer.clear();
         }
+        wireSequenceId = sequenceId;
         isSend = true;
     }
 
@@ -538,6 +564,7 @@ public class MysqlChannel implements BytesChannel {
                 writeHeader(bufLen, isSslMode);
                 writeBuffer(packet);
                 accSequenceId();
+                markWireIfSent();
             }
         }
         if (isSslHandshaking) {
@@ -548,6 +575,15 @@ public class MysqlChannel implements BytesChannel {
             packet.limit(oldLimit);
             writeBuffer(packet);
             accSequenceId();
+            markWireIfSent();
+        }
+    }
+
+    // A packet too large for the send buffer goes to the wire directly (writeBuffer), after what
+    // the buffer held; when nothing is left in the buffer the client has seen everything written.
+    private void markWireIfSent() {
+        if (sendBuffer == null || sendBuffer.position() == 0) {
+            wireSequenceId = sequenceId;
         }
     }
 
@@ -556,12 +592,15 @@ public class MysqlChannel implements BytesChannel {
         flush();
     }
 
-    // Call this function before send query before
+    // Drops what was written since the last flush: called before a statement (and before a query is
+    // attempted again) so that only its own packets reach the client. Those packets are numbered
+    // from where the client left off, not from where the dropped ones would have ended.
     public void reset() {
         isSend = false;
         if (null != sendBuffer) {
             sendBuffer.clear();
         }
+        sequenceId = wireSequenceId;
     }
 
     public boolean isSend() {
