@@ -140,12 +140,13 @@ public:
         if (scope == FunctionContext::FunctionStateScope::FRAGMENT_LOCAL) {
             std::shared_ptr<FunctionJsonbParseState> state =
                     std::make_shared<FunctionJsonbParseState>();
-            context->set_function_state(FunctionContext::FRAGMENT_LOCAL, state);
+            context->set_function_state(FunctionContext::FunctionStateScope::FRAGMENT_LOCAL, state);
         }
         if constexpr (parse_error_handle_mode == JsonbParseErrorMode::RETURN_VALUE) {
             if (scope == FunctionContext::FunctionStateScope::FRAGMENT_LOCAL) {
-                auto* state = reinterpret_cast<FunctionJsonbParseState*>(
-                        context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+                auto* state =
+                        reinterpret_cast<FunctionJsonbParseState*>(context->get_function_state(
+                                FunctionContext::FunctionStateScope::FRAGMENT_LOCAL));
                 if (state) {
                     if (context->get_num_args() == 2) {
                         if (context->is_col_constant(1)) {
@@ -232,8 +233,8 @@ public:
         const ColumnString* default_value_str_col = nullptr;
         const NullMap* default_value_nullmap = nullptr;
         if constexpr (parse_error_handle_mode == JsonbParseErrorMode::RETURN_VALUE) {
-            auto* state = reinterpret_cast<FunctionJsonbParseState*>(
-                    context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+            auto* state = reinterpret_cast<FunctionJsonbParseState*>(context->get_function_state(
+                    FunctionContext::FunctionStateScope::FRAGMENT_LOCAL));
             if (state && state->has_const_default_value) {
                 constant_default_value = state->default_value;
                 default_value_null_const = state->default_is_null;
@@ -2157,8 +2158,9 @@ public:
         if (root->isArray()) {
             writer.writeStartArray();
             const auto* array_val = root->unpack<ArrayVal>();
-            for (int i = 0; i != array_val->numElem(); ++i) {
-                auto* it = array_val->get(i);
+            int i = 0;
+            for (auto iter = array_val->begin(); iter < array_val->end(); ++iter, ++i) {
+                const auto* it = &*iter;
 
                 if (is_last_parent && last_leg->array_index == i) {
                     value_written = true;
@@ -2383,12 +2385,12 @@ private:
         } else if (element->isArray()) {
             const auto* array = element->unpack<ArrayVal>();
             bool find = false;
-            for (int i = 0; i < array->numElem(); ++i) {
-                auto leg = std::make_unique<leg_info>(nullptr, 0, i, ARRAY_CODE);
-                cur_path->add_leg_to_leg_vector(std::move(leg));
-                const auto* child_element = array->get(i);
+            int index = 0;
+            for (auto it = array->begin(); it < array->end(); ++it, ++index) {
                 // construct an array cell path leg.
-                find |= find_matches(child_element, one_match, state, cur_path, matches);
+                auto leg = std::make_unique<leg_info>(nullptr, 0, index, ARRAY_CODE);
+                cur_path->add_leg_to_leg_vector(std::move(leg));
+                find |= find_matches(&*it, one_match, state, cur_path, matches);
                 cur_path->pop_leg_from_leg_vector();
                 if (one_match && find) {
                     return true;
@@ -2435,7 +2437,7 @@ private:
         LikeState* state = nullptr;
         if (search_is_const) {
             state = reinterpret_cast<LikeState*>(
-                    context->get_function_state(FunctionContext::THREAD_LOCAL));
+                    context->get_function_state(FunctionContext::FunctionStateScope::THREAD_LOCAL));
         }
 
         bool is_one = false;
@@ -2527,7 +2529,7 @@ public:
     bool use_default_implementation_for_nulls() const override { return false; }
 
     Status open(FunctionContext* context, FunctionContext::FunctionStateScope scope) override {
-        if (scope != FunctionContext::THREAD_LOCAL) {
+        if (scope != FunctionContext::FunctionStateScope::THREAD_LOCAL) {
             return Status::OK();
         }
         if (context->is_col_constant(2)) {
